@@ -1,0 +1,7 @@
+# dumpsys SurfaceFlinger on glass17 (emulator-5564), 2026-11-17, companion attached to SystemUI and NexusLauncher,
+# persist.sys.glass.mode=glass, full Quick Settings open over the home screen (one folder on it).
+# Lines that carry blur state, per layer:
+  Layer [1635] VRI-NotificationShade#1635
+        visible reason= buffer=60619168415791 frame=10 backgroundBlurRadius=89 backgroundBlurScale=0.95 blurRegions.size()=14
+  Layer [1618] VRI-com.google.android.apps.nexuslauncher/com.google.android.apps.nexuslauncher.NexusLauncherActivity#1618
+        visible reason= buffer=59725815218229 frame=121 blurRegions.size()=1

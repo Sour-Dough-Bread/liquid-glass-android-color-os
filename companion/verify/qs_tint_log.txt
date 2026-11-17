@@ -1,0 +1,35 @@
+Tinted glass for Quick Settings tiles that are on: glass17 (emulator-5564),
+engine 0.4.6 dev-installed (SurfaceFlinger restarted; SELinux permissive, set
+by the user for this run, since 0.4.6 refuses to hook under enforcing without
+the module's sepolicy.rule), companion attached with dev_attach.sh systemui.
+
+Engine status after the restart
+  sys.glass.engine=glass  sys.glass.regen=1  sys.glass.tripped=(empty)
+  StockGlass: hook installed in 188 ms
+  StockGlass: shader validated: 40 uniforms + 2 children resolved, blob 256 bytes
+
+Decoded tints (logcat -s StockGlass; draw lines are rate-limited)
+  light theme, app.tint 0.5:  draw #195 pane r=263 tint=#4e5e8b@0.50 ...
+                              device=[297 1221 530 1410]   (Auto-rotate, the one
+                              small tile that is on; #4e5e8b is its fill colour)
+  dark theme, app.tint 0.5:   tint=#bac5ee@0.50
+  light theme, app.tint 0.8:  tint=#4e5e8b@0.80
+  default after the change:   tint=#4e5e8b@0.80
+Regions with QS open: 14 for every app.tint value (tinting adds none).
+Tiles that are off, and dual-target large tiles whose body stays neutral
+(Wi-Fi, Bluetooth, Mobile data: "on" shows in their icon square), log no tint.
+
+Strength sweep (qs_tint_sweep.png): app.tint 0 (old look), 0.5, 0.65, 0.8 in
+both themes. Light theme: the white icon reads at every strength. Dark theme:
+the on-tile is light with a dark icon, and the shade behind it is dark; at 0.5
+the glass goes mid-grey and the icon nearly disappears, 0.65 is marginal, 0.8
+reads. Default set to 0.8.
+
+Blur intensity re-blur on A17 (for the parent session), QS open:
+  setprop persist.sys.glass.fillBlurScale 1.5
+  62 draw lines with "(blurred at N)": 58 tile panes "pane r=263 (blurred at 300)"
+  (263 x 1.5 = 394, capped by kMaxRegenRadius = 300), the others 3, 45, 46, 47
+  0 "no blur at" warnings; sys.glass.tripped stayed empty; surfaceflinger pid
+  25139 before and after; engine still "glass"
+  one line with both: draw #2453 pane r=263 (blurred at 300) tint=#4e5e8b@0.80
+  setprop persist.sys.glass.fillBlurScale '' afterwards

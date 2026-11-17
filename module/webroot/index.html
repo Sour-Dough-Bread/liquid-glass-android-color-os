@@ -1,0 +1,805 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Stock Glass</title>
+<!--
+  KernelSU / KernelSU-Next / APatch module WebUI.
+
+  Everything goes through glassctl, the same script the Action button uses, so
+  this page holds no knowledge of its own about presets or defaults: it asks
+  `glassctl json`, which asks glasscheck, which is compiled from the engine's own
+  glass_params.cpp. Writes are plain setprop calls; the engine inside
+  SurfaceFlinger picks them up within half a second.
+-->
+<style>
+  :root {
+    --bg: #f3f3f6;
+    --card: #ffffff;
+    --text: #17171c;
+    --muted: #63636f;
+    --line: #e2e2e8;
+    --accent: #3d63dd;
+    --accent-soft: #e5ebfd;
+    --accent-text: #ffffff;
+    --ok: #1f8a4c;
+    --warn: #b4540a;
+    --bad: #c4323a;
+    --track: #dcdce4;
+    --shadow: 0 1px 2px rgba(20, 20, 30, .06), 0 4px 16px rgba(20, 20, 30, .05);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0f0f13;
+      --card: #1a1a20;
+      --text: #ececf1;
+      --muted: #9a9aa8;
+      --line: #2a2a33;
+      --accent: #8aa4ff;
+      --accent-soft: #232b48;
+      --accent-text: #0f0f13;
+      --ok: #5fd08f;
+      --warn: #f0a35b;
+      --bad: #ff7b82;
+      --track: #33333d;
+      --shadow: none;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: var(--bg); color: var(--text); }
+  body {
+    font: 15px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    padding: max(16px, env(safe-area-inset-top)) 16px max(28px, env(safe-area-inset-bottom));
+    max-width: 640px; margin: 0 auto;
+    -webkit-tap-highlight-color: transparent;
+  }
+  header { display: flex; align-items: center; gap: 12px; margin: 8px 2px 18px; }
+  header h1 { font-size: 22px; margin: 0; letter-spacing: -.01em; flex: 1; }
+  .chip {
+    font-size: 12px; font-weight: 600; padding: 4px 10px; border-radius: 999px;
+    background: var(--card); border: 1px solid var(--line); color: var(--muted); white-space: nowrap;
+  }
+  .chip.ok { color: var(--ok); } .chip.warn { color: var(--warn); } .chip.bad { color: var(--bad); }
+  .card {
+    background: var(--card); border-radius: 18px; padding: 16px; margin-bottom: 14px;
+    box-shadow: var(--shadow); border: 1px solid var(--line);
+  }
+  .card h2 {
+    font-size: 13px; font-weight: 600; letter-spacing: .04em; text-transform: uppercase;
+    color: var(--muted); margin: 0 0 12px;
+  }
+  .note { color: var(--muted); font-size: 13px; margin: 10px 2px 0; }
+  .banner {
+    border-radius: 14px; padding: 12px 14px; margin-bottom: 14px; font-size: 14px;
+    background: var(--accent-soft); color: var(--text); display: none;
+  }
+  .banner.show { display: block; }
+  .banner code { font-size: 13px; }
+
+  /* mode */
+  .seg { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; background: var(--bg);
+         padding: 4px; border-radius: 14px; }
+  .seg button {
+    appearance: none; border: 0; border-radius: 11px; padding: 12px 8px; font: inherit;
+    font-weight: 600; color: var(--muted); background: transparent; cursor: pointer;
+  }
+  .seg.three { grid-template-columns: 1fr 1fr 1fr; }
+  .seg button[aria-pressed="true"] { background: var(--accent); color: var(--accent-text); }
+  .seg button:disabled { opacity: .5; }
+
+  /* presets */
+  .presets { display: grid; gap: 8px; }
+  .preset {
+    display: flex; gap: 12px; align-items: flex-start; padding: 12px; border-radius: 12px;
+    border: 1px solid var(--line); cursor: pointer; text-align: left; background: transparent;
+    font: inherit; color: inherit; width: 100%;
+  }
+  .preset[aria-checked="true"] { border-color: var(--accent); background: var(--accent-soft); }
+  .preset .dot {
+    flex: none; width: 18px; height: 18px; border-radius: 50%; border: 2px solid var(--muted);
+    margin-top: 2px; position: relative;
+  }
+  .preset[aria-checked="true"] .dot { border-color: var(--accent); }
+  .preset[aria-checked="true"] .dot::after {
+    content: ""; position: absolute; inset: 3px; border-radius: 50%; background: var(--accent);
+  }
+  .preset b { display: block; text-transform: capitalize; }
+  .preset span { color: var(--muted); font-size: 13px; }
+
+  /* sliders */
+  .row { padding: 10px 0; border-top: 1px solid var(--line); }
+  .row:first-of-type { border-top: 0; padding-top: 2px; }
+  .row .top { display: flex; align-items: baseline; gap: 8px; margin-bottom: 6px; }
+  .row label { flex: 1; font-weight: 500; }
+  .row .val { font-variant-numeric: tabular-nums; color: var(--muted); font-size: 14px; }
+  .row .mod { width: 7px; height: 7px; border-radius: 50%; background: var(--accent);
+              visibility: hidden; flex: none; align-self: center; }
+  .row.overridden .mod { visibility: visible; }
+  .row .undo {
+    appearance: none; border: 0; background: none; color: var(--accent); font: inherit;
+    font-size: 13px; padding: 0 0 0 4px; cursor: pointer; visibility: hidden;
+  }
+  .row.overridden .undo { visibility: visible; }
+  input[type=range] { width: 100%; accent-color: var(--accent); margin: 0; height: 28px; }
+  .tint { display: flex; gap: 12px; align-items: center; }
+  .tint input[type=color] {
+    flex: none; width: 44px; height: 32px; border: 1px solid var(--line); border-radius: 8px;
+    background: none; padding: 2px;
+  }
+  details summary {
+    cursor: pointer; font-weight: 600; color: var(--muted); font-size: 13px;
+    letter-spacing: .04em; text-transform: uppercase; list-style: none;
+  }
+  details summary::-webkit-details-marker { display: none; }
+  details summary::after { content: " +"; }
+  details[open] summary::after { content: " −"; }
+  details[open] summary { margin-bottom: 12px; }
+
+  .actions { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 12px; }
+  .btn {
+    appearance: none; border: 1px solid var(--line); background: var(--card); color: var(--text);
+    border-radius: 12px; padding: 10px 14px; font: inherit; font-weight: 600; cursor: pointer;
+  }
+  .switch { display: flex; align-items: center; gap: 12px; }
+  .switch label { flex: 1; }
+  .switch input { width: 46px; height: 26px; accent-color: var(--accent); flex: none; }
+  #app-parts .switch { padding: 9px 0; border-top: 1px solid var(--line); }
+  #app-parts .switch:first-child { border-top: 0; }
+  .dim { opacity: .55; }
+  .toast {
+    position: fixed; left: 50%; bottom: max(20px, env(safe-area-inset-bottom)); transform: translateX(-50%);
+    background: var(--text); color: var(--bg); padding: 10px 16px; border-radius: 12px; font-size: 14px;
+    opacity: 0; transition: opacity .2s; pointer-events: none; max-width: calc(100% - 32px);
+  }
+  .toast.show { opacity: .94; }
+
+  /* basic */
+  .ticks { display: flex; justify-content: space-between; font-size: 12px; color: var(--muted);
+           margin-top: 2px; padding: 0 2px; }
+  .ticks span:nth-child(2) { text-align: center; }
+  .swatch { display: inline-block; width: 12px; height: 12px; border-radius: 50%;
+            border: 1px solid var(--line); vertical-align: -1px; margin-right: 4px; }
+  .linkbtn { appearance: none; border: 0; background: none; color: var(--accent); font: inherit;
+             font-size: 13px; padding: 0; cursor: pointer; }
+  [hidden] { display: none !important; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Stock Glass</h1>
+  <span class="chip" id="engine">checking…</span>
+</header>
+
+<div class="banner" id="banner"></div>
+
+<section class="card">
+  <h2>Blur style</h2>
+  <div class="seg" role="group" aria-label="Blur style">
+    <button id="mode-stock" aria-pressed="false">Android blur</button>
+    <button id="mode-glass" aria-pressed="false">Liquid Glass</button>
+  </div>
+  <p class="note" id="mode-note">Android blur leaves the system's own blur exactly as it is.
+    Liquid Glass draws over the same regions, live, without a reboot.</p>
+</section>
+
+<section class="card" id="basic-card">
+  <h2>Glass</h2>
+  <div class="row" id="b-variant-row">
+    <div class="top"><label for="b-variant">Blur transparency</label><span class="val" id="b-variant-val"></span></div>
+    <input type="range" id="b-variant" min="0" max="1" step="0.01">
+    <div class="ticks"><span>Clear</span><span>Regular</span><span>Frosted</span></div>
+  </div>
+  <div class="row" id="b-intensity-row">
+    <div class="top"><label for="b-intensity">Blur intensity</label><span class="val" id="b-intensity-val"></span></div>
+    <input type="range" id="b-intensity" min="0" max="1" step="0.005">
+    <div class="ticks"><span>Clear</span><span>As the app asks</span><span>Frosted</span></div>
+  </div>
+  <div class="row" id="b-tint-row">
+    <div class="top"><label for="b-tint">Tint intensity</label><span class="val" id="b-tint-val"></span></div>
+    <input type="range" id="b-tint" min="0" max="1" step="0.01">
+    <div class="ticks"><span>Liquid Glass</span><span>Liquid Material</span></div>
+  </div>
+  <p class="note" id="basic-note" hidden></p>
+</section>
+
+<section class="card">
+  <div class="switch">
+    <label for="advanced">Advanced
+      <span class="note" style="display:block;margin:2px 0 0">Presets, the shade's blur and every
+        setting. They show what the sliders above produce.</span>
+    </label>
+    <input type="checkbox" id="advanced">
+  </div>
+</section>
+
+<section class="card adv-only" id="preset-card">
+  <h2>Preset</h2>
+  <div class="presets" id="presets" role="radiogroup" aria-label="Preset"></div>
+  <p class="note">Picking a preset clears the tuning below, so it looks as designed.</p>
+</section>
+
+<section class="card adv-only" id="backdrop-card">
+  <h2>Shade and full-screen blur</h2>
+  <div class="seg three" role="group" aria-label="Shade and full-screen blur">
+    <button id="bd-stock" aria-pressed="false">Android blur</button>
+    <button id="bd-tone" aria-pressed="false">Toned</button>
+    <button id="bd-glass" aria-pressed="false">Liquid Glass</button>
+  </div>
+  <p class="note">Blur that covers the screen, like the notification shade or a dialog's
+    blur-behind. Cards, the volume panel and dialogs drawn over it always get Liquid Glass.
+    Toned keeps Android's blur and makes it lighter, greyer and veiled.</p>
+  <div id="backdrop-tune"></div>
+</section>
+
+<section class="card adv-only" id="tune-card">
+  <h2>Tuning</h2>
+  <div id="tune"></div>
+  <div class="row" id="tint-row">
+    <div class="top"><span class="mod"></span><label for="tint-a">Tint</label>
+      <span class="val" id="tint-val"></span><button class="undo" id="tint-undo">reset</button></div>
+    <div class="tint">
+      <input type="color" id="tint-color" aria-label="Tint colour">
+      <input type="range" id="tint-a" min="0" max="0.6" step="0.01">
+    </div>
+  </div>
+  <div class="actions"><button class="btn" id="reset">Reset tuning to preset</button></div>
+</section>
+
+<section class="card adv-only">
+  <details>
+    <summary>More settings</summary>
+    <div id="adv"></div>
+  </details>
+</section>
+
+<section class="card adv-only">
+  <div class="switch">
+    <label for="follow">Follow the system theme
+      <span class="note" style="display:block;margin:2px 0 0">Sets the frost colour from light or
+        dark mode, and the Liquid Material colour from the wallpaper palette.</span>
+    </label>
+    <input type="checkbox" id="follow">
+  </div>
+</section>
+
+<section class="card adv-only" id="app-card">
+  <h2>Apps</h2>
+  <div id="app-parts"></div>
+  <p class="note" id="app-note">Glass for what Android never blurs, drawn by the Stock Glass
+    Companion: an LSPosed module, with System UI and the launcher in its scope. A switch here
+    applies at once.</p>
+</section>
+
+<p class="note">Same controls from a root shell:
+  <code>sh /data/adb/modules/stockglass/glassctl help</code></p>
+
+<div class="toast" id="toast"></div>
+
+<script>
+'use strict';
+const MODDIR = '/data/adb/modules/stockglass';
+const CTL = `sh ${MODDIR}/glassctl`;
+const PROP = 'persist.sys.glass.';
+
+// The settings shown, in order. Ranges are a UI choice; defaults and preset
+// values come from the engine through `glassctl json`.
+const TUNE = [
+  { k: 'blurMix', label: 'Blur inside the pane', min: 0, max: 1, step: 0.01 },
+  { k: 'frost', label: 'Frost', min: 0, max: 0.6, step: 0.01 },
+  { k: 'softenDp', label: 'Softness', min: 0, max: 8, step: 0.25, unit: ' dp' },
+  { k: 'saturation', label: 'Colour', min: 0.5, max: 2, step: 0.01 },
+  { k: 'refractionAmountDp', label: 'Refraction', min: 0, max: 150, step: 1, unit: ' dp' },
+  { k: 'refractionWidthDp', label: 'Rim width', min: 4, max: 60, step: 1, unit: ' dp',
+    also: ['refractionHeightDp'] },
+  { k: 'dispersionAmountDp', label: 'Colour fringe', min: 0, max: 30, step: 0.5, unit: ' dp' },
+  { k: 'highlightIntensity', label: 'Edge light', min: 0, max: 1, step: 0.01 },
+  { k: 'highlightAngleDeg', label: 'Light angle', min: 0, max: 360, step: 1, unit: '°' },
+  { k: 'noise', label: 'Grain', min: 0, max: 0.2, step: 0.005 },
+  { k: 'cornerRadiusDp', label: 'Minimum corner radius', min: 0, max: 48, step: 1, unit: ' dp' },
+  { k: 'glassOpacity', label: 'Opacity', min: 0, max: 1, step: 0.01 },
+];
+const BACKDROP = [
+  { k: 'backdropBlur', label: 'Blur strength', min: 0.05, max: 1, step: 0.01 },
+  { k: 'backdropSaturation', label: 'Colour', min: 0, max: 2, step: 0.01 },
+  { k: 'backdropVeil', label: 'Veil', min: 0, max: 0.6, step: 0.01 },
+];
+const ADVANCED = [
+  { k: 'backdropCoverage', label: 'Share of the screen that counts as full-screen', min: 0.5, max: 1, step: 0.01 },
+  { k: 'refractionDepth', label: 'Dome depth', min: 0, max: 2, step: 0.01 },
+  { k: 'paneSpanDp', label: 'Largest pane (dp) before the dome flattens', min: 0, max: 1200, step: 10 },
+  { k: 'blurFalloff', label: 'Rim-to-frost handover', min: 0.25, max: 6, step: 0.05 },
+  { k: 'lensBlurRef', label: 'Radius where the rim is fully blurred', min: 1, max: 80, step: 1 },
+  { k: 'crossFadeRadius', label: 'Fade-in radius', min: 0, max: 40, step: 1 },
+  { k: 'dispersionQuadrant', label: 'Fringe follows corners', min: 0, max: 1, step: 0.01 },
+  { k: 'light', label: 'Inner light', min: 0, max: 1, step: 0.01 },
+  { k: 'lensBlur', label: 'Blur at the rim', min: 0, max: 1, step: 0.01 },
+  { k: 'fillLighten', label: 'See-through pulled toward a brighter blur', min: 0, max: 1, step: 0.01 },
+  { k: 'fillDarken', label: 'See-through pulled toward a darker blur', min: 0, max: 1, step: 0.01 },
+  { k: 'toneScale', label: 'Tone: contrast', min: 0.2, max: 1.5, step: 0.005 },
+  { k: 'toneBias', label: 'Tone: lift', min: 0, max: 0.8, step: 0.005 },
+  { k: 'lumaLimit', label: 'Tone: highlight limiter', min: 0, max: 1, step: 0.01 },
+];
+
+// Basic mode. Blur intensity is a multiple of the radius each app asks for,
+// on a log scale in two halves so "as the app asks" is the middle: 0.25x to 1x
+// on the left, 1x to 2x on the right.
+const INT_MIN = 0.25, INT_MAX = 2;
+const intensityFromSlider = (x) =>
+  x <= 0.5 ? INT_MIN * Math.pow(1 / INT_MIN, x * 2) : Math.pow(INT_MAX, (x - 0.5) * 2);
+const sliderFromIntensity = (s) => {
+  s = Math.min(INT_MAX, Math.max(INT_MIN, s));
+  return s <= 1 ? Math.log(s / INT_MIN) / Math.log(1 / INT_MIN) / 2
+                : 0.5 + Math.log(s) / Math.log(INT_MAX) / 2;
+};
+function variantName(v) {
+  if (v < 0.02) return 'Clear';
+  if (Math.abs(v - 0.5) < 0.02) return 'Regular';
+  if (v > 0.98) return 'Frosted';
+  return v < 0.5 ? 'Clear – Regular' : 'Regular – Frosted';
+}
+let advanced = false;
+try { advanced = localStorage.getItem('sg-advanced') === '1'; } catch (e) { /* no storage: start basic */ }
+
+let state = null;          // last `glassctl json`
+const rows = new Map();    // key -> { spec, input, val, row }
+
+// ---------------------------------------------------------------- bridge
+// KernelSU, KernelSU-Next and APatch all inject `ksu.exec(cmd, optionsJson,
+// callbackName)`, which calls window[callbackName](errno, stdout, stderr).
+function exec(cmd) {
+  return new Promise((resolve, reject) => {
+    if (typeof ksu === 'undefined' || typeof ksu.exec !== 'function') {
+      reject(new Error('no-bridge'));
+      return;
+    }
+    const cb = `__sg_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+    window[cb] = (errno, stdout, stderr) => {
+      delete window[cb];
+      resolve({ errno, stdout: stdout || '', stderr: stderr || '' });
+    };
+    try { ksu.exec(cmd, '{}', cb); } catch (e) { delete window[cb]; reject(e); }
+  });
+}
+
+// Values come from our own sliders and tables, but quote anyway: nothing typed
+// into this page should ever reach a root shell unquoted.
+const q = (s) => `'${String(s).replace(/'/g, `'\\''`)}'`;
+const setprop = (k, v) => exec(`setprop ${q(PROP + k)} ${q(v)}`);
+
+function toast(msg) {
+  const t = document.getElementById('toast');
+  t.textContent = msg; t.classList.add('show');
+  clearTimeout(toast.timer); toast.timer = setTimeout(() => t.classList.remove('show'), 1800);
+}
+
+// ---------------------------------------------------------------- state
+const param = (k) => state && state.state && state.state.params.find((p) => p.name === k);
+const decimals = (step) => (String(step).split('.')[1] || '').length;
+const fmt = (spec, v) => `${Number(v).toFixed(decimals(spec.step))}${spec.unit || ''}`;
+
+async function load() {
+  let r;
+  try { r = await exec(`${CTL} json`); } catch (e) { return noBridge(); }
+  try { state = JSON.parse(r.stdout); } catch (e) {
+    banner(`Could not read the module state. <code>${CTL} json</code> said: ${escapeHtml(r.stderr || r.stdout || 'nothing')}`);
+    return;
+  }
+  render();
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+}
+
+function banner(html) {
+  const b = document.getElementById('banner');
+  b.innerHTML = html; b.classList.toggle('show', !!html);
+}
+
+function noBridge() {
+  banner('This page talks to the module through KernelSU or APatch. On Magisk, use the module\'s ' +
+         '<b>Action</b> button to switch modes, and <code>glassctl</code> from a root shell to tune.');
+  document.getElementById('engine').textContent = 'no root bridge';
+  document.querySelectorAll('button, input').forEach((el) => { el.disabled = true; });
+}
+
+// ---------------------------------------------------------------- render
+function render() {
+  const st = state.state;
+  const chip = document.getElementById('engine');
+  const eng = state.engine;
+  chip.className = 'chip ' + (eng === 'loaded' ? 'ok' : eng === 'disabled' ? 'bad' : 'warn');
+  chip.textContent = eng === 'loaded' ? 'engine running' : eng === 'disabled' ? 'disabled' : 'not loaded';
+  if (eng === 'disabled') {
+    banner('The module turned itself off after a boot that did not complete. Remove ' +
+           '<code>/data/adb/glass/disabled</code> and reboot to try again; ' +
+           '<code>/data/adb/glass/last_boot.log</code> says what happened.');
+  } else if (eng === 'no-metamodule') {
+    banner('The engine is not running: KernelSU 3 and later only mount modules through a ' +
+           '<b>metamodule</b>, and none is installed. Install one, such as meta-overlayfs, from ' +
+           'the manager and reboot. Settings made now are kept and apply once it is.');
+  } else if (eng === 'loaded' && state.tripped) {
+    const at = new Date(Number(state.tripped) * 1000);
+    banner('SurfaceFlinger restarted at ' + at.toLocaleTimeString() + ' while drawing Liquid ' +
+           'Glass, so the engine switched back to Android\'s blur rather than crash again. ' +
+           'The crash is in <code>/data/tombstones</code>. Turning glass on again clears this.');
+  } else if (eng === 'loaded' && state.engineStatus === 'no-glass') {
+    banner('The engine is running, but the glass shader did not validate on this ROM, so ' +
+           'Android\'s blur is drawn instead. <code>logcat -s StockGlass</code> says why.');
+  } else if (eng === 'loaded' && state.engineStatus === 'not-hooked') {
+    banner('The engine is loaded but declined to hook this ROM\'s blur, so nothing changes. ' +
+           '<code>logcat -s StockGlass</code> right after a reboot says why.');
+  } else if (eng !== 'loaded') {
+    banner('The engine is not running in SurfaceFlinger yet. Reboot after installing; if it is ' +
+           'still not running, see <code>/data/adb/glass/last_boot.log</code>. Settings made now ' +
+           'are kept and apply once it is.');
+  } else {
+    banner('');
+  }
+  if (!st) return;
+
+  const glass = st.mode === 'glass';
+  document.getElementById('mode-stock').setAttribute('aria-pressed', String(!glass));
+  document.getElementById('mode-glass').setAttribute('aria-pressed', String(glass));
+  for (const id of ['basic-card', 'preset-card', 'backdrop-card', 'tune-card']) {
+    document.getElementById(id).classList.toggle('dim', !glass);
+  }
+  renderBasic();
+
+  const list = document.getElementById('presets');
+  list.textContent = '';
+  for (const p of st.presets) {
+    const b = document.createElement('button');
+    b.className = 'preset';
+    b.setAttribute('role', 'radio');
+    b.setAttribute('aria-checked', String(p.name === st.preset));
+    b.innerHTML = '<span class="dot"></span><div><b></b><span></span></div>';
+    b.querySelector('b').textContent = p.name;
+    b.querySelector('div span').textContent = p.summary;
+    b.addEventListener('click', () => choosePreset(p.name));
+    list.appendChild(b);
+  }
+
+  for (const [k, r] of rows) {
+    const p = param(k);
+    if (!p) { r.row.hidden = true; continue; }
+    const overridden = p.overridden || (r.spec.also || []).some((a) => param(a) && param(a).overridden);
+    if (document.activeElement !== r.input) r.input.value = p.effective;
+    r.val.textContent = fmt(r.spec, p.effective);
+    r.row.classList.toggle('overridden', overridden);
+  }
+  renderTint();
+  renderBackdrop();
+  renderApps();
+  document.getElementById('follow').checked = !!state.followTheme;
+}
+
+// The three Basic sliders, from the engine's own values, and what they cannot
+// do here said next to them.
+function renderBasic() {
+  const st = state.state;
+  const v = param('variant'), s = param('fillBlurScale'), m = param('materialTint');
+  if (!v || !s || !m) { document.getElementById('basic-card').hidden = true; return; }
+  const isBasic = st.preset === 'basic';
+  const vIn = document.getElementById('b-variant');
+  if (document.activeElement !== vIn) vIn.value = isBasic ? v.effective : 0;
+  document.getElementById('b-variant-val').textContent =
+    isBasic ? variantName(Number(v.effective)) : `preset ${st.preset}`;
+
+  const iIn = document.getElementById('b-intensity');
+  if (document.activeElement !== iIn) iIn.value = sliderFromIntensity(Number(s.effective));
+  document.getElementById('b-intensity-val').textContent = `×${Number(s.effective).toFixed(2)}`;
+
+  const tIn = document.getElementById('b-tint');
+  if (document.activeElement !== tIn) tIn.value = m.effective;
+  const rgb = ['accentR', 'accentG', 'accentB'].map((k) => param(k) ? Number(param(k).effective) : 0);
+  const hasPalette = Math.max(...rgb) >= 0.02;
+  const tv = document.getElementById('b-tint-val');
+  tv.textContent = '';
+  if (hasPalette) {
+    const sw = document.createElement('span');
+    sw.className = 'swatch';
+    sw.style.background = `rgb(${rgb.map((c) => Math.round(c * 255)).join(',')})`;
+    tv.appendChild(sw);
+  }
+  tv.appendChild(document.createTextNode(Number(m.effective) < 0.005 ? 'off' : `${Math.round(m.effective * 100)}%`));
+
+  const notes = [];
+  if (!isBasic) {
+    notes.push(`The <b>${escapeHtml(st.preset)}</b> preset from Advanced is in use. Moving Blur ` +
+               'transparency switches back to these sliders and clears tuning made under Advanced.');
+  } else {
+    const tuned = st.params.filter((p) => p.overridden && !SWITCHES.has(p.name)).length;
+    if (tuned) {
+      notes.push(`${tuned} setting${tuned > 1 ? 's' : ''} tuned under Advanced sit on top of these ` +
+                 'sliders. <button class="linkbtn" id="basic-clear">Clear them</button>');
+    }
+  }
+  if (state.regen === '0') {
+    notes.push('Blur intensity needs Android 17: on this build every app keeps the blur it asks for.');
+  }
+  if (!hasPalette) {
+    notes.push('Liquid Material is waiting for the system palette. It arrives within 15 seconds ' +
+               'while <b>Follow the system theme</b> (under Advanced) is on.');
+  }
+  const note = document.getElementById('basic-note');
+  note.innerHTML = notes.join('<br>');
+  note.hidden = notes.length === 0;
+  const clearBtn = document.getElementById('basic-clear');
+  if (clearBtn) clearBtn.addEventListener('click', async () => {
+    await exec(`${CTL} reset`); toast('Tuning cleared'); await load();
+  });
+}
+
+// Properties glassctl treats as switches, which reset leaves alone.
+const SWITCHES = new Set(['mode', 'preset', 'enabled', 'follow_theme', 'variant', 'fillBlurScale',
+  'materialTint', 'frostR', 'frostG', 'frostB', 'accentR', 'accentG', 'accentB']);
+
+function showAdvanced(on) {
+  advanced = on;
+  document.getElementById('advanced').checked = on;
+  document.querySelectorAll('.adv-only').forEach((el) => { el.hidden = !on; });
+  try { localStorage.setItem('sg-advanced', on ? '1' : '0'); } catch (e) { /* fine */ }
+}
+
+const BACKDROP_STYLES = ['stock', 'tone', 'glass'];
+
+function renderBackdrop() {
+  const p = param('backdrop');
+  if (!p) { document.getElementById('backdrop-card').hidden = true; return; }
+  const style = BACKDROP_STYLES[Math.round(p.effective)] || 'stock';
+  for (const s of BACKDROP_STYLES) {
+    document.getElementById(`bd-${s}`).setAttribute('aria-pressed', String(s === style));
+  }
+  document.getElementById('backdrop-tune').hidden = style !== 'tone';
+}
+
+async function setBackdrop(style) {
+  const r = await exec(`${CTL} backdrop ${q(style)}`);
+  if (r.errno) toast(r.stderr || 'Could not switch');
+  await load();
+}
+
+// The companion's parts (glassctl app). Which parts there are comes from
+// glassctl; these are only their names.
+const APP_LABELS = {
+  clock: 'Lockscreen clock',
+  qs: 'Quick Settings tiles',
+  sliders: 'Quick Settings sliders',
+  shade: 'Notification shade and cards',
+  headsup: 'Heads-up notifications',
+  toolbar: 'Text selection toolbar',
+  screenshot: 'Screenshot action bar',
+  icons: 'Themed app icons',
+  folders: 'Folders',
+  widgets: 'Home screen widgets',
+  drawer: 'App drawer icons',
+  search: 'Search boxes in the launcher',
+};
+const appInputs = new Map();
+
+function renderApps() {
+  const app = state.app || {};
+  const box = document.getElementById('app-parts');
+  for (const k of Object.keys(app)) {
+    let input = appInputs.get(k);
+    if (!input) {
+      const row = document.createElement('div');
+      row.className = 'switch';
+      row.innerHTML = `<label for="app-${k}"></label><input type="checkbox" id="app-${k}">`;
+      row.querySelector('label').textContent = APP_LABELS[k] || k;
+      input = row.querySelector('input');
+      input.addEventListener('change', (e) => setApp(k, e.target.checked));
+      box.appendChild(row);
+      appInputs.set(k, input);
+      if (k === 'clock' && 'clockTint' in state) box.appendChild(clockTintRow());
+    }
+    input.checked = !!app[k];
+  }
+  const tint = document.getElementById('clock-tint');
+  if (tint) {
+    const v = state.clockTint === '' || state.clockTint == null ? 0.5 : Number(state.clockTint);
+    if (document.activeElement !== tint) tint.value = v;
+    document.getElementById('clock-tint-val').textContent = `${Math.round(v * 100)}%`;
+    document.getElementById('clock-tint-row').classList.toggle('dim', !app.clock);
+  }
+  document.getElementById('app-card').classList.toggle('dim', !(state.state && state.state.mode === 'glass'));
+}
+
+// How much of a plugin clock face's own colours (Inflate, Number Overlap...)
+// its glass keeps: 0 is clear glass like the default clock, 1 the face as drawn.
+function clockTintRow() {
+  const row = document.createElement('div');
+  row.className = 'row';
+  row.id = 'clock-tint-row';
+  row.innerHTML = `<div class="top"><label for="clock-tint">Clock face colour in the glass</label>
+    <span class="val" id="clock-tint-val"></span></div>
+    <input type="range" id="clock-tint" min="0" max="1" step="0.05">
+    <div class="ticks"><span>Clear glass</span><span>Face's own colours</span></div>`;
+  const input = row.querySelector('input');
+  let timer = null;
+  const send = async () => {
+    const r = await exec(`${CTL} app clocktint ${q(input.value)}`);
+    if (r.errno) toast(r.stderr || 'Could not set it');
+    else state.clockTint = input.value;
+  };
+  input.addEventListener('input', () => {
+    document.getElementById('clock-tint-val').textContent = `${Math.round(input.value * 100)}%`;
+    clearTimeout(timer); timer = setTimeout(send, 150);
+  });
+  input.addEventListener('change', () => { clearTimeout(timer); send(); });
+  return row;
+}
+
+async function setApp(k, on) {
+  const r = await exec(`${CTL} app ${q(k)} ${on ? 'on' : 'off'}`);
+  if (r.errno) { toast(r.stderr || 'Could not switch'); await load(); return; }
+  if (state.app) state.app[k] = on;
+  renderApps();
+  toast(`${APP_LABELS[k] || k}: ${on ? 'glass' : 'left as Android draws it'}`);
+}
+
+function renderTint() {
+  const [r, g, b, a] = ['tintR', 'tintG', 'tintB', 'tintA'].map((k) => param(k));
+  if (!a) { document.getElementById('tint-row').hidden = true; return; }
+  const hex = (v) => Math.round(Math.min(1, Math.max(0, v.effective)) * 255).toString(16).padStart(2, '0');
+  document.getElementById('tint-color').value = `#${hex(r)}${hex(g)}${hex(b)}`;
+  const slider = document.getElementById('tint-a');
+  if (document.activeElement !== slider) slider.value = a.effective;
+  document.getElementById('tint-val').textContent = Number(a.effective).toFixed(2);
+  document.getElementById('tint-row').classList.toggle('overridden',
+    [r, g, b, a].some((p) => p.overridden));
+}
+
+function buildRows(container, specs) {
+  for (const spec of specs) {
+    const row = document.createElement('div');
+    row.className = 'row';
+    const id = `p-${spec.k}`;
+    row.innerHTML = `<div class="top"><span class="mod"></span><label for="${id}"></label>
+      <span class="val"></span><button class="undo">reset</button></div>
+      <input type="range" id="${id}" min="${spec.min}" max="${spec.max}" step="${spec.step}">`;
+    row.querySelector('label').textContent = spec.label;
+    const input = row.querySelector('input');
+    const val = row.querySelector('.val');
+    let timer = null;
+    input.addEventListener('input', () => {
+      val.textContent = fmt(spec, input.value);
+      row.classList.add('overridden');
+      clearTimeout(timer);
+      // Debounced: a drag is dozens of events, and each one is a root shell.
+      timer = setTimeout(() => write(spec, input.value), 120);
+    });
+    input.addEventListener('change', () => { clearTimeout(timer); write(spec, input.value); });
+    row.querySelector('.undo').addEventListener('click', async () => {
+      await Promise.all([spec.k, ...(spec.also || [])].map((k) => setprop(k, '')));
+      await load();
+    });
+    container.appendChild(row);
+    rows.set(spec.k, { spec, input, val, row });
+  }
+}
+
+async function write(spec, v) {
+  try {
+    await Promise.all([spec.k, ...(spec.also || [])].map((k) => setprop(k, v)));
+  } catch (e) { toast('Could not write the setting'); return; }
+  const p = param(spec.k);
+  if (p) { p.effective = Number(v); p.overridden = true; }
+  for (const a of spec.also || []) { const pa = param(a); if (pa) { pa.effective = Number(v); pa.overridden = true; } }
+}
+
+async function choosePreset(name) {
+  await exec(`${CTL} preset ${q(name)}`);
+  toast(`Preset: ${name}`);
+  await load();
+}
+
+async function setMode(glass) {
+  const r = await exec(`${CTL} ${glass ? 'glass' : 'stock'}`);
+  toast(glass ? 'Liquid Glass on' : 'Android blur');
+  if (r.errno) toast(r.stderr || 'Could not switch');
+  await load();
+}
+
+// ---------------------------------------------------------------- wire up
+buildRows(document.getElementById('tune'), TUNE);
+buildRows(document.getElementById('backdrop-tune'), BACKDROP);
+for (const s of BACKDROP_STYLES) {
+  document.getElementById(`bd-${s}`).addEventListener('click', () => setBackdrop(s));
+}
+buildRows(document.getElementById('adv'), ADVANCED);
+
+document.getElementById('mode-stock').addEventListener('click', () => setMode(false));
+document.getElementById('mode-glass').addEventListener('click', () => setMode(true));
+document.getElementById('reset').addEventListener('click', async () => {
+  await exec(`${CTL} reset`);
+  toast('Tuning cleared');
+  await load();
+});
+showAdvanced(advanced);
+document.getElementById('advanced').addEventListener('change', (e) => showAdvanced(e.target.checked));
+
+// Debounced like the tuning rows: a drag is dozens of events, each a root shell.
+function basicSlider(id, onValue, onWrite) {
+  const input = document.getElementById(id);
+  let timer = null;
+  // After a write, read the state back once the drag settles, so the values
+  // under Advanced show what the slider produced.
+  const written = async (v) => {
+    await onWrite(v);
+    clearTimeout(basicSlider.reload);
+    basicSlider.reload = setTimeout(load, 400);
+  };
+  input.addEventListener('input', () => {
+    onValue(Number(input.value));
+    clearTimeout(timer);
+    timer = setTimeout(() => written(Number(input.value)), 120);
+  });
+  input.addEventListener('change', () => { clearTimeout(timer); written(Number(input.value)); });
+}
+basicSlider('b-variant',
+  (v) => { document.getElementById('b-variant-val').textContent = variantName(v); },
+  async (v) => {
+    if (state && state.state && state.state.preset !== 'basic') {
+      await exec(`${CTL} basic ${q(v.toFixed(2))}`);
+      toast('Basic sliders in use');
+      await load();
+    } else {
+      await setprop('variant', v.toFixed(2));
+    }
+  });
+basicSlider('b-intensity',
+  (x) => { document.getElementById('b-intensity-val').textContent = `×${intensityFromSlider(x).toFixed(2)}`; },
+  async (x) => {
+    // Snap to exactly 1 near it, so "as the app asks" is reachable by hand.
+    let s = intensityFromSlider(x);
+    if (Math.abs(s - 1) < 0.04) s = 1;
+    await setprop('fillBlurScale', s.toFixed(3));
+  });
+basicSlider('b-tint',
+  (t) => {
+    const tv = document.getElementById('b-tint-val');
+    const sw = tv.querySelector('.swatch');
+    tv.textContent = '';
+    if (sw) tv.appendChild(sw);
+    tv.appendChild(document.createTextNode(t < 0.005 ? 'off' : `${Math.round(t * 100)}%`));
+  },
+  async (t) => { await setprop('materialTint', t.toFixed(2)); });
+
+document.getElementById('follow').addEventListener('change', async (e) => {
+  // On = the empty value, which is the default and lets glass-theme.sh take
+  // the frost colour back within its next 15 s poll.
+  await setprop('follow_theme', e.target.checked ? '' : '0');
+  await load();
+});
+
+{
+  let timer = null;
+  const color = document.getElementById('tint-color');
+  const alpha = document.getElementById('tint-a');
+  const writeTint = async () => {
+    const hex = color.value.replace('#', '');
+    const ch = [0, 2, 4].map((i) => (parseInt(hex.slice(i, i + 2), 16) / 255).toFixed(3));
+    await Promise.all([setprop('tintR', ch[0]), setprop('tintG', ch[1]), setprop('tintB', ch[2]),
+                       setprop('tintA', alpha.value)]);
+    await load();
+  };
+  const later = () => { clearTimeout(timer); timer = setTimeout(writeTint, 150); };
+  color.addEventListener('input', later);
+  alpha.addEventListener('input', () => {
+    document.getElementById('tint-val').textContent = Number(alpha.value).toFixed(2);
+    document.getElementById('tint-row').classList.add('overridden');
+    later();
+  });
+  document.getElementById('tint-undo').addEventListener('click', async () => {
+    await Promise.all(['tintR', 'tintG', 'tintB', 'tintA'].map((k) => setprop(k, '')));
+    await load();
+  });
+}
+
+load();
+</script>
+</body>
+</html>

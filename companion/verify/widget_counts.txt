@@ -1,0 +1,44 @@
+Home screen widgets on glass17 (emulator-5564), Pixel launcher, companion
+attached with dev_attach.sh launcher. Counts from tools/launcher_count.sh
+(blur regions on the launcher's layer).
+
+Page 1: Gemini widget (com.google.android.apps.bard), the "Glass" folder,
+themed icons, dock
+  glass                          6
+  persist.sys.glass.mode=stock   0
+  glass again                    6
+  app.widgets=0                  5   (the widget's region alone goes)
+  app drawer open                0
+  app drawer closed              6
+
+Page 2: Google Calendar "Calendar month view" 4x4
+(com.google.android.calendar/.widgetmonth.MonthViewWidgetProvider) and the
+dock (3 themed icons; the 4th is an unpinned prediction, stock)
+  glass                          4   (light theme and dark theme)
+  persist.sys.glass.mode=stock   0
+  glass again                    4
+
+Contrast guard: share of the plate kept, from the app.debug=1 log
+("<provider>: plate <tone> (<drawable>), wallpaper <tone>, keeps <k>")
+  light theme, default wallpaper (Android: dark)
+    Calendar  plate light (GradientDrawable)  keeps 0.65
+    Gemini    plate light (ColorDrawable)     keeps 0.65
+  dark theme, default wallpaper (dark)
+    Calendar  plate dark (GradientDrawable)   keeps 0.3
+    Gemini    plate dark (ColorDrawable)      keeps 0.3
+  dark theme, a light test wallpaper (pale blue gradient, home screen only)
+    log: "wallpaper now light" as it was set, then
+    Calendar  plate dark                      keeps 0.65
+    Gemini    plate unread (night fallback)   keeps 0.65
+    app.contrast=0 + SYSPROPS_TRANSACTION     keeps 0.3   (live)
+    app.contrast unset + SYSPROPS_TRANSACTION keeps 0.65  (live)
+  wallpaper cleared back to the default
+    log: "wallpaper now dark", Calendar and Gemini keep 0.3
+
+While a widget re-renders (theme flip, wallpaper change) its host shows the
+loading layout for about a second; that plate is a StateListDrawable with no
+current child, read as "no drawable", and the system theme decides until the
+real plate arrives (the decision was the same both times).
+
+Screenshots: widget_calendar_dark.png, widget_calendar_light_theme.png,
+widget_calendar_light_wallpaper.png.

@@ -1,0 +1,18 @@
+# Themed app icons on glass17, 2026-11-17: blur regions on the launcher's layer
+# (tools/launcher_count.sh). Pixel launcher, themed icons on, engine in glass mode,
+# companion loaded by dev_attach.sh. Home screen: the "Glass" folder, Photos, and a
+# dock of Phone, Messages, Chrome plus one unpinned prediction (Gmail or Photos),
+# which gets no region (it draws its own plate and ring).
+home screen                                          5   folder + Photos + 3 dock icons
+app drawer open (KEYCODE_ALL_APPS)                   0
+app drawer closed                                    5
+folder open                                          4   the closed folder icon is hidden
+mode=stock + SYSPROPS_TRANSACTION                    0
+mode=glass + SYSPROPS_TRANSACTION                    5
+app.icons=0                                          1   the folder
+# Hotseat stacked by the launcher's cold-start race (4 PredictedAppIcon views, three
+# of them under Phone, Messages and Chrome), after launcher regions started to punch:
+home screen                                          5
+mode=stock                                           0
+mode=glass again                                     5
+# Plain launcher restarts with nothing attached: dock children 7 / 4 / 4 (one stacked).

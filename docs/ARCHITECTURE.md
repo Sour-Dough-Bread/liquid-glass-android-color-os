@@ -1,0 +1,781 @@
+# Architecture decisions
+
+## Two delivery tracks, and which one is actually hacky
+
+There are two ways to get this effect onto a device, and they have very
+different risk profiles. It matters to keep them separate, because the
+uncomfortable part below applies to only one of them.
+
+### Track A — source patch (Lineage, crDroid, any build-from-source ROM)
+
+A patch to `frameworks/native/libs/renderengine/skia/filters/BlurFilter.cpp`
+that replaces the body of `drawBlurRegion`. It compiles against whatever
+`external/skia` is already in the tree.
+
+- No symbol resolution, no inline hooking, no ABI guessing, no injection.
+- Nothing can drift, because the compiler sees the same Skia the rest of the
+  image sees.
+- Maintainers can carry it; users flash a ROM they were flashing anyway.
+
+**This is the non-hacky path, and it is the one that fits the actual target
+audience** — crDroid/Lineage on beryllium are built from source by definition.
+
+### Track B — KernelSU module (stock, prebuilt, or unwilling-to-reflash)
+
+Resolve `BlurFilter::drawBlurRegion` out of the stripped binary's MiniDebugInfo,
+inline-hook it, and rebuild the draw using Skia entry points called through
+resolved function pointers.
+
+This is the hacky one. It exists because a large share of users cannot or will
+not change ROM, and it is the only way to reach them.
+
+## Decision: vendor pinned Skia headers (Track B)
+
+**Chosen.** The engine compiles against Skia public headers pinned to the target
+Android release, and resolves only genuinely out-of-line symbols.
+
+### Why headers are unavoidable
+
+Measured on real binaries (see `VERIFIED.md`): `SkPaint()`, `SkPaint::setShader`
+and `SkRuntimeEffect::uniforms()` have **no out-of-line symbol on either A14 or
+A16**. They are header-inline, so there is nothing to call. Their bodies — and
+the object layouts they assume — have to come from somewhere, and the only
+correct source is the headers the target was built from.
+
+The alternative considered and rejected was hand-declaring layout-compatible
+structs for `SkPaint` and the builder. Smaller, but it replaces "use the exact
+source the ROM was built from" with "guess and hope", which is strictly worse at
+the same risk.
+
+### Why this is tolerable rather than reckless
+
+It *is* hacky. What keeps it on the right side of the line:
+
+1. **The headers are not guessed.** They are the exact pinned source tree the
+   ROM was built from, not an approximation.
+2. **The layout-sensitive surface is tiny.** `SkPaint` plus
+   `SkRuntimeEffectBuilder` — not all of Skia. Everything else goes through
+   resolved function pointers where only the *signature* has to match, and
+   signatures are checked against a candidate list with drift detection.
+3. **`SkPaint` is about as stable as Skia gets.** It is public API, used
+   everywhere, and its field set changes rarely.
+4. **We develop on a snapshot-able emulator.** A wrong layout crashes
+   SurfaceFlinger, which is a soft reboot — 60 seconds and a snapshot restore on
+   an AVD, versus a bootloop on a phone. The whole reason the AVD came first.
+5. **The kill switch bounds the blast radius in the field.** A boot-success
+   marker written at `post-fs-data` and cleared once `sys.boot_completed` lands
+   means a module that bootloops disables itself on the next boot.
+6. **Refusal is always available.** Drift detection, strategy availability, and
+   shader-compile failure all fall through to calling the original
+   `drawBlurRegion`. Doing nothing is a supported outcome at every step.
+
+### Which pin
+
+Not "Android 16" — **Android 16 at a specific QPR**. These are genuinely
+different trees:
+
+- LineageOS 23.0 is Android 16 **QPR0**, because Google never pushed QPR1 source
+  to AOSP.
+- LineageOS 23.2 is Android 16 **QPR2**.
+- crDroid v12.7 for beryllium (the eventual hardware target) is **QPR2**.
+- The development AVD is `BE2A.250530.026.D1`, an Android 16 release build.
+
+So the header pin is a per-target property, tracked alongside the device. The
+engine must therefore never *assume* its headers match: strategy availability
+and mangling drift are checked at load time against the actual binary, and a
+mismatch declines to install rather than proceeding.
+
+### What is NOT pinned
+
+`BlurFilter::drawBlurRegion` mangles byte-identically on Android 14 and 16, and
+its signature matches AOSP `main`. The hook target itself is stable; only the
+Skia call surface around it moves.
+
+## Shader construction: settled on the direct path
+
+`SkRuntimeEffect::uniforms()` is inlined on every build measured, so the uniform
+offsets are not reachable through it. Two ways out were considered:
+
+- **`builder`** — `SkRuntimeEffectBuilder` packs uniforms for us, but its packing
+  lives in *its own object layout*, so using it means depending on that layout
+  too.
+- **`direct`** — `SkRuntimeEffect::findUniform` returns each uniform's offset
+  directly, and `SkRuntimeEffect::makeShader` takes a plain `SkData` blob. No
+  builder, no builder layout.
+
+**`direct` is what the engine uses.** `findUniform` and `findChild` resolve on
+both A14 and A16, so it is also the one path that works everywhere — the builder
+turned out not to be needed on either. The builder entry points are still
+resolved and reported, because how much of it survives out-of-line is a useful
+signal when bringing up a new target, but nothing calls them.
+
+Using `findUniform` for the offsets has a second benefit: the engine never
+reimplements Skia's uniform packing rules, and a shader whose uniforms move is
+detected at load time rather than rendering wrong.
+
+## Layout dependencies, in full
+
+Everything the engine touches by layout rather than by call, so the list can be
+re-checked when the pin moves:
+
+| type | what is read | source |
+|---|---|---|
+| `SkRuntimeEffect::Result` | `effect@0`, `errorText@8` | header |
+| `SkString`, `SkString::Rec` | `fLength@0`, `data@8` | header |
+| `SkPaint` | size and alignment only; contents built by `reset()`. Measured 80 bytes on both A14 and A16; `ScopedPaint` adds 48 bytes of headroom | header |
+| `SkPaint::fShader` | written directly — **only when `SkPaint::setShader` did not resolve** | header |
+| `SkCanvas` / `MCRec` | `fMCRec`, `fMatrix` | header — **only when `SkCanvas::getTotalMatrix` did not resolve** (A16 inlined it; A14 kept it) |
+| `SkData` | `writable_data()` | header |
+| `SkRRect` | `rect()`, `radii()` | header |
+| `SkRuntimeEffect::ChildPtr` | one `sk_sp`, 8 bytes, trivially relocatable | header |
+| `SkImage` | `width()`, `height()`, `uniqueID()` (`fInfo@16`, dimensions at +16, `fUniqueID@40`), to tell a backdrop from a pane and recognise "this layer" | header; checked at run time against `blurRect` |
+| `SkRefCntBase` | `fRefCnt@8`, through `sk_sp` / `SkSafeRef` on images the engine keeps | header |
+
+Every entry says "header" because the headers are the pinned tree the ROM's Skia
+was built from. Two of them — `SkCanvas::getTotalMatrix` and `SkPaint::setShader`
+— are *defined* by the engine, but **only on builds that inlined them away**.
+Android 16 did; Android 14 did not, and there the engine calls the target's own
+copy and depends on nothing but the signature. Which path a target took is
+printed at install. Both definitions were cross-checked against the target's own
+compiled `drawBlurRegion`; see VERIFIED.md.
+
+The practical consequence is that the layout surface is not fixed — it *shrinks*
+on targets that kept more code out-of-line. Bringing up a new ROM starts by
+running `engine/test/resolve_test` against its `surfaceflinger` to see which
+column it lands in.
+
+## Milestones
+
+- **M0 — prove the hook, zero Skia surface.** Hook `drawBlurRegion`, alter
+  `blurRadius`, call the original. Validates symbol resolution, load bias,
+  inline hooking, injection, SELinux and the kill switch with no ABI risk at
+  all. Obviously visible on the volume panel.
+- **M1 — draw our shader. DONE.** `drawBlurRegion` replaced; two child shaders
+  with `getShaderTransform` matrices; `glass_high.sksl` compiled and run through
+  SF's own `SkRuntimeEffect`. Verified by neutralising every tone term and
+  measuring the interior **bit-exact against stock**. Live `persist.sys.glass.*`
+  tuning landed here rather than in M2, because calibrating anything without it
+  meant a rebuild and an SF restart per value.
+- **M2 — glassify-all.** Mostly a tuning and policy milestone now that the
+  property channel exists. Open questions it has to answer, all raised by M1's
+  measurements:
+  - `refractionDepth` needs to scale with region size, or full-screen regions
+    refract into arcs.
+  - a corner-radius floor for the plain-rect regions stock actually produces.
+  - whether to opt *out* of regions (a full-screen recents backdrop is arguably
+    not something to glassify).
+- **M3 — LSPosed add-on. PROTOTYPE (`companion/`).** Regions *created* rather
+  than restyled. M1 measured that stock A16 produces exactly **one** blur region
+  ever, but A17 on alioth already makes every notification card a region, so on
+  A17 the add-on is for what Android never blurs: Quick Settings tiles,
+  launcher folders, themed app icons (crDroid's "Minimal" style) and home
+  screen widgets work on the A17 AVD, and so does a lighter shade scrim; notification cards and heads-ups
+  are built against crDroid's SystemUI and wait for LSPosed on alioth.
+  Full-colour icons are not built. See "The companion" below. Region inflation
+  for effects that draw outside their bounds is still open.
+
+## Glass is a mode, not a replacement
+
+**Decision (v0.3): Android's blur is the default, and Liquid Glass is a mode the
+user switches on.** Before v0.3, loading the engine meant every blur region was
+glass. Now one property decides, live:
+
+```
+persist.sys.glass.mode    glass  → draw the glass over the regions Android produces
+                          other  → call the original drawBlurRegion, untouched
+```
+
+Anything other than an explicit `glass` (or `on`) is stock, so a typo, an empty
+value or a name from a later version can only ever produce Android's blur. The
+old `bypass=1` still forces stock.
+
+Why a live mode rather than "install = on":
+
+- **It is the honest framing of what the module is.** The compositor already
+  decided where to blur and how much; glass is a way of drawing that decision,
+  and a user should be able to compare the two without a reboot.
+- **It is a safety valve on new ROMs.** Stock mode puts nothing of ours in the
+  path except the trampoline: the shader is not even compiled until glass is
+  first selected. Someone who switches back because glass misbehaves on their
+  build gets measurably stock output (VERIFIED.md), not "glass with the effect
+  turned down".
+- **The hook stays installed in stock mode** so switching is instant. The cost is
+  one jump and a property-serial check per blur region per frame. `enabled=0`
+  remains for not installing the hook at all, at the next boot.
+
+### Parameters are layered: override → preset → default
+
+```
+persist.sys.glass.<name>     per-setting override (glassctl set, WebUI sliders)
+persist.sys.glass.preset     clear | regular | frosted | prism | edge
+kSpecs in glass_params.cpp   the calibrated defaults
+```
+
+Presets live **in the engine**, not in a script that writes properties. A preset
+is then one property, switching is atomic, an override on top of a preset is
+visible as an override, and a preset can be selected with nothing but `setprop`.
+A preset lists only what it changes; the frost *colour* is in none of them,
+because glass-theme.sh owns it.
+
+### One source of truth for the UIs
+
+The WebUI and `glassctl` never hold a copy of the presets or the defaults.
+`glasscheck --params` is compiled from the same `glass_params.cpp` as the engine
+and prints the tables plus the live values as JSON; `glassctl json` wraps it with
+what only the module knows (is the engine loaded, is theme-following on); the
+WebUI renders that. Slider *ranges* are the only UI-owned numbers.
+
+```
+WebUI ──ksu.exec──▶ glassctl ──▶ setprop persist.sys.glass.*  ──▶ engine (≤ 500 ms)
+Action button ────▶ glassctl ──▶ glasscheck --params ◀── glass_params.cpp ──▶ engine
+```
+
+`glassctl` is the only place that knows which properties are switches and which
+are tuning, so `reset` and `preset` behave the same from every entry point.
+
+## Backdrops and panes (v0.4)
+
+**Decision: what a region is decides what it gets.** A region whose on-screen
+rect spans the display (90% of each side, `backdropCoverage`) is a *backdrop*:
+the notification shade, a dialog's blur-behind. Anything smaller is a *pane*: a
+notification card, a piece of the volume panel, a blurred dialog. Panes get
+Liquid Glass; the backdrop gets `stock`, `tone` or `glass` (`backdrop`, which a
+preset may set).
+
+Why geometry rather than anything SurfaceFlinger labels: `drawBlurRegion` is
+called the same way for a layer's background blur and for its blur regions, and
+the layer's name never reaches it. Geometry is also what the user means. On
+alioth the shade is one full-screen background blur, and each card and each
+piece of the volume panel is a separate region (VERIFIED.md), so the split
+falls exactly where "shade Android blur, controls liquid" puts it. The display
+size is the size of `input`, the snapshot of the whole output buffer, so a
+screenshot or a rotated buffer is judged against itself.
+
+Three consequences shaped the code:
+
+1. **A toned backdrop is the glass shader with the lens off**: no refraction,
+   dispersion, light, grain or rim, the blurred child everywhere, plus
+   saturation and a veil in the frost colour, which follows the theme. No second
+   shader to compile or keep in step.
+2. **A lighter backdrop blur needs the filter's own arguments.** `drawBlurRegion`
+   is handed the finished blur but not the GPU context or display it was made
+   with. On Android 17 the engine also hooks `generateTemporaryImage` (all three
+   filters) purely to remember them, and when a toned backdrop wants
+   `backdropBlur < 1` it asks the same filter for the same rect at the lower
+   radius. Only when the last generate call was for this very input and rect, so
+   the remembered context is the one in use. Elsewhere the backdrop keeps the
+   requested radius.
+3. **A pane over a backdrop looks through the backdrop.** RenderEngine snapshots
+   a layer's input once, before its background blur is drawn, and every region
+   in that layer samples the same snapshot. Clear glass on a notification card
+   would then show the sharp home screen inside a blurred shade. So the engine
+   remembers the last backdrop (input image ID, blur rect, zoom, the blur it was
+   drawn with) and a pane in the same layer uses that blur as its "sharp" child
+   and composes the backdrop's tone under its own: saturations multiply, veils of
+   one colour combine as 1 − (1 − a)(1 − b).
+4. **Pieces of one surface are one pane** (`region_merge.h`). crDroid's volume
+   panel is a rounded cap and a square-topped body that overlap. Regions that
+   share one axis's extent and overlap along the other are outlined as their
+   union, and each draws only its own part. `drawBlurRegion` sees one region at
+   a time, so the cap, drawn first, learns about the body from a short memory
+   of earlier frames. That memory is keyed by each pane's slot, its place in
+   the layer's draw order. A pane that has moved since the last frame borrows
+   nothing from earlier frames. Without that rule (0.4.2–0.4.6) a moving pane
+   merged with its own earlier positions and trailed a squared-off smear
+   (VERIFIED.md, v0.4.7).
+
+What the compositor cannot do: Quick Settings tiles, launcher folders and icons
+are not blurred by Android at all, so they never reach `drawBlurRegion`. Those
+need an app-side module that makes them regions: "The companion" below.
+
+## The module (Track B, shipping form)
+
+`module/` builds a flashable KernelSU / Magisk module, ~3.4 MB.
+
+```
+customize.sh      refuses to install on a ROM the engine cannot drive;
+                  on an update, swaps running files out by rename
+post-fs-data.sh   builds the overlay, owns the bootloop guard
+service.sh        disarms the guard once sys.boot_completed lands
+glassctl          mode, presets, tuning; the one script every UI calls
+action.sh         the manager's Action button: glass ↔ Android blur
+webroot/          KernelSU / APatch WebUI
+bin/<abi>/        patchelf + glasscheck, both built for Android
+libs/<abi>/       libglassengine.so
+```
+
+`module/tools/webui_preview.py` serves the WebUI in a desktop browser with a
+`ksu.exec` stand-in that runs each command over `adb shell`, so the page can be
+iterated on against a real device's glassctl and engine.
+
+Three decisions worth keeping:
+
+1. **Injection is a `DT_NEEDED` entry on a copy**, mounted over the original.
+   `LD_PRELOAD` is not available — surfaceflinger runs with `AT_SECURE=1`, so
+   bionic strips it. See VERIFIED.md.
+2. **The preflight is the same resolver the engine uses.** `glasscheck` runs at
+   install time against the device's own `surfaceflinger` and aborts with a list
+   of what is missing. An incompatible ROM costs an error message, not a boot.
+3. **The guard lives in the scripts, not the engine.** It has to, because the
+   failure it exists for happens in the linker before any engine code runs.
+4. **An update never rewrites a file the running system maps.** Under
+   meta-overlayfs the metamodule copies `system/` with `cp -af` into the live
+   overlay's lower directory, which truncates `libglassengine.so` under
+   SurfaceFlinger and takes its relocated pages with it (it crashed, 0.4.9 over
+   0.4.8). `customize.sh` first gives each live path a new file by rename, so
+   the running copy stays intact until the reboot. See VERIFIED.md, "Updating
+   over a running copy".
+
+## The companion: regions for what Android never blurs (M3)
+
+`companion/` is an LSPosed module (legacy Xposed API 82, built without Gradle
+like the harness). The engine can only restyle blur regions that exist, so the
+companion makes them: each control gets a `BackgroundBlurDrawable` from its
+window's `ViewRootImpl`, the object SystemUI uses for notification cards, drawn
+at the control's bounds, and the control's own fill turns translucent so the
+glass under it shows. Drawing that drawable records an empty RenderNode;
+RenderThread reports where it lands every frame, and the window's aggregator
+sends rect, corner radii and blur radius with the same frame's buffer. A region
+therefore follows scrolling and animation exactly, with no position bookkeeping
+in the module, and the engine draws it as a pane.
+
+### Hooks on Android 17
+
+| surface | process | before-hook | what it changes |
+|---|---|---|---|
+| QS tiles | `com.android.systemui` | `…qs.panels.ui.compose.infinitegrid.TileKt.TileExpandable` (a static composable) | wraps `color: () -> Color`, alpha × `app.fill` (neutral fill) or × `app.accent` (coloured: an active tile); adds a `drawBehind` to `modifier` that draws the tile's region with the corner radii of its `Shape`. With `app.tint` > 0 an active tile's region asks the engine for glass tinted in the tile's own colour (the v0.4.6 corner-radius encoding, `module/README.md` "Tinted glass for apps"), at `app.tint` (0.8) times how far its colour is from neutral, and its fill keeps `app.fill`. Below about 0.8 a dark-theme tile's dark icon is lost over the dark shade (VERIFIED.md). On Google's build a dual-target large tile shows "on" in its icon square only, which is not a region |
+| folder icons | `com.android.launcher3`, `com.google.android.apps.nexuslauncher` | `com.android.launcher3.folder.PreviewBackground.drawBackground(Canvas)` | `mBgColor` alpha × `app.fill`; region at the folder shape's bounds (`basePreviewOffsetX/Y`, `getScaledRadius()`), corners from the theme's folder shape |
+| themed app icons | the same two | `…launcher3.icons.FastBitmapDrawable.draw(Canvas)`, then `…icons.mono.ThemedIconDelegate.drawContent(BitmapInfo, IconShape, Canvas, Rect, Paint)` | the plate's `Paint` alpha × `app.fill`, glyph untouched; region at the theme's icon shape in the drawable's bounds (`IconShape.path`/`pathSize`, scaled by `IconNormalizer.ICON_VISIBLE_AREA_FACTOR` as `drawContent` does), corners measured from the path; home screen and dock under `app.icons`, the app drawer's grid, predictions and search results (`mDisplay` 1, 8, 9) under `app.drawer` |
+| home screen widgets | the same two | `com.android.launcher3.CellLayout.dispatchDraw(Canvas)`, which gives each `…launcher3.widget.LauncherAppWidgetHostView` on the page a drawable in its `ViewOverlay` | the plate's alpha × `app.fill`, or × `app.contrast` where the widget's text would be lost; the plate is the view the launcher rounds (`RoundedCornerEnforcement.findBackground`); region at the launcher's enforced rect and radius, else the plate's outline, else `system_app_widget_background_radius`; workspace only |
+| shade scrims | `com.android.systemui` | the `UNLOCKED` and `SHADE_LOCKED` `…statusbar.phone.ScrimState`s' `setShadePanelColor(int)` / `setNotificationScrimColor(int)` | the colour's alpha × `app.scrim`; `ScrimController.updateThemeColors()` and `applyAndDispatchState()` re-apply it on a switch |
+| notification cards | `com.android.systemui` | `com.android.internal.graphics.drawable.BackgroundBlurDrawable.setColor(int)` when its callback is a `…notification.row.NotificationBackgroundView` | the card fill's alpha × `app.cards`; the region is the framework's own |
+| heads-up notifications | `com.android.systemui` | after-hook on `…notification.row.ExpandableNotificationRow.usesTransparentBackground()` | true instead of false while a heads-up must stay on screen, when row transparency is on and not on the keyguard; LSPosed only |
+| QS brightness slider, crDroid's volume slider | `com.android.systemui` | `androidx.compose.material3.SliderDefaults.Track-mnvyFg4` (an instance method of `SliderDefaults.INSTANCE`) | `colors` (a `SliderColors`) remade with the active track's alpha × `app.accent` and the inactive track's × `app.fill`, thumb and ticks unchanged; a `drawBehind` on `modifier` draws a region at the track's bounds with its outer corner radius (the `cornerDp` argument); only a track in the shade's window (`TYPE_NOTIFICATION_SHADE`), not the volume or brightness dialogs |
+| text selection toolbar (Cut, Copy, Paste) | `com.android.systemui` | `…selectiontoolbar.app.ui.RemoteSelectionToolbar.show(ShowInfo)` | `ViewGlass` on its public `contentContainer` (the framework's `floating_popup_container`), shadow off; every app's toolbar, with no app in scope (below) |
+| screenshot action bar | `com.android.systemui:screenshot` | `…screenshot.ScreenshotShelfViewProxy$prepareEntranceAnimation$1.onPreDraw()` | `ViewGlass` on `ScreenshotShelfView.actionsContainerBackground`, shadow off |
+| drawer search box | the two launchers | `…allapps.search.AppsSearchContainerLayout.onLayout` (crDroid), `…nexuslauncher.allapps.UniversalSearchInputView.onLayout` (Pixel) | `ViewGlass` on the view; it follows the launcher's own pill alpha (Pixel hides the pill while search is open) and crDroid's new background on every layout |
+| dock search bar, crDroid | `com.android.launcher3` | `com.android.launcher3.qsb.QsbLayout.onMeasure` | `ViewGlass` on the accent ring (`outer`), else the pill (`inner`); the pill and the Gemini circle inside the ring get only the fill cut; fades as the drawer opens |
+| dock search bar, Pixel | `com.google.android.apps.nexuslauncher` | the widget hook above: the bar is an app widget (`OseWidgetView`, Google's RemoteViews) that `Hotseat` holds directly | the widget path, under `app.search`; its pill is the full-width images in the RemoteViews (two `GradientDrawable` images), with their own corner radius |
+| lockscreen clock | `com.android.systemui` | `…customization.clocks.view.DigitalClockTextView.onLayout` and `…shared.clocks.view.FlexClockViewGroup.onLayout` (the flex clock, both builds); crDroid's `…systemui.clocks.ClockStyle.applyClockAlpha()` (its own clock styles); `com.android.keyguard.ClockEventController.setClock(ClockController)` (clock faces from plugins, both builds) | no region: a `RenderEffect` on the clock's view (the large clock's digit group, the small clock's text, each `TextClock` of a crDroid style whose digits are at least 24 dp tall, a plugin face's view) draws the glyphs as glass refracting a capture of the screen behind them (below); shade window only, never while dozing |
+
+A17's Quick Settings are Compose only, in crDroid 13.1 and in the AVD's
+SystemUIGoogle alike: `QSTileViewImpl`, `QSPanel` and `TileLayout` are gone, so
+there is no tile View to hook. `TileExpandable` passes its colour lambda to
+`rememberExpandableController`, and `Expandable`'s `animatedBackground` reads it
+at draw time, so the one hook covers fill and bounds. Its parameters are matched
+by type, because crDroid's has an extra boolean. Compose is reached by
+reflection into SystemUI's own R8-processed copy (names are kept, and each one
+was checked in both builds), with Kotlin lambdas made as `Proxy`s of the host's
+`Function0`/`Function1`.
+
+Themed icons are the one kind of launcher icon whose plate is drawn at draw
+time. A full-colour icon is a cached bitmap with its background baked in (see
+"Not built"), but `ThemedIconDelegate.drawContent` draws the shape's shadow
+layer and then the plate with the `Paint` it is given, clipped to the theme's
+icon shape, and only then the tinted monochrome glyph with its own paint. So a
+translucent copy of that `Paint` fades the plate and its shadow and leaves the
+glyph. crDroid's ThemePicker "Minimal" app icon style
+(`ThemePickerIconStyle.MONOCHROME`) sets the launcher's themed-icons preference,
+so on crDroid it is the same code path; this is read from the source and not
+yet run there. `drawContent` does not know which view it draws for, and a region
+needs the view's window: the hook on `FastBitmapDrawable.draw`, its caller,
+notes the drawable and canvas, and `drawContent` pairs with it only if both
+match. The drawable's callback is the `BubbleTextView`, and one displaying on
+the workspace (`mDisplay` 0: home screen and dock) or in the app drawer (1, 8,
+9: `displayIsAppDrawer()`) gets glass. crDroid themes the drawer's icons when its
+drawer setting asks for themed icons (`mThemeAllAppsIcons`); the Pixel launcher
+does not. The drawer's grid scrolls under its search box and off its bottom
+edge, where the RecyclerView clips the icon but not the region, so a drawer
+icon's region fades by the share of its plate (`getIconBounds`) that
+`getLocalVisibleRect` still shows. It keeps the punch: under a plate it clears
+the drawer's sheet, so the plate is a window onto the glass rather than glass
+veiled by the sheet. Folder previews, the open folder, drag views and software
+snapshots stay stock, and so does an unpinned dock prediction
+(`PredictedAppIcon`), which paints its own plate and ring over the icon.
+
+A widget is a RemoteViews tree that the launcher only hosts, and neither
+launcher's host view declares a draw method, so the hook is on the page:
+`CellLayout.dispatchDraw` gives each widget host on it a drawable in the host's
+`ViewOverlay`. The overlay draws with the host's canvas after the widget, so
+the region follows page scrolls, the spring-loaded shrink and reorder
+animations, and it does not punch, which would erase the widget drawn under
+it. The plate is the view the launcher itself rounds
+(`RoundedCornerEnforcement.findBackground`: `@android:id/background`, else the
+first view that draws), and only its alpha changes; text, images and the
+widget's other backgrounds keep theirs. A RemoteViews update can replace the
+plate without the launcher redrawing anything, so a pre-draw check redraws the
+overlay when the widget's content, plate or plate position changes. The
+widget picker's previews and a dragged widget stay stock.
+
+A widget's text is drawn for its own plate, so with less plate the glass can
+swallow it: dark text on a light plate over a dark wallpaper (the Calendar
+month widget in the AVD's light theme), light text on a dark plate over a light
+one. Such a widget keeps `app.contrast` (0.65) of its plate instead of
+`app.fill` (0.3). The plate's tone is the mean colour of a copy drawn at 8×8
+(a selector's current child), read before its alpha first changes; the
+wallpaper's is Android's own (`WallpaperColors` hints: dark below a mean
+luminance of 0.3, light above 0.7), followed through
+`WallpaperManager.addOnColorsChangedListener`. Dark text is guarded on a dark
+wallpaper only, light text on any wallpaper Android does not call dark: white
+text loses its contrast well before a wallpaper counts as light. A plate that
+cannot be read is taken to follow the system theme, as widgets usually do.
+
+`ViewGlass` covers the rest: a view whose own background is the control's
+plate (a popup's container, a search box). A drawable in the view's
+`ViewOverlay` draws the region at the view's outline (rect and radius) and the
+background keeps `app.fill` of its alpha; text and icons are untouched. The
+overlay is drawn after the background, so the alpha is set in a pre-draw
+listener instead, after the host's animations and before the background is
+drawn. Each time the host sets the background's alpha itself (Pixel's drawer
+pill fades to 0 while search is open), that becomes the background's own, the
+fill is taken of it, and the region follows: full strength at the highest alpha
+seen, gone at 0. `shadowless()` also clears the view's outline shadow colours,
+since the shadow is drawn under the whole outline and showed through a
+translucent background: the toolbar's glass came out darker than its stock
+fill until the shadow was off. A view added to a new
+window (the screenshot UI, each time) gets its listeners there again: a tree
+observer belongs to the window, not to the view, and the per-window sync in
+`Region` re-registers the same way.
+
+On A17 an app does not draw its own text selection toolbar. With
+`android.permission.flags.system_selection_toolbar_enabled` (on in both builds
+in hand) and the `selection_toolbar` service present, `FloatingToolbar` makes a
+`RemoteFloatingToolbarPopup`: a transparent `PopupWindow` holding a
+`setZOrderOnTop` SurfaceView, into which SystemUI's
+`SysUiSelectionToolbarRenderService` draws the toolbar through a
+`SurfaceControlViewHost`. So every app's toolbar is a view tree in SystemUI's
+process, already in scope, and its region is on the SCVH's layer
+(`blurRegions.size()=1` there). An app on a build without that flag, or with an
+old target, uses `LocalFloatingToolbarPopup` in its own process; that path is
+not hooked, and would need every app in the module's scope.
+
+The screenshot UI runs in SystemUI's second process,
+`com.android.systemui:screenshot`, which LSPosed also loads the module into;
+`Entry` routes it to the screenshot hook only. Its window is added for each
+screenshot and removed on dismissal; the pill starts GONE and its overlay draws
+once it is shown, and the region follows its alpha and slide through the
+entrance and the dismissal.
+
+The brightness slider is a Material 3 `Slider` whose track SystemUI draws
+through `SliderDefaults.Track-mnvyFg4`, as the tiles draw through
+`TileExpandable`: one before-hook remakes the colours and adds the
+`drawBehind`. Compose restarts `Track` with the arguments its body received,
+which are the hook's, so the hook recognises its own modifier and colours and
+never wraps or fades twice; it reads a snapshot state in the caller's
+composition, so a switch recomposes the caller. The volume dialog and the
+brightness dialog reach the same method from their own windows and stay stock.
+One region covers the whole track, the 6 dp gaps beside the thumb included;
+crDroid's auto-brightness and ringer buttons beside the sliders are separate
+`IconButton`s and stay stock (Not built).
+
+The lockscreen clock is the one control whose glass the companion draws
+itself (`ClockGlass`). A region is a rounded rect, and SurfaceFlinger never sees
+the glyphs; handing the engine a mask would need a file channel and sepolicy,
+and could not follow the clock's per-frame animations. So it is done in
+SystemUI, as Kyant0's AndroidLiquidGlass catalog does its lockscreen clock in
+its app (`LockScreenContent.kt`, `SdfShader.kt`, Apache-2.0; its look and
+parameters are reimplemented, no code is copied). A `RenderEffect` on the
+clock's view takes whatever the view draws as the glass's shape, so the flex
+clock's font weight, size and digit animations need nothing extra. The demo
+reads a signed distance field from a prebaked texture; here it is rebuilt from
+the glyphs on every draw. They are Gaussian-blurred, and under a straight edge
+the blurred coverage is Φ(d/σ), so the logistic approximation of Φ gives the
+depth d back in closed form, and the coverage's gradient gives the edge's
+normal n. An AGSL shader samples the backdrop at p − k·h·n, with the demo's
+profile k = circleMap(1 − d/band) (1 at the edge, 0 from `band` inwards), then
+applies its 25% white fill, colour controls (brightness −0.1, contrast 0.75,
+saturation 1.5) and a bevel lit from 45°. `DST_IN` with the clock's own drawing
+keeps the result to the glyphs and their antialiased edges. Sizes follow the
+digit height H measured with the clock's paint, in the demo's proportions:
+band 0.09 H, refraction height 0.45 H.
+
+The backdrop is the screen without the shade window, which holds the clock:
+`IWindowManager.captureDisplay` with that window's layer excluded, at a quarter
+of the display's resolution (the demo blurs its backdrop by 2 dp; the bilinear
+upscale does about as much). Both SystemUI builds hold `READ_FRAME_BUFFER`. The
+capture runs on a background thread, 25–80 ms on the AVD. It is taken once the
+clock has sat on the lockscreen for 400 ms, not dozing and at a steady alpha,
+and again after every doze and every wallpaper change. It is never taken while
+dozing, or while the keyguard comes or goes, when it would show the app behind.
+Each frame the backdrop's matrix maps the screen into the clock's own
+coordinates, so the glass stays put on the wallpaper while the clock moves
+(the switch between the large and small clock, the shade pulled down).
+`IWindowManager.screenshotWallpaper` would have been simpler, but it crops the
+wallpaper window's own layer in that layer's coordinates
+(`WallpaperController.screenshotWallpaperLocked`), which need not line up with
+the screen where the wallpaper is offset for the home pages (not tested); the
+display capture is what lies behind the clock by construction. Plain glass, translucent white
+with the same bevel and no refraction, stands in when there is nothing to
+refract: a live wallpaper (anything but SystemUI's own image and gradient
+wallpapers; a capture would not move), a failed capture, or `app.clock=plain`.
+The clock is stock while dozing, and the effect crossfades with the clock's own
+drawing through the doze transition. It is also stock outside the shade window
+(the wallpaper picker's preview, which SystemUI draws too), and until the first
+capture is back; then the glass fades in over 250 ms. It is not a region and
+costs no composition: one blur and one shader pass over the clock's view when
+its content or position changes.
+
+Clock faces from plugins get the same glass. crDroid ships Pixel's
+(`SystemUIClocks-BigNum`, `-Calligraphy`, `-Growth`, `-Inflate`, `-Metro` and
+`-NumOverlap` in `/system_ext/priv-app`); SystemUI loads each through its
+`PluginManager` with a class loader of its own and its own copy of the clock
+view classes, so hooks on SystemUI's classes never see them.
+`ClockEventController.setClock` is where SystemUI takes every new clock, from
+any provider, with both faces' views made; the hook there hands each face's
+view to the same code, skipping views from SystemUI's own class loader (the
+flex clock, hooked as above) and analog faces (an id starting `ANALOG`: BigNum,
+hands on a dial). Each face's view group draws all of its digits itself
+(`DigitalClockViewGroup.onDraw` calls each digit's `draw(Canvas)`), so the group
+gets the effect, and Inflate's and NumOverlap's overlapping digits make one
+piece of glass. Plain glass would then make all four digits one grey shape, and
+these faces are coloured per digit, so a face's own drawing tints its glass:
+the shader runs twice over the same blur, once for the unlit glass and once for
+its light, and the result is (glass·(1 − t) + face·t) screened with the light,
+t being `app.clocktint` (default 0.5; 0 is the flex clock's clear glass). Mixing
+before the light keeps the rim as bright as on clear glass, where tinting after
+it dimmed the rim by the same factor; multiplying by the face's colours made
+dark glass of dark fills. A face's own `dozeFraction` drives the doze
+crossfade, and its digit height comes from its text paint, or, for Metro's
+Lottie digits, 0.7 of its tallest digit view. Inflate's small clock measures
+itself from its digits' positions before they are laid out, so its width is 0
+until the next minute's re-measure, with its digits drawn outside it, where an
+effect does not reach (and its date drawn under it): the companion asks for
+that layout once, at once.
+
+The notification shade needs no new regions on A17. With notification row
+transparency on (`Settings.Secure notification_row_transparency`, on on
+alioth), `NotificationBackgroundView.setBlurBackgroundEnabled(true)` gives each
+card a `BackgroundBlurDrawable`, and the engine already draws every card as a
+pane. Paint hides the panes: the drawable fills the card itself (the theme's
+`surface_effect_1`, `#8a121317` in alioth's dark theme), and under the card lie
+the shade's behind scrim (alpha 0.725 on alioth and the AVD, the shade panel
+colour's) and notifications scrim (0.5). Together they cover about 94% of each
+pane, so glass mode multiplies the scrims by `app.scrim` and the card fill by
+`app.cards`. The keyguard, bouncer and AOD scrims are not touched. crDroid's
+own Settings → UI → Shade style → Glass (`shade_color_style` 1) lightens the
+same two scrim colours from the theme side, down to a contrast floor capped at
+0.72 behind; the companion's cut applies on top of whichever style is chosen.
+A heads-up has no region at all: `usesTransparentBackground()` returns false
+for a row that must stay on screen, so the row drops its drawable and paints an
+opaque colour over the app below. The after-hook keeps the row's own drawable,
+region and translucent fill instead, and the engine draws it over the app. The
+A17 AVD's SystemUIGoogle has no `setBlurBackgroundEnabled`, so there the
+companion changes the scrims only.
+
+Framework behaviours the companion changes:
+
+- **Punch per surface.** The framework paints the drawable's shape in
+  transparent `SRC`, erasing what the window drew there. Under a tile that is
+  the shade's scrim, so the tile showed the unveiled home screen, darker than its
+  surroundings in a light theme. QS tiles therefore clear the xfermode
+  (transparent `SRC_OVER` draws nothing, and the node still reports its
+  position). Launcher regions keep the punch: nothing the launcher draws belongs
+  under an icon or a folder, and after some cold starts the Pixel launcher
+  leaves a dock prediction (ring, plate and glyph) under each pinned dock icon,
+  which the stock opaque plate hides and a translucent one showed. `app.punch=1`
+  or `0` forces one way everywhere.
+- **Regions follow what hides the control.** A region is not part of the view
+  tree, so an ancestor's alpha or visibility does nothing to it. Before each
+  frame, a pre-draw listener scales every region by its control's ancestors'
+  alpha and visibility, and launcher regions also by the app drawer's position
+  (`AllAppsTransitionController.mProgress`: 1 closed, 0 open). A17's launchers do
+  not fade the workspace for the drawer: every ancestor of a home-screen icon
+  stays visible at alpha 1 while the drawer's translucent panel slides over, and
+  the glass left under it showed through as faint discs. Compose fades with
+  graphics layers, whose alpha hwui applies to the layer's RenderNode and never
+  to a region inside it, so QS tiles and sliders also multiply in the alpha of
+  every layer from their draw node out to the root (`NodeCoordinator.layer`,
+  `lastLayerAlpha`, an explicit layer's own alpha: the fields Compose reads for
+  `isTransparent()`). Glass under a tile row that QS had faded to 0 stayed at
+  full strength before (VERIFIED.md). The window's blur aggregator copies its
+  regions in a pre-draw listener of its own, registered when the window got its
+  first region, so before the companion's: what the sync changed reached
+  SurfaceFlinger a frame late, and never if the window stopped drawing straight
+  after (the last frame of a fade). The companion moves the aggregator's
+  listener behind its own when it starts watching a window, so the change goes
+  with the same frame. A change made while drawing still reaches SurfaceFlinger
+  a frame later, so a region that changes asks for that frame.
+- **Moves on RenderThread alone ask for a UI frame.** hwui reports a region's
+  position on every frame it renders, but the aggregator only sends regions from
+  frames the UI thread drew. Each region also listens to its node's position
+  (`RenderNode.addPositionUpdateListener`), and a move on a frame no pre-draw
+  started asks the window for one (`app.rtfollow`, default on). A17 has no
+  RenderThread backend for `View.animate()`, so this has not caught a case on
+  the AVD; it is a guard.
+- **Switches are pushed, not only pulled.** A control re-reads the switches when
+  it is drawn, and a host does not redraw what it has no reason to. Tiles in an
+  open QS and a folder on an idle home screen kept their regions and translucent
+  fills after a switch to stock, and stock SurfaceFlinger drew those regions as
+  plain blur. On a change the companion redraws every control (tiles read a Compose
+  snapshot state at draw time, which it writes; folder hosts are invalidated),
+  and an idle host hears of a change through
+  `SystemProperties.addChangeCallback`, which runs on `SYSPROPS_TRANSACTION`
+  (`service call activity 1599295570`). `setprop` alone sends none, so
+  `glassctl` should send it after every write. Until it does, a switch reaches a
+  control when that control is next shown.
+
+### What a region costs
+
+Per layer with blur, per frame, SkiaRenderEngine makes one blur *generation*
+per distinct radius, over the layer's whole bounds clipped to the display, not
+over the region (`cachedBlurs`, seeded by the layer's own background blur).
+Then it makes one `drawBlurRegion` per region, which with the engine is one
+glass shader pass over that region's rect. So:
+
+- N tiles at one radius cost one full-screen blur generation plus N small
+  shader passes. The generation is saved only on frames where their radius
+  equals the shade's. They default to the framework radius (100 dp: 263 px on
+  the AVD) against the shade's 89 (AVD) or 77 (alioth). `app.radius` can match
+  the shade, but the shade's radius animates with the expansion.
+- Regions force GPU composition. The open shade is GPU-composited anyway, but the
+  home screen otherwise need not be: a folder region costs a GPU composition on
+  every launcher frame (page scrolls, app-launch animations), and it blurs only
+  the wallpaper. With themed icons every icon on the home screen and dock is a
+  region too: 5 on the AVD's sparse home screen, 20–30 on a full one, each one
+  glass pass per composited launcher frame, and so is each widget. Not
+  measured yet.
+- Nothing is composed while nothing changes, so an idle QS or home screen costs
+  nothing extra.
+- Off-screen pager pages are still regions (QS page 2: four), one call each
+  that draws nothing visible.
+
+Measured on the A17 AVD with `companion/tools/cost.sh`: TimeStats RenderEngine
+time per composited frame over 6 QS open/close cycles, two passes in opposite
+orders. This is SwiftShader, so only the ratios carry over:
+
+| | ms per frame |
+|---|---|
+| stock | 36–46 |
+| glass, tiles off (`app.qs=0`) | 103–111 |
+| glass, 14 tile regions | 128–135 |
+| the same at the shade's radius (`app.radius=89`) | 127 |
+
+The tiles add 16–31% to RenderEngine time on top of glass. Matching the shade's
+radius was within the noise. A real-GPU pass on alioth is still owed. Two
+cheaper designs were not built: tiles that follow the shade's live radius
+(SystemUI sets it in `BlurUtils.applyBlur`), and hiding regions of tiles
+outside the window.
+
+### How it stays opt-in
+
+1. **LSPosed scope.** The APK has no activity, service, receiver or permission.
+   LSPosed loads it only into the apps ticked in its scope; `xposedscope` just
+   suggests SystemUI and the two launchers.
+2. **The engine's switch.** `Gate` reads the engine's own properties and draws
+   only when `persist.sys.glass.mode` is `glass`/`on`, `bypass` is not 1 and
+   `enabled` is not 0. The Action button, the WebUI and `glassctl` therefore
+   switch the controls together with the compositor.
+3. **A live engine.** The mode persists, so it still says glass when the module
+   is disabled, stood down by its boot guard, or removed. Stock SurfaceFlinger
+   would then blur the regions into frosted tiles. So the companion also needs
+   `sys.glass.engine` to be `hooked` or `glass`; `not-hooked`, `no-glass` and
+   empty mean stock. On a debuggable build an empty value passes, since a dev
+   install of the engine may predate the report (the AVD's does). alioth
+   reports `glass`.
+4. **Per surface:** `persist.sys.glass.app.qs=0`, `persist.sys.glass.app.folders=0`,
+   `persist.sys.glass.app.icons=0`, `persist.sys.glass.app.widgets=0`,
+   `persist.sys.glass.app.shade=0` (scrims and cards),
+   `persist.sys.glass.app.headsup=0`, `persist.sys.glass.app.sliders=0`,
+   `persist.sys.glass.app.toolbar=0`, `persist.sys.glass.app.screenshot=0`,
+   `persist.sys.glass.app.drawer=0` (drawer icons),
+   `persist.sys.glass.app.search=0` (drawer and dock search boxes),
+   `persist.sys.glass.app.clock=0` (the lockscreen clock; `plain` keeps its
+   glass but refracts nothing; `persist.sys.glass.app.clocktint`, 0 to 1, is
+   how much of a plugin face's own colours its glass keeps). Themed icons also need the user's
+   own choice of themed (on crDroid, "Minimal") icons; full-colour icons are
+   never touched. Cards and heads-ups need the user's notification row
+   transparency.
+5. **Off is stock.** No region, and the host's colour returned unchanged: 0
+   shade regions in stock mode, with `app.qs=0`, and with the engine reporting
+   `no-glass` (VERIFIED.md).
+6. **Fail closed.** Every hook catches everything. A missing class, method or
+   field leaves that surface stock, with one line in logcat (`StockGlassApp`)
+   and the LSPosed log.
+
+### Not built
+
+- **Full-colour icon backgrounds.** Themed icons are built (above). Full-colour
+  icons reach the screen as cached bitmaps (`BaseIconFactory` and the icon
+  cache) with the adaptive icon's background layer baked in. Glass under them
+  would need them re-rendered without it (a hook in the icon factory, plus
+  invalidating the cache through `IconProvider`'s system state), and an app's
+  own background layer is part of its look, where a themed plate is only the
+  theme's.
+- Icon regions are rounded rects measured from the theme's shape: exact for a
+  circle or a rounded square, closest at the corners for a squircle or a
+  cookie.
+- **The open folder panel.** Its region would blur the wallpaper but not the
+  workspace icons behind it, which are in the same layer, so it would read as a
+  hole. Left stock.
+- **Recoloured widget content.** A widget's text and icons stay as the app drew
+  them; where they would be lost on glass, the widget keeps more plate (above).
+  Forcing them light, as a "clear" home screen style would, means overriding
+  the widget's colour resources (`AppWidgetHostView.setColorResources`) and
+  works only for widgets that take their colours from the system palette.
+- Regions are rounded rects and ignore ancestor clips. Neither showed on QS,
+  folders, icons or widgets on the AVD; drawer icons fade by their visible share
+  instead (above).
+- **The drawer's sheet.** The launcher draws it in `ScrimView` (the rounded
+  sheet, in crDroid's "Background opacity"), over a window that already blurs
+  the wallpaper behind it (the depth controller). A region for it would cover
+  over 90% of the display both ways, which the engine treats as a backdrop
+  (Android's blur, or the `backdrop` style), not a pane. Left as the launcher
+  draws it; its icons and search box have glass.
+- **crDroid's auto-brightness and ringer buttons.** Static composables with no
+  modifier argument; glass there would mean hooking `animateColorAsState`,
+  `clip` and `IconButton` for every call in SystemUI, behind a thread-local flag.
+- **A tinted active track.** A slider's region is one pane under the whole
+  track; tinting only the active part, as an active tile is tinted, needs a
+  second region that follows the thumb.
+- **Other clock faces.** The flex clock (A17's default, large and small),
+  crDroid's text-based clock styles and the digital plugin faces get glass.
+  BigNum, the analog plugin face, and crDroid's analog and image styles
+  (`AnalogClockView`, `NothingAnalogClockView`) stay stock. The clock's date
+  line, smartspace and lock icon stay stock too, as on iOS.
+- **Per-digit glass on overlapping faces.** Inflate's and NumOverlap's digits
+  overlap, and one group draws them all, so they share one shape and one
+  bevel; each digit stays apart by its own colour and outline (the tint).
+  Glass per digit would mean redrawing each digit into a layer of its own.
+
+On the AVD there is no LSPosed, so `companion/dev_attach.sh` loads the same APK
+through a JVMTI agent standing in for the Xposed framework.
+`companion/README.md` covers it and its limits, and how crDroid's clock plugins,
+which the AVD's SystemUI would refuse (a signature permission), are tested there.
+
+## Still open
+- Cost measured only on an emulator GPU (+0.66 ms on a full-screen region).
+  Needs a real-device pass.
+- The companion has only run under its dev loader on the A17 AVD. LSPosed on
+  A17, crDroid's Launcher3QuickStep at run time (folders, widgets, and icons in
+  the "Minimal" style), crDroid's notification cards and heads-ups (LSPosed only),
+  and region cost on a real GPU are unverified.
+- arm64 has loaded and run in stock mode on alioth (crDroid 13.1, A17), but
+  glass has not yet drawn a frame there. Two arm64-only failures so far, both
+  invisible on the x86_64 AVDs: an SELinux `execmem` denial at load (fixed by a
+  pre-hook check plus `sepolicy.rule`), and a compiler-changed calling
+  convention on `MakeForShader(SkString)` that crashed the first glass frame
+  (fixed by compiling through the Options form, checking every by-value
+  callee's result register, and a crash guard). VERIFIED.md has both.
+- The calling-convention check is a short-list decoder of the first
+  instructions: it can only say "x8" for encodings it knows, so a ROM whose
+  prologues look different gets "undetermined" and no glass, not a crash. Only
+  by-value RETURNS are checked; a compiler could also drop or reorder plain
+  arguments of a function it sees every caller of. None of the bound functions
+  on alioth do (read off the disassembly), but a new target deserves the same
+  look.
+- Every AVD runs permissive. Test with `setenforce 1`, or with `hookprobe`
+  under `runcon u:r:surfaceflinger:s0`, before trusting an emulator result on
+  anything SELinux could refuse.
+- The backdrop and pane split, the toned backdrop and the lighter regenerated
+  blur were verified on the A17 AVD (SwiftShader, Ganesh GL). On alioth only the
+  region map is measured; the look of `clear` over real notification cards,
+  whose own backgrounds sit on top of the glass, is not yet seen.
+- `clear` is modelled on a desktop reference, not measured against iOS.
+- `basic`'s Regular stop uses the blend and tone of a WebGPU reimplementation of
+  QuartzCore (uikit.even.how), not values measured on an iPhone; Frosted has no
+  reference at all. Blur intensity (`fillBlurScale`) on panes and region tints
+  have not drawn a frame on Android 17 yet (VERIFIED.md, v0.4.6).
+- `lensBlurRef = 12` was measured on the QPR0 Kawase path. QPR2 and A17 choose
+  KawaseDualFilterV2; re-run the radius sweep on a device.
+- The `frosted` and `prism` presets were judged by eye on the emulator probe,
+  not calibrated. `clear` and `regular` are measured (VERIFIED.md).

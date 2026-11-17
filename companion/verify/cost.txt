@@ -1,0 +1,16 @@
+# tools/cost.sh on glass17 (SwiftShader, Ganesh GL, 1080x2400), 2026-11-17.
+# TimeStats averageRenderEngineTiming per client-composited frame over 6 Quick Settings
+# open/close cycles (3.5 s open, 2 s closed). Emulator CPU rasteriser: compare rows, not
+# absolute times. Pass 2 ran the conditions in reverse order.
+
+## pass 1
+stock                              frames=263  client=254  averageRenderEngineTiming = 36.335 ms
+glass, tiles off (app.qs=0)        frames=179  client=172  averageRenderEngineTiming = 103.099 ms
+glass, tiles on (r=263 default)    frames=167  client=162  averageRenderEngineTiming = 135.167 ms
+glass, tiles on, app.radius=89     frames=165  client=159  averageRenderEngineTiming = 126.591 ms
+
+## pass 2
+glass, tiles on, app.radius=89     frames=161  client=155  averageRenderEngineTiming = 127.013 ms
+glass, tiles on (r=263 default)    frames=160  client=156  averageRenderEngineTiming = 128.128 ms
+glass, tiles off (app.qs=0)        frames=165  client=159  averageRenderEngineTiming = 110.595 ms
+stock                              frames=238  client=234  averageRenderEngineTiming = 46.281 ms

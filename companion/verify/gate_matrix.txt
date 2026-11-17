@@ -1,0 +1,15 @@
+# gate_matrix.sh on glass17, 2026-11-17: blur regions on the NotificationShade layer
+# (tools/shade_count.sh) for every companion switch. 14 = 10 tiles on page 1 + 4 on
+# the off-screen page 2; QQS shows 4 tiles. Without the companion the shade has 0.
+glass (default), full QS                             14
+glass (default), notification shade (QQS)            4
+mode=stock, full QS                                  0
+mode=glass again, full QS                            14
+app.qs=0, full QS                                    0
+app.qs cleared, full QS                              14
+engine reports no-glass, full QS                     0
+engine reports hooked, full QS                       14
+engine report empty (debuggable), full QS            14
+QS held open: mode=stock, setprop only               14
+QS held open: + SYSPROPS_TRANSACTION                 0
+QS held open: mode=glass + SYSPROPS_TRANSACTION      14

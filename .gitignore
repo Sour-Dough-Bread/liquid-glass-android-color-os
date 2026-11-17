@@ -1,0 +1,20 @@
+# Build outputs (module/out, engine/out, engine/tools/out, companion/out, harness/out)
+out/
+/shader/build/
+/engine/vendor/.dobby-build/
+
+# Third-party code, fetched by engine/vendor/fetch_*.sh and build_dobby.sh
+/engine/vendor/dobby/
+/engine/vendor/frida-gum/
+/engine/vendor/patchelf/
+/engine/vendor/patchelf-android/
+/engine/vendor/skia/
+/engine/vendor/xz/
+
+# Captures from real devices: logs and screenshots with personal data
+/captures/
+
+# Local tooling
+/.claude/
+__pycache__/
+*.pyc

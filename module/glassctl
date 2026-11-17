@@ -1,0 +1,322 @@
+#!/system/bin/sh
+# glassctl — switch Stock Glass between Android's own blur and Liquid Glass,
+# pick a preset, and tune it. Everything here is a property write: the engine
+# inside SurfaceFlinger picks changes up within half a second, no reboot.
+#
+#   glassctl                     status (same as `glassctl status`)
+#   glassctl glass | on          draw Liquid Glass over Android's blur regions
+#   glassctl stock | off         Android's own blur, untouched (the default)
+#   glassctl toggle              flip between the two
+#   glassctl preset <name>       pick a preset; clears per-setting tuning
+#   glassctl presets             list the presets
+#   glassctl basic [variant]     the Basic preset: 0 clear, 0.5 regular,
+#                                1 frosted, or anything between
+#   glassctl intensity <x>       blur behind the glass, times the radius the
+#                                app asked for (1 = as asked; Android 17)
+#   glassctl material <0..1>     Liquid Material: tint the glass with the
+#                                Material You palette (0 = off)
+#   glassctl backdrop [style]    what full-screen blurs (the shade) get:
+#                                stock, tone or glass; panes always get glass
+#   glassctl set <name> <value>  override one setting on top of the preset
+#   glassctl unset <name>        drop one override
+#   glassctl reset               drop every override, keep mode and preset
+#   glassctl app                 the companion's parts, each on or off
+#   glassctl app <part> on|off   switch one part of the companion's glass
+#   glassctl app clocktint <x>   how much of a clock face's own colour its glass
+#                                keeps, 0 (clear) to 1 (as drawn); default 0.5
+#   glassctl json                machine-readable state, for the WebUI
+#
+# A backdrop is a blur that covers the display: the notification shade, a
+# dialog's blur-behind. A pane is anything smaller: a notification card, the
+# volume panel, a blurred dialog. Panes get Liquid Glass; the backdrop gets
+# Android's blur (stock), Android's blur lighter and veiled (tone),
+# or Liquid Glass too (glass). Each preset picks one; `backdrop` overrides it.
+#
+# The Action button and the WebUI both call this script, so there is exactly
+# one place that knows which properties mean what.
+MODDIR=${0%/*}
+P=persist.sys.glass
+STATE=/data/adb/glass
+
+ABI=$(cat "$MODDIR/abi" 2>/dev/null)
+[ -n "$ABI" ] || case "$(getprop ro.product.cpu.abi)" in
+  arm64-v8a) ABI=arm64-v8a ;;
+  x86_64)    ABI=x86_64 ;;
+esac
+CHECK="$MODDIR/bin/$ABI/glasscheck"
+
+# Properties that are switches rather than tuning. `reset` and `preset` leave
+# these alone. The three Basic sliders are among them: the variant is what the
+# basic preset is made of, and intensity and Liquid Material apply on top of
+# any preset.
+is_switch() {
+  case "$1" in
+    mode|preset|enabled|follow_theme|variant|fillBlurScale|materialTint) return 0 ;;
+    frostR|frostG|frostB|accentR|accentG|accentB)
+      # Owned by glass-theme.sh while it is following the theme.
+      [ "$(getprop $P.follow_theme)" != "0" ] && return 0 ;;
+  esac
+  return 1
+}
+
+# The parts of the Stock Glass Companion, the LSPosed module that makes blur
+# regions of what Android never blurs (Quick Settings tiles, launcher icons...).
+# Each reads persist.sys.glass.app.<part> and is on unless that is 0. Not
+# settings of the engine's, so `reset` and `preset` leave them alone.
+APP_PARTS="clock qs sliders shade headsup toolbar screenshot icons folders widgets drawer search"
+
+app_on() { [ "$(getprop $P.app.$1)" != 0 ]; }
+
+# Every persist.sys.glass.* that currently holds a value, as name=value.
+set_props() {
+  getprop | sed -n "s/^\[$P\.\([A-Za-z_]*\)\]: \[\(.*\)\]\$/\1=\2/p" | while IFS= read -r kv; do
+    [ -n "${kv#*=}" ] && echo "$kv"
+  done
+}
+
+overrides() {
+  set_props | while IFS= read -r kv; do
+    is_switch "${kv%%=*}" || echo "$kv"
+  done
+}
+
+mode() {
+  # Mirrors the engine: only "glass" (or "on") draws, and the old bypass switch
+  # still forces stock.
+  case "$(getprop $P.mode)" in
+    glass|on) [ "$(getprop $P.bypass)" = "1" ] && echo stock || echo glass ;;
+    *)        echo stock ;;
+  esac
+}
+
+preset() {
+  p=$(getprop $P.preset)
+  if [ -n "$p" ] && "$CHECK" --presets 2>/dev/null | cut -f1 | grep -qx "$p"; then
+    echo "$p"
+  else
+    "$CHECK" --params 2>/dev/null | sed -n 's/.*"defaultPreset":"\([A-Za-z_]*\)".*/\1/p'
+  fi
+}
+
+# The value the engine is using for one setting (override, else preset, else
+# default), as glasscheck computes it from the same tables.
+effective() {
+  "$CHECK" --params 2>/dev/null | grep -o "\"name\":\"$1\",\"default\":[^,]*,\"effective\":[^,]*" \
+    | sed 's/.*"effective"://'
+}
+
+backdrop() {
+  case "$(effective backdrop)" in
+    1) echo tone ;;
+    2) echo glass ;;
+    *) echo stock ;;
+  esac
+}
+
+# Whether the engine is actually running inside the compositor right now. Every
+# switch above is inert until it is, which is the first thing to rule out when
+# a setting "does nothing".
+engine_state() {
+  if [ -f "$STATE/disabled" ]; then echo disabled; return; fi
+  pid=$(pidof surfaceflinger 2>/dev/null)
+  if [ -n "$pid" ] && grep -q libglassengine.so "/proc/$pid/maps" 2>/dev/null; then
+    echo loaded
+  elif [ -x /data/adb/ksud ] && grep -q metamodule /data/adb/ksud 2>/dev/null \
+       && [ ! -e /data/adb/metamodule ]; then
+    echo no-metamodule
+  else
+    echo absent
+  fi
+}
+
+# What the engine reported about itself (sys.glass.engine), and whether it
+# switched glass off because SurfaceFlinger died drawing it (sys.glass.tripped,
+# the time it did, in seconds since the epoch). Both are cleared by a reboot.
+engine_status() { getprop sys.glass.engine; }
+tripped() { getprop sys.glass.tripped; }
+
+clear_overrides() {
+  overrides | while IFS= read -r kv; do setprop "$P.${kv%%=*}" ""; done
+}
+
+param_names() {
+  "$CHECK" --params 2>/dev/null | sed 's/.*"params":\[//' | grep -o '"name":"[A-Za-z_]*"' \
+    | cut -d'"' -f4
+}
+
+status() {
+  m=$(mode)
+  echo "Mode:    $m$([ "$m" = stock ] && echo "  (Android's own blur)")"
+  p=$(preset)
+  if [ "$p" = basic ]; then
+    echo "Preset:  basic, variant $(effective variant)  (0 clear, 0.5 regular, 1 frosted)"
+  else
+    echo "Preset:  $p"
+  fi
+  echo "Blur:    x$(effective fillBlurScale) the radius each app asks for"
+  m=$(effective materialTint)
+  case "$m" in 0|0.0|"") ;; *) echo "Material: $m  (Liquid Material, from the system palette)" ;; esac
+  case "$(backdrop)" in
+    stock) echo "Backdrop: stock  (the shade keeps Android's blur; panes get glass)" ;;
+    tone)  echo "Backdrop: tone   (the shade's blur, lighter and veiled)" ;;
+    glass) echo "Backdrop: glass  (the shade is Liquid Glass too)" ;;
+  esac
+  case "$(engine_state)" in
+    loaded)   case "$(engine_status)" in
+                not-hooked) echo "Engine:  loaded, but declined to hook this ROM's blur"
+                            echo "         (logcat -s StockGlass, right after a reboot, says why)" ;;
+                no-glass)   echo "Engine:  loaded, but the glass shader did not validate on"
+                            echo "         this ROM: Android's blur is drawn instead" ;;
+                *)          echo "Engine:  loaded in SurfaceFlinger" ;;
+              esac ;;
+    disabled) echo "Engine:  DISABLED after a boot that did not complete"
+              echo "         rm $STATE/disabled and reboot to retry" ;;
+    *)        if [ -x /data/adb/ksud ] && grep -q metamodule /data/adb/ksud 2>/dev/null \
+                 && [ ! -e /data/adb/metamodule ]; then
+                echo "Engine:  not loaded — KernelSU 3+ only mounts modules through a"
+                echo "         metamodule, and none is installed. Install one (e.g."
+                echo "         meta-overlayfs) and reboot."
+              else
+                echo "Engine:  not loaded. Last boot said:"
+                sed 's/^/         /' "$STATE/last_boot.log" 2>/dev/null | tail -3
+              fi ;;
+  esac
+  t=$(tripped)
+  if [ -n "$t" ]; then
+    echo "Crash:   SurfaceFlinger restarted at $(date -d "@$t" +%H:%M:%S 2>/dev/null || echo "$t")"
+    echo "         while drawing Liquid Glass, so the engine switched to Android's"
+    echo "         blur. /data/tombstones has the crash. 'glassctl glass' turns it on again."
+  fi
+  o=$(overrides)
+  if [ -n "$o" ]; then
+    echo "Tuning on top of the preset:"
+    echo "$o" | sed 's/^/  /'
+  fi
+}
+
+json() {
+  # glasscheck emits the tables and the live values in one object; the rest is
+  # what only the module can know. regen: whether the engine can blur at
+  # another radius (Blur Intensity), "" until it has started.
+  st=$("$CHECK" --params 2>/dev/null)
+  [ -n "$st" ] || st=null
+  ft=true; [ "$(getprop $P.follow_theme)" = "0" ] && ft=false
+  app="" sep=""
+  for k in $APP_PARTS; do
+    app_on "$k" && v=true || v=false
+    app="$app$sep\"$k\":$v"; sep=,
+  done
+  printf '{"engine":"%s","engineStatus":"%s","tripped":"%s","regen":"%s","followTheme":%s,"app":{%s},"clockTint":"%s","state":%s}\n' \
+    "$(engine_state)" "$(engine_status)" "$(tripped)" "$(getprop sys.glass.regen)" "$ft" "$app" \
+    "$(getprop $P.app.clocktint)" "$st"
+}
+
+number() {
+  case "$1" in
+    ''|*[!0-9.]*) die "'$1' is not a number" ;;
+  esac
+}
+
+die() { echo "glassctl: $*" >&2; exit 1; }
+
+cmd="${1:-status}"
+[ $# -gt 0 ] && shift
+case "$cmd" in
+  status) status ;;
+  glass|on)
+    # Switching on again is the answer to a crash note, so it clears it.
+    [ -n "$(tripped)" ] && setprop sys.glass.tripped ""
+    setprop $P.mode glass
+    [ "$(getprop $P.bypass)" = "1" ] && setprop $P.bypass ""
+    echo "Liquid Glass on ($(preset))"
+    ;;
+  stock|off)
+    setprop $P.mode stock
+    echo "Android's own blur"
+    ;;
+  toggle)
+    if [ "$(mode)" = glass ]; then sh "$0" stock; else sh "$0" glass; fi
+    ;;
+  presets)
+    "$CHECK" --presets | while IFS="$(printf '\t')" read -r n s; do
+      printf '  %-9s %s\n' "$n" "$s"
+    done
+    ;;
+  preset)
+    [ -n "$1" ] || die "usage: glassctl preset <name>   (see: glassctl presets)"
+    "$CHECK" --presets | cut -f1 | grep -qx "$1" || die "no preset '$1' (see: glassctl presets)"
+    setprop $P.preset "$1"
+    clear_overrides
+    echo "Preset: $1"
+    ;;
+  basic)
+    if [ "$(preset)" != basic ]; then
+      setprop $P.preset basic
+      clear_overrides
+    fi
+    if [ $# -ge 1 ]; then number "$1"; setprop $P.variant "$1"; fi
+    echo "Preset: basic, variant $(getprop $P.variant | sed 's/^$/0/')"
+    ;;
+  intensity)
+    [ $# -eq 1 ] || die "usage: glassctl intensity <multiple of the requested radius, 1 = as asked>"
+    number "$1"; setprop $P.fillBlurScale "$1"
+    ;;
+  material)
+    [ $# -eq 1 ] || die "usage: glassctl material <0..1>"
+    number "$1"; setprop $P.materialTint "$1"
+    ;;
+  backdrop)
+    if [ $# -eq 0 ]; then backdrop; exit 0; fi
+    case "$1" in
+      stock|tone|glass) setprop $P.backdrop "$1"; echo "Backdrop: $1" ;;
+      *) die "usage: glassctl backdrop [stock|tone|glass]" ;;
+    esac
+    ;;
+  set)
+    [ $# -eq 2 ] || die "usage: glassctl set <name> <value>"
+    param_names | grep -qx "$1" || die "no setting '$1'"
+    case "$1:$2" in
+      backdrop:stock|backdrop:tone|backdrop:glass) ;;
+      *:|*:*[!0-9.eE+-]*) die "'$2' is not a number" ;;
+    esac
+    setprop "$P.$1" "$2"
+    ;;
+  unset)
+    [ $# -eq 1 ] || die "usage: glassctl unset <name>"
+    setprop "$P.$1" ""
+    ;;
+  reset)
+    clear_overrides
+    echo "Tuning cleared; preset $(preset) as designed"
+    ;;
+  app)
+    if [ $# -eq 0 ]; then
+      for k in $APP_PARTS; do
+        app_on "$k" && printf '  %-9s on\n' "$k" || printf '  %-9s off\n' "$k"
+      done
+      exit 0
+    fi
+    if [ "$1" = clocktint ]; then
+      if [ $# -eq 1 ]; then v=$(getprop $P.app.clocktint); echo "${v:-0.5}"; exit 0; fi
+      number "$2"
+      setprop "$P.app.clocktint" "$2"
+      service call activity 1599295570 >/dev/null 2>&1
+      echo "clocktint: $2"
+      exit 0
+    fi
+    [ $# -eq 2 ] || die "usage: glassctl app [<part> on|off]   (parts: $APP_PARTS)"
+    case " $APP_PARTS " in *" $1 "*) ;; *) die "no part '$1' (parts: $APP_PARTS)" ;; esac
+    case "$2" in
+      on|1)  setprop "$P.app.$1" 1 ;;
+      off|0) setprop "$P.app.$1" 0 ;;
+      *) die "usage: glassctl app $1 on|off" ;;
+    esac
+    # SYSPROPS_TRANSACTION: every app runs its property callbacks now, so the
+    # change shows at once rather than when each control next draws.
+    service call activity 1599295570 >/dev/null 2>&1
+    echo "$1: $2"
+    ;;
+  json) json ;;
+  -h|--help|help) sed -n '2,33p' "$0" | sed 's/^# \{0,1\}//' ;;
+  *) die "unknown command '$cmd' (glassctl help)" ;;
+esac
