@@ -18,6 +18,20 @@ their own:
 There's a write-up of how it works on my site:
 [Liquid Glass inside Android's compositor](https://capthnds.me/blog/liquid-glass-android/).
 
+## See it in action
+
+<p align="center">
+  <a href="https://bnlg.capthnds.me/TMOX7gByb5BebXsyqA/liquid-glass-android-demo.mp4">
+    <img src="docs/images/demo.webp" width="45%" alt="Play the screen recording: a glass timer widget, dock and search bar over a fluid simulation wallpaper" />
+  </a>
+</p>
+
+The picture opens a half-minute screen recording from my phone, with a
+fluid simulation as the live wallpaper. The wallpaper changes every
+frame, so SurfaceFlinger redraws all the glass above it every frame too.
+At 0:17 the app drawer opens, with about 40 glass icons on screen at
+once.
+
 ## Screenshots
 
 From a Poco F3 on crDroid 13.1, Android 17.
