@@ -11,22 +11,66 @@ An optional LSPosed companion makes glass of surfaces that have no blur of
 their own:
 - Quick Settings tiles;
 - the launcher's icons, folders, widgets and search box;
-- sliders, the text-selection toolbar and the screenshot UI;
+- heads-up notifications;
+- sliders, the text selection toolbar and the screenshot UI;
 - the lockscreen clock.
 
-Status: experimental, root only, Android 14 to 17. The installer checks the
+There's a write-up of how it works on my site:
+[Liquid Glass inside Android's compositor](https://capthnds.me/blog/liquid-glass-android/).
+
+## Screenshots
+
+From a Poco F3 on crDroid 13.1, Android 17.
+
+<p>
+  <img src="docs/images/home.webp" width="49%" alt="The home screen, with the calendar and music widgets, app icons, dock and search bar drawn as glass" />
+  <img src="docs/images/lockscreen.webp" width="49%" alt="The lockscreen, with the clock's digits drawn as glass" />
+</p>
+<p>
+  <img src="docs/images/heads-up.webp" width="99%" alt="A heads-up notification as a glass card" />
+</p>
+<p>
+  <img src="docs/images/volume-keyboard.webp" width="99%" alt="The volume panel's sliders and Gboard's keys as glass" />
+</p>
+<p align="center">
+  <img src="docs/images/quick-settings.webp" width="60%" alt="Quick Settings with glass tiles" />
+</p>
+<p>
+  <img src="docs/images/toolbar-screenshot.webp" width="99%" alt="The text selection toolbar and the screenshot action bar as glass" />
+</p>
+
+## Download
+
+| Build | sha256 |
+|---|---|
+| [Module, v0.4.12](https://bnlg.capthnds.me/h8_iDCux-oy7mKk1fb/stockglass-v0.4.12.zip) | `76c84259fc20322e10dc241a369e9d29f9d2a479f8c625ca97b6cbd222011860` |
+| [Companion APK](https://bnlg.capthnds.me/bUc6_77Uk2vmpAXHNu/stockglass-companion.apk) | `c07f7f1f513d5fc25ab44e0afa06f9acc7c4741cf07d1b636d8ad6b190806da4` |
+
+It's experimental and needs root on Android 14 to 17. The installer checks the
 ROM's SurfaceFlinger first and refuses to install if the engine can't drive it.
-It has been tested on a Poco F3 (crDroid 13.1, Android 17, KernelSU 3 with
-meta-overlayfs) and on Android 16 and 17 emulators.
+If a boot ever fails with the module installed, it disables itself on the next
+boot.
+
+1. Flash the module zip in KernelSU, Magisk or APatch, and reboot. KernelSU 3
+   also needs a metamodule such as meta-overlayfs.
+2. Turn glass on with the module's Action button, its WebUI or
+   `sh /data/adb/modules/stockglass/glassctl glass`. Glass is off until you do.
+3. For the companion, install the APK and enable it in LSPosed with System UI
+   and your launcher in its scope. Then reboot.
+
+[module/README.md](module/README.md) and
+[companion/README.md](companion/README.md) cover the settings and each
+surface's requirements. For example, app icons get glass only when they are
+themed.
 
 ## What's here
 
 | Path | What it is |
 |---|---|
-| `module/` | The KernelSU / Magisk / APatch module: the installer, boot scripts, `glassctl` and the WebUI. Start with [module/README.md](module/README.md). |
+| `module/` | The KernelSU / Magisk / APatch module: the installer, boot scripts, `glassctl` and the WebUI. |
 | `engine/` | `libglassengine.so`, which loads into SurfaceFlinger. It resolves Skia's symbols from the ROM's own binary, hooks the blur and draws the glass. |
 | `shader/` | Generates the glass shader (SkSL) that the engine embeds. |
-| `companion/` | The LSPosed module. See [companion/README.md](companion/README.md). |
+| `companion/` | The LSPosed module. |
 | `harness/` | A test app that makes blur regions on demand. |
 | `docs/` | [ARCHITECTURE.md](docs/ARCHITECTURE.md) explains the design. [VERIFIED.md](docs/VERIFIED.md) records what was tested where, with numbers. |
 
