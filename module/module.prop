@@ -1,6 +1,6 @@
 id=stockglass
 name=Stock Glass
-version=v0.4.12
-versionCode=16
+version=v0.4.14
+versionCode=18
 author=capthndsme
 description=An optional Liquid Glass mode for Android's own blur, drawn inside SurfaceFlinger. Panes (notification cards, volume panel, dialogs) become glass, clear through regular to frosted, optionally tinted with your Material You palette. Off until you switch it on: Action button, WebUI or glassctl. Android 14-17.

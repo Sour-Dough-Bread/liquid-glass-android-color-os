@@ -57,8 +57,8 @@ From a Poco F3 on crDroid 13.1, Android 17.
 
 | Build | sha256 |
 |---|---|
-| [Module, v0.4.12](https://bnlg.capthnds.me/h8_iDCux-oy7mKk1fb/stockglass-v0.4.12.zip) | `76c84259fc20322e10dc241a369e9d29f9d2a479f8c625ca97b6cbd222011860` |
-| [Companion APK](https://bnlg.capthnds.me/bUc6_77Uk2vmpAXHNu/stockglass-companion.apk) | `c07f7f1f513d5fc25ab44e0afa06f9acc7c4741cf07d1b636d8ad6b190806da4` |
+| [Module, v0.4.14](https://bnlg.capthnds.me/KfLzkdXetoZ-UXCZ65/stockglass-v0.4.14.zip) | `c1d99a8fbacae5d0751ffc0e747ad5ccf62bf61f25678eba03db3fc4b243fe6d` |
+| [Companion APK](https://bnlg.capthnds.me/X1l-_U6YeApbAXKOM3/stockglass-companion.apk) | `baa9efa6ba9591560aba6c5be6ef16cdeaa1bad83a582767974823eea9783774` |
 
 It's experimental and needs root on Android 14 to 17. The installer checks the
 ROM's SurfaceFlinger first and refuses to install if the engine can't drive it.
