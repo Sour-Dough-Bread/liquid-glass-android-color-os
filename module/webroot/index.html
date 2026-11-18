@@ -85,6 +85,8 @@
     font-weight: 600; color: var(--muted); background: transparent; cursor: pointer;
   }
   .seg.three { grid-template-columns: 1fr 1fr 1fr; }
+  .seg.four { grid-template-columns: repeat(4, 1fr); }
+  .seg.four button { padding: 10px 4px; }
   .seg button[aria-pressed="true"] { background: var(--accent); color: var(--accent-text); }
   .seg button:disabled { opacity: .5; }
 
@@ -571,6 +573,7 @@ const APP_LABELS = {
   headsup: 'Heads-up notifications',
   toolbar: 'Text selection toolbar',
   screenshot: 'Screenshot action bar',
+  toast: 'Toasts',
   icons: 'Themed app icons',
   folders: 'Folders',
   widgets: 'Home screen widgets',
@@ -593,42 +596,104 @@ function renderApps() {
       input.addEventListener('change', (e) => setApp(k, e.target.checked));
       box.appendChild(row);
       appInputs.set(k, input);
-      if (k === 'clock' && 'clockTint' in state) box.appendChild(clockTintRow());
+      if (k === 'shade' && 'scrimColor' in state) box.appendChild(scrimColourRow());
+      for (const spec of APP_SLIDERS[k] || []) {
+        if (spec.state in state) box.appendChild(appSliderRow(spec));
+      }
     }
     input.checked = !!app[k];
   }
-  const tint = document.getElementById('clock-tint');
-  if (tint) {
-    const v = state.clockTint === '' || state.clockTint == null ? 0.5 : Number(state.clockTint);
-    if (document.activeElement !== tint) tint.value = v;
-    document.getElementById('clock-tint-val').textContent = `${Math.round(v * 100)}%`;
-    document.getElementById('clock-tint-row').classList.toggle('dim', !app.clock);
+  for (const [part, specs] of Object.entries(APP_SLIDERS)) {
+    for (const spec of specs) {
+      const slider = document.getElementById(`app-${spec.key}`);
+      if (!slider) continue;
+      const raw = state[spec.state];
+      const v = raw === '' || raw == null ? spec.def : Number(raw);
+      if (document.activeElement !== slider) slider.value = v;
+      document.getElementById(`app-${spec.key}-val`).textContent = `${Math.round(v * 100)}%`;
+      document.getElementById(`app-${spec.key}-row`).classList.toggle('dim', !app[part]);
+    }
   }
+  const colour = state.scrimColor || 'stock';
+  for (const [v] of SCRIM_COLOURS) {
+    const b = document.getElementById(`scrim-${v}`);
+    if (b) b.setAttribute('aria-pressed', String(v === colour));
+  }
+  const scrimRow = document.getElementById('scrim-colour-row');
+  if (scrimRow) scrimRow.classList.toggle('dim', !app.shade);
   document.getElementById('app-card').classList.toggle('dim', !(state.state && state.state.mode === 'glass'));
 }
 
-// How much of a plugin clock face's own colours (Inflate, Number Overlap...)
-// its glass keeps: 0 is clear glass like the default clock, 1 the face as drawn.
-function clockTintRow() {
+// Settings under a part's switch, each `glassctl app <key> <0..1>`. `state` is
+// the field of `glassctl json` that holds it, "" while it is at its default.
+const APP_SLIDERS = {
+  // How much of a plugin clock face's own colours (Inflate, Number Overlap...)
+  // its glass keeps: 0 is clear glass like the default clock, 1 the face as drawn.
+  clock: [{ key: 'clocktint', state: 'clockTint', def: 0.5, label: 'Clock face colour in the glass',
+    ticks: ['Clear glass', "Face's own colours"] }],
+  // A tile that is on: its glass tinted in its colour, and its own fill over that.
+  qs: [
+    { key: 'tint', state: 'tileTint', def: 0.6, label: "Colour in an active tile's glass",
+      ticks: ['Clear glass', 'Solid colour'] },
+    { key: 'tilecolor', state: 'tileColor', def: 0.5, label: "Active tile's own colour over it",
+      ticks: ['None', 'As Android draws it'] },
+  ],
+  // The shade's background (its scrims): how much of Android's alpha it keeps.
+  shade: [{ key: 'scrim', state: 'scrim', def: 0.5, label: 'Shade background strength',
+    ticks: ['Clear', 'As Android draws it'] }],
+};
+
+function appSliderRow(spec) {
   const row = document.createElement('div');
   row.className = 'row';
-  row.id = 'clock-tint-row';
-  row.innerHTML = `<div class="top"><label for="clock-tint">Clock face colour in the glass</label>
-    <span class="val" id="clock-tint-val"></span></div>
-    <input type="range" id="clock-tint" min="0" max="1" step="0.05">
-    <div class="ticks"><span>Clear glass</span><span>Face's own colours</span></div>`;
+  row.id = `app-${spec.key}-row`;
+  row.innerHTML = `<div class="top"><label for="app-${spec.key}"></label>
+    <span class="val" id="app-${spec.key}-val"></span></div>
+    <input type="range" id="app-${spec.key}" min="0" max="1" step="0.05">
+    <div class="ticks"><span></span><span></span></div>`;
+  row.querySelector('label').textContent = spec.label;
+  const ticks = row.querySelectorAll('.ticks span');
+  ticks[0].textContent = spec.ticks[0];
+  ticks[1].textContent = spec.ticks[1];
   const input = row.querySelector('input');
   let timer = null;
   const send = async () => {
-    const r = await exec(`${CTL} app clocktint ${q(input.value)}`);
+    const r = await exec(`${CTL} app ${spec.key} ${q(input.value)}`);
     if (r.errno) toast(r.stderr || 'Could not set it');
-    else state.clockTint = input.value;
+    else state[spec.state] = input.value;
   };
   input.addEventListener('input', () => {
-    document.getElementById('clock-tint-val').textContent = `${Math.round(input.value * 100)}%`;
+    document.getElementById(`app-${spec.key}-val`).textContent = `${Math.round(input.value * 100)}%`;
     clearTimeout(timer); timer = setTimeout(send, 150);
   });
   input.addEventListener('change', () => { clearTimeout(timer); send(); });
+  return row;
+}
+
+// The shade's background: Android's two tones (a panel colour behind
+// everything, another under the notifications), or one colour over all of it.
+const SCRIM_COLOURS = [['stock', 'Two-tone'], ['black', 'Black'], ['white', 'White'], ['tint', 'Tinted']];
+
+function scrimColourRow() {
+  const row = document.createElement('div');
+  row.className = 'row';
+  row.id = 'scrim-colour-row';
+  row.innerHTML = `<div class="top"><label>Shade background colour</label></div>
+    <div class="seg four" role="group" aria-label="Shade background colour"></div>`;
+  const seg = row.querySelector('.seg');
+  for (const [v, label] of SCRIM_COLOURS) {
+    const b = document.createElement('button');
+    b.id = `scrim-${v}`;
+    b.setAttribute('aria-pressed', 'false');
+    b.textContent = label;
+    b.addEventListener('click', async () => {
+      const r = await exec(`${CTL} app scrimcolor ${v}`);
+      if (r.errno) { toast(r.stderr || 'Could not set it'); return; }
+      state.scrimColor = v;
+      renderApps();
+    });
+    seg.appendChild(b);
+  }
   return row;
 }
 

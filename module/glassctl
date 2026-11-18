@@ -24,6 +24,14 @@
 #   glassctl app <part> on|off   switch one part of the companion's glass
 #   glassctl app clocktint <x>   how much of a clock face's own colour its glass
 #                                keeps, 0 (clear) to 1 (as drawn); default 0.5
+#   glassctl app tint <x>        a Quick Settings tile that is on: how strongly
+#                                its glass takes the tile's colour; default 0.6
+#   glassctl app tilecolor <x>   ...and how much of its own colour it keeps
+#                                over that glass; default 0.5
+#   glassctl app scrim <x>       the shade's background, times its alpha;
+#                                default 0.5
+#   glassctl app scrimcolor <c>  the shade's background: stock (two tones) or
+#                                one colour, black, white or tint (the accent)
 #   glassctl json                machine-readable state, for the WebUI
 #
 # A backdrop is a blur that covers the display: the notification shade, a
@@ -63,7 +71,7 @@ is_switch() {
 # regions of what Android never blurs (Quick Settings tiles, launcher icons...).
 # Each reads persist.sys.glass.app.<part> and is on unless that is 0. Not
 # settings of the engine's, so `reset` and `preset` leave them alone.
-APP_PARTS="clock qs sliders shade headsup toolbar screenshot icons folders widgets drawer search"
+APP_PARTS="clock qs sliders shade headsup toolbar screenshot toast icons folders widgets drawer search"
 
 app_on() { [ "$(getprop $P.app.$1)" != 0 ]; }
 
@@ -206,9 +214,10 @@ json() {
     app_on "$k" && v=true || v=false
     app="$app$sep\"$k\":$v"; sep=,
   done
-  printf '{"engine":"%s","engineStatus":"%s","tripped":"%s","regen":"%s","followTheme":%s,"app":{%s},"clockTint":"%s","state":%s}\n' \
+  printf '{"engine":"%s","engineStatus":"%s","tripped":"%s","regen":"%s","followTheme":%s,"app":{%s},"clockTint":"%s","tileTint":"%s","tileColor":"%s","scrim":"%s","scrimColor":"%s","state":%s}\n' \
     "$(engine_state)" "$(engine_status)" "$(tripped)" "$(getprop sys.glass.regen)" "$ft" "$app" \
-    "$(getprop $P.app.clocktint)" "$st"
+    "$(getprop $P.app.clocktint)" "$(getprop $P.app.tint)" "$(getprop $P.app.tilecolor)" \
+    "$(getprop $P.app.scrim)" "$(getprop $P.app.scrimcolor)" "$st"
 }
 
 number() {
@@ -296,14 +305,29 @@ case "$cmd" in
       done
       exit 0
     fi
-    if [ "$1" = clocktint ]; then
-      if [ $# -eq 1 ]; then v=$(getprop $P.app.clocktint); echo "${v:-0.5}"; exit 0; fi
-      number "$2"
-      setprop "$P.app.clocktint" "$2"
-      service call activity 1599295570 >/dev/null 2>&1
-      echo "clocktint: $2"
-      exit 0
-    fi
+    # Settings rather than parts: a number, or the shade's colour.
+    case "$1" in
+      clocktint|tint|tilecolor|scrim)
+        if [ $# -eq 1 ]; then
+          v=$(getprop $P.app.$1)
+          [ -n "$v" ] || case "$1" in tint) v=0.6 ;; *) v=0.5 ;; esac
+          echo "$v"; exit 0
+        fi
+        number "$2"
+        setprop "$P.app.$1" "$2"
+        service call activity 1599295570 >/dev/null 2>&1
+        echo "$1: $2"
+        exit 0 ;;
+      scrimcolor)
+        if [ $# -eq 1 ]; then v=$(getprop $P.app.scrimcolor); echo "${v:-stock}"; exit 0; fi
+        case "$2" in
+          stock|black|white|tint) setprop "$P.app.scrimcolor" "$2" ;;
+          *) die "usage: glassctl app scrimcolor stock|black|white|tint" ;;
+        esac
+        service call activity 1599295570 >/dev/null 2>&1
+        echo "scrimcolor: $2"
+        exit 0 ;;
+    esac
     [ $# -eq 2 ] || die "usage: glassctl app [<part> on|off]   (parts: $APP_PARTS)"
     case " $APP_PARTS " in *" $1 "*) ;; *) die "no part '$1' (parts: $APP_PARTS)" ;; esac
     case "$2" in
@@ -317,6 +341,6 @@ case "$cmd" in
     echo "$1: $2"
     ;;
   json) json ;;
-  -h|--help|help) sed -n '2,33p' "$0" | sed 's/^# \{0,1\}//' ;;
+  -h|--help|help) sed -n '2,41p' "$0" | sed 's/^# \{0,1\}//' ;;
   *) die "unknown command '$cmd' (glassctl help)" ;;
 esac

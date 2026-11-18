@@ -250,6 +250,9 @@ root shell:
 ```
 glassctl app                  # every part, on or off
 glassctl app icons off        # leave themed app icons as Android draws them
+glassctl app tint 0.6         # how strongly an active QS tile's glass takes its colour
+glassctl app tilecolor 0.5    # ...and how much of its own colour it keeps over that
+glassctl app scrimcolor black # the shade's background in one colour: stock, black, white or tint
 ```
 
 A switch reaches every app at once. The companion draws nothing while the

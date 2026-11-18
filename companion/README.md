@@ -1,9 +1,10 @@
 # Stock Glass Companion
 
 An LSPosed module that turns Quick Settings tiles and the brightness slider,
-the text selection toolbar (Cut, Copy, Paste), the screenshot UI's action bar,
-launcher folder icons, themed app icons (home screen, dock and app drawer),
-home screen widgets and the launcher's search boxes into blur regions, so that
+the text selection toolbar (Cut, Copy, Paste), apps' text toasts, the
+screenshot UI's action bar, launcher folder icons, themed app icons (home
+screen, dock and app drawer), home screen widgets and the launcher's search
+boxes into blur regions, so that
 the Stock Glass engine draws Liquid Glass under them. In the notification shade it uncovers the glass Android 17
 already puts under each card (lighter scrims, a lighter card fill), and it lets
 heads-up notifications keep that glass. The lockscreen clock is not a region:
@@ -40,8 +41,10 @@ Needs the Android SDK (build-tools 36.0.0, platform android-33), NDK
 Install the APK and enable it in LSPosed with System UI and the launcher in its
 scope (`com.android.launcher3` on crDroid, `com.google.android.apps.nexuslauncher`
 on Pixel builds). Restart both, or reboot. It then follows the engine's switch.
-No app needs to be in scope for the text selection toolbar: on Android 17
-SystemUI draws every app's toolbar. The screenshot UI runs in SystemUI's own
+No app needs to be in scope for the text selection toolbar or toasts: on
+Android 17 SystemUI draws every app's toolbar and text toast. Toasts an app
+draws with its own view (deprecated since Android 11) are drawn in the app's
+process and stay stock. The screenshot UI runs in SystemUI's own
 `com.android.systemui:screenshot` process, which the System UI scope covers.
 
 App icons get glass only when they are themed: "Themed icons" in a Pixel
@@ -78,16 +81,19 @@ Read at most every 500 ms, while a control draws.
 | `persist.sys.glass.app.sliders` | 1 | 0 leaves Quick Settings' brightness slider (and crDroid's volume slider) stock |
 | `persist.sys.glass.app.toolbar` | 1 | 0 leaves the text selection toolbar stock |
 | `persist.sys.glass.app.screenshot` | 1 | 0 leaves the screenshot UI's action bar stock |
+| `persist.sys.glass.app.toast` | 1 | 0 leaves toasts stock |
 | `persist.sys.glass.app.drawer` | 1 | 0 leaves the app drawer's themed icons stock |
 | `persist.sys.glass.app.search` | 1 | 0 leaves the drawer's and the dock's search boxes stock |
 | `persist.sys.glass.app.clock` | 1 | 0 leaves the lockscreen clock stock; `plain` gives it translucent glass that refracts nothing (what a live wallpaper gets) |
 | `persist.sys.glass.app.clocktint` | 0.5 | how much of a plugin clock face's own colours (Inflate, NumOverlap, …) shows in its glass: 0 is the flex clock's clear glass, 1 the face as drawn with the glass rim on top |
 | `persist.sys.glass.app.fill` | 0.3 | alpha kept on a neutral fill |
 | `persist.sys.glass.app.accent` | 0.75 | alpha kept on a coloured fill (an active tile) when `app.tint` is 0 |
-| `persist.sys.glass.app.tint` | 0.8 | strength of the tinted glass the engine (v0.4.6 or later) draws under a Quick Settings tile that is on, in the tile's own colour; the tile's fill then keeps `app.fill`. Much lower loses a dark-theme tile's icon. 0: untinted glass and `app.accent`. An older engine ignores the tint, so set 0 there |
+| `persist.sys.glass.app.tint` | 0.6 | strength of the tinted glass the engine (v0.4.6 or later) draws under a Quick Settings tile that is on, in the tile's own colour; the tile's fill then keeps `app.tilecolor`. 0: untinted glass and `app.accent`. An older engine ignores the tint, so set 0 there |
+| `persist.sys.glass.app.tilecolor` | 0.5 | alpha kept on the fill of a Quick Settings tile that is on, over its tinted glass. Together with `app.tint` it decides how see-through an active tile is; much less of both loses a dark-theme tile's dark icon over the dark shade |
 | `persist.sys.glass.app.contrast` | 0.65 | alpha kept on a widget's background when its text would be hard to read on glass; 0 turns that off |
 | `persist.sys.glass.app.radius` | 0 | region blur radius in px; 0 is the framework's 100 dp |
 | `persist.sys.glass.app.scrim` | 0.5 | the shade's scrim alpha (behind and notifications) is multiplied by this |
+| `persist.sys.glass.app.scrimcolor` | stock | `stock`: the shade's two scrims in their own colours, a panel colour behind everything and another under the notifications. `black`, `white` or `tint` (the palette's accent, tone 20 in a dark shade, 90 in a light one): one colour over the whole shade, at the behind scrim's alpha |
 | `persist.sys.glass.app.cards` | 0.6 | a notification card's fill alpha is multiplied by this |
 | `persist.sys.glass.app.punch` | per surface | 1: every region clears what its window drew under the control, as the framework does; 0: none does. Unset, launcher regions clear it and QS tiles keep it (the shade's scrim) |
 | `persist.sys.glass.app.rtfollow` | 1 | 0: a region moved on RenderThread alone waits for the window's next UI frame |
@@ -194,6 +200,10 @@ back to the flex clock.
 | `cost.sh <label> [prop=value…]` | RenderEngine time per frame over 6 QS open/close cycles (TimeStats) |
 | `qs_hold.sh <out.png> <to_y> [from_y]` | drag Quick Settings open to `to_y`, hold, take a screenshot |
 | `region_dump.sh [process]` | every region of a process as it stands (`app.debug=1` and a property broadcast); default the Pixel launcher, `com.android.launcher3` on crDroid |
+| `chaos.sh [trials] [seed] [outdir]` | stale launcher glass hunt: random home screen actions (page flings, home and overview gestures mid-animation, app launches, the drawer, screen off, Wallpaper & style), then the region dump and the launcher layer's `blurRegions.size()` after each trial and again after HOME; counts regions with glass whose control is off screen (stale), whose rect is off their control (misplaced), and SurfaceFlinger regions beyond those shown (excess). The same seed replays the same actions |
+| `stale_repro.sh [out-prefix]` | the shortest sequence found that leaves home screen glass behind (overview, back into the app, HOME, page swipes), then stale and shown regions, the launcher layer's count, and how often the companion replayed moves from an earlier surface or its sweep put rects back |
+| `perf_home.sh <label> [swipes]` | what the home screen's glass costs on a fixed workload (stress page, drawer, page swipes): the per-frame sync's µs per pre-draw, median UI and RenderThread times, frame time percentiles, SurfaceFlinger's RenderEngine time, its log lines, live regions |
+| `toast_check.sh [out-prefix]` | a real text toast (Settings' Build number, tapped four times): SystemUI's toast regions and the toast layer's `blurRegions.size()` while it shows and after it hides |
 
 ## Layout
 
@@ -204,6 +214,7 @@ java/…/Entry.java            which process gets which hooks
 java/…/QsTiles.java          SystemUI: TileKt.TileExpandable
 java/…/Sliders.java          SystemUI: SliderDefaults.Track (brightness, crDroid's volume)
 java/…/TextToolbar.java      SystemUI: RemoteSelectionToolbar.show (every app's text toolbar)
+java/…/Toasts.java           SystemUI: ToastPresenter.show (every app's text toast)
 java/…/ScreenshotGlass.java  SystemUI :screenshot: the action bar
 java/…/ClockGlass.java       SystemUI: the lockscreen clock (flex clock, crDroid's clock styles, plugin faces); a RenderEffect, not a region
 java/…/LauncherFolders.java  Launcher3: PreviewBackground.drawBackground

@@ -2728,3 +2728,343 @@ kept pid 1628 while the library's path moved to a new file (inode 114704 to
 Also seen in that install's output: `chcon: invalid context: 0644`, twice. It is
 meta-overlayfs's own `set_perm "$MNT_DIR" 0 0 0755 0644`, which passes a mode
 where `set_perm` takes a label, and it is harmless.
+
+## The companion: stale glass on the home screen (A17 AVD, engine 0.4.11)
+
+The user's report from alioth (crDroid 13.1, crDroid Launcher3): seventeen
+glass regions from home page 4 (the large widget, the 4×1 widget and 15 icons,
+at about 80% scale) drawn over page 1. The region dump marked all of them
+`off` at alpha 255 with their last non-empty rect, and swiping to page 4
+cleared them. Just before, the lockscreen clock face had been changed in
+Wallpaper & style.
+
+Everything below ran on glass17 (emulator-5564, Pixel launcher, engine
+running, gesture navigation) under the dev loader, with a page 4 built like
+the user's: a 4×2 widget, a 4×1 widget and 12 icons. Its regions' rects cover
+36% of the screen, 43% with the dock (the user's page 4: about 50%, 60% with
+the dock).
+
+**Oracle** (`tools/chaos.sh`). Each trial runs 4–9 random home screen actions
+with random gaps, lets the launcher settle, then reads the region dump and the
+launcher layer's `blurRegions.size()`; again after HOME. It counts regions
+with glass (alpha > 0, a non-empty rect) whose control is off screen
+(**stale**), whose rect is not on their control (**misplaced**), and
+SurfaceFlinger regions beyond those shown (**excess**). Regions in windows
+that are gone (Wallpaper & style's home screen previews leave six per visit)
+are counted apart: they cannot reach SurfaceFlinger. A dump that failed to
+arrive once (a false excess of 5) made the checks retry three times.
+
+**Reproduced.** The same 60 trials (seed 7; the timing still varies), on six
+builds. The two exploration runs used baseline builds that also logged each
+window aggregator's queue:
+
+| build | trials with an incident | what |
+|---|---|---|
+| baseline, instrumented (explore 1) | 29–30, 57–60 | 15 stale: page 4's icons at overview's scale over page 1, SurfaceFlinger 22 regions for 7 shown; then 3 excess; in trial 57 glass frozen a little off its controls |
+| baseline, instrumented (explore 2) | 8–10, 47–51 | page 2's widget at 0.71 scale after its loss (1 excess); 15 stale whose loss was queued behind the new surface's frames (keys 52 ×16 and 53 ×5 while the window was at frame 11, then 24, then 46); the stress widget at 0.9 scale (1 excess) |
+| baseline (before) | 12 | 0 stale; 7 misplaced: the dock's three icons and search bar, and a folder, an icon and a widget on page 1, each with its rect a page width to the right (off screen, so no glass under them) |
+| first fix: the queue every frame, plus an on-screen check | none | 0 stale, 0 misplaced, 0 excess over all 120 checks |
+| second attempt: the queue on a new surface's first frame only | 13–38, every trial (stopped there) | 3 regions of page 1 frozen at overview's scale from trial 13 on: misplaced while page 1 was shown, stale (and 3 excess) while another page was; a forced redraw did not move them |
+| final fix: the queue every frame, plus the sweep | none | 0 stale, 0 misplaced, 0 excess over all 120 checks; 4 replays of moves from an earlier surface, all on a new surface's first frame; the sweep put nothing back |
+
+The shortest sequence found (`tools/stale_repro.sh`): Settings, HOME, page 4,
+swipe up and hold for overview, tap the card back into Settings, HOME twice,
+four page swipes. Baseline: 4 of 5 runs left 13–28 stale regions
+(SurfaceFlinger 18–35 for 5–7 shown; `verify/stale_page_glass.png`, left: page
+4's widgets and icons as glass over page 1). First fix: 0 of 5. Second
+attempt: 0 of 5. Final fix: 0 of 5 (right); in 4 of them it applied 17–91
+queued moves on the first frame of the launcher's new surface, and the sweep
+had nothing to put back.
+
+**Cause.** hwui reports each move of a region's node with the frame number of
+the window's surface, and the window's blur aggregator queues the moves by that
+number (`mFrameRtUpdates`) and applies them in number order with the frame it
+sends. It sends frames only while some region is above alpha 0. In overview
+and through an app launch the launcher fades its pages, the companion takes
+every region to 0, and the moves pile up. When the window stops, hwui reports
+every region lost as frame 0; when it starts again it draws into a new surface,
+numbered from 1. The old moves then sort after everything the new surface
+reports:
+- the losses apply on the first new frame, and once the count passes the old
+  numbers the old rects come back, for controls that are no longer there
+  (page 4 over page 1, at overview's scale: explore 1, `stale_repro.sh`);
+- a loss queued on the old surface's last frames waits behind the new numbers,
+  and the page's old rect stays meanwhile (explore 2, trial 47);
+- an old rect can also land on a control that is still on screen and does not
+  move again; hwui reports a node only when it moves, so nothing corrects it.
+  The baseline run's trial 12 looks like this (not traced to the queue): the
+  dock's icons and search bar with rects a page width to their right, off
+  screen, so no glass under the dock.
+
+The companion kept such a region at alpha 255: it followed only its control's
+ancestors' alpha and visibility and the drawer's position, all of which said
+"shown".
+
+**Fix** (`companion/java/.../Region.java`, ARCHITECTURE.md), two parts:
+1. Before each frame, the per-frame sync applies every queued move numbered
+   past the surface's next frame (only an earlier surface can have numbered
+   it), in order, before the aggregator sends the frame. The losses and the
+   new surface's positions then land after them. It logs `applied N region
+   moves from frames A-B of an earlier surface; the window's next frame is N`.
+2. The sweep. Each region already listened to its node's position (for moves
+   made on RenderThread alone); that listener now also keeps where hwui last
+   put the node, or that it lost it, in the order hwui reports them, and is
+   moved ahead of the drawable's own listener so it has each move before the
+   aggregator does. 300 ms after a window draws, and every 300 ms while it
+   keeps drawing, once the aggregator has applied everything it queued, a
+   region whose rect differs from that record gets the record's rect and the
+   next frame sends it. It logs `put N region rects in <window> back where hwui
+   last reported their nodes (S with glass, L lost)`. A control that is no
+   longer drawn (a page swiped away) has been reported lost by hwui, so its
+   glass goes; glass left at the wrong place on a control that is still on
+   screen goes back to where the control is; a region that is right is not
+   touched.
+
+Attempts. The first fix had part 1 and, instead of part 2, took to alpha 0
+every frame any region whose control had no part on screen
+(`getGlobalVisibleRect`): it passed the 60 trials, but the check cost about
+3 ms of the launcher's UI thread per frame on the AVD (next section), and it
+cannot correct glass on a control that is on screen. Since every replay it
+logged was on the first frame of a new surface, the second attempt looked at
+the queue only then (a new generation of the window's `Surface`), with no
+on-screen check: 5 of 5 `stale_repro.sh` runs clean, but in the chaos run
+three regions of page 1 froze at overview's scale from trial 13 (an app
+launched from overview, then home) and stayed for the 25 trials until the run
+was stopped, through page swipes and a forced redraw. Seen through the
+debugger, the window's queue was empty and the three drawables were like the
+healthy ones (visible, alpha 255, their bounds and radius), so hwui had
+nothing new to report; the launcher's log had rotated before it could be
+read, and the cause was not found. Either a move reached the queue after the
+new surface's first frame, which that build never looked at again, or
+something else applied an old rect last. The final build checks the queue
+every frame and adds the sweep, which corrects such a region whatever the
+cause.
+
+The final run did not show the frozen glass again, so it does not say which
+part would have caught it. **The sweep, tested on its own** through the
+debugger (jdb on the launcher, the final build, launcher idle on page 1):
+- a region of another page, alpha 255 with the empty rect hwui's loss had left,
+  given a rect on screen as a stale move would: within one sweep the launcher
+  logged `put 1 region rect in DecorView@5616f73 back where hwui last reported
+  its node (1 with glass, 1 lost)`, and the rect was empty again;
+- page 1's widget given the frozen rect from the second attempt's run
+  (`Rect(554, 767 - 888, 1144)` for a widget at 560,717 471×531): still there
+  1.5 s later with no input, as hwui had nothing new to report; one long press
+  on empty space (a frame that does not move the widget), and the launcher
+  logged `put 1 region rect ... (1 with glass, 0 lost)` and the rect was back
+  at `Rect(560, 717 - 1031, 1248)`.
+
+Not run: crDroid Launcher3 and LSPosed; the clock face change in Wallpaper &
+style the user made just before (Wallpaper & style was opened in the chaos
+runs, not used). To see the fix act on the phone: the launcher logs `applied N
+region moves ...` and `put N region rects ... back` each time, and the region
+dump (`tools/region_dump.sh com.android.launcher3`) shows each region's rect,
+followed by `(hwui: ...)` where hwui last reported something else.
+
+## The companion: what the home screen's glass costs (A17 AVD, engine 0.4.11)
+
+The stress case is the AVD's page 4 above: 14 regions on the page and 4 in
+the dock, 17 of them sent to SurfaceFlinger, 36–43% of the screen as glass.
+The user's page 4 is about 50% (60% with the dock). For scale,
+expo-liquid-glass-ui measured one animating glass view on a Galaxy S23 Ultra
+at 120 Hz at 2% janky frames covering 10% or 25% of the screen, 18% at 50% and
+78% at 75%, and no quality setting holding 120 Hz full screen ([What it
+costs](https://capthnds.me/projects/expo-liquid-glass-ui/#what-it-costs)). That is
+an app drawing its own glass, not SurfaceFlinger; only the trend carries over.
+
+`tools/perf_home.sh` runs a fixed workload: from the default page to page 4,
+the app drawer opened, scrolled and closed, then 10 swipes each way between
+pages 3 and 4. Per run:
+- **sync**: the companion's per-frame work in the launcher's main window
+  (`Region.syncWindow`, UI thread), µs per pre-draw, from the region dump's
+  timer (CPU);
+- **UI** and **RT**: medians over the launcher's last 120 frames of
+  input-to-draw, which holds the pre-draw, and of RenderThread sync, where hwui
+  reports region positions (CPU);
+- **RE**: SurfaceFlinger's RenderEngine time per composited frame
+  (TimeStats): GPU work, which SwiftShader runs on the CPU.
+
+Each build was attached fresh (`dev_attach.sh launcher`), given one discarded
+run to warm the JIT, then measured three times or more. Runs where the launcher
+was not in front at the end (a swipe taken as a tap opened an app) or its layer
+had no regions were thrown away. Under the dev loader the launcher is
+debuggable, so framework code runs without its AOT compilation and every
+absolute figure is inflated: compare rows, and rows of the same sessions. Mean
+of the runs, range in parentheses, n runs:
+
+| build | sync, µs per pre-draw (CPU) | UI median, ms (CPU) | n | result |
+|---|---|---|---|---|
+| *sessions 2–3:* baseline, before the fix | 1183 (1103–1333) | 2.31 (2.20–2.44) | 3 | |
+| first fix: the queue every frame, plus the on-screen check | 4411 (4054–5061) | 5.43 (4.48–6.85) | 3 | replaced: the on-screen check (`getGlobalVisibleRect` for every region, every frame) is the cost |
+| the on-screen check, with the queue only on a new surface | 4709 (3959–5253) | 6.21 (4.92–6.99) | 3 | rejected: the same cost |
+| hwui's word every frame (a region whose node hwui last reported lost has no glass until it is reported again), the queue only on a new surface | 1252 (1213–1320) | 2.36 (2.29–2.43) | 3 | rejected: as cheap as the baseline, but glass coming back on screen a frame late |
+| the queue only on a new surface (the second attempt) | 1411 (1216–1785); again 1184 (996–1358) | 2.43 (2.24–2.72); 2.00 (1.87–2.08) | 3 + 3 | rejected: glass froze in the chaos run |
+| the same, plus a region's fade not read when its ancestors already hide it | 1202 (1044–1289) | 2.04 (1.90–2.24) | 3 | rejected: no change here (below) |
+| *sessions 5–7:* baseline | 1159 (1099–1201) | 2.04 (1.91–2.22) | 3 | |
+| final fix: the queue every frame, plus the sweep | 1134 (847–1573) | 2.08 (1.85–2.65) | 10 | kept |
+| the same, with the sweep's own time counted in the sync's (an instrumented copy) | 1153 (1056–1272) | 1.90 (1.64–2.12) | 3 | the sweep's cost is below the noise |
+| final fix, plus the region list kept as an array between frames (no copy of the owner set every pre-draw) | 1053 (789–1545) | 1.85 (1.49–2.11) | 10 | rejected: within the noise |
+| final fix, plus the drawer's position read once a frame (not once per region) | 1150 (866–1390) | 1.93 (1.69–2.30) | 6 | rejected: within the noise |
+
+The last two remove work from every frame and change nothing on screen, but
+neither moved the sync beyond its spread: the same build ranged from 847 to
+1573 µs across sessions, and its first run after an attach was often the
+highest. Ten runs each put the array 81 µs (7%) under the final fix, less than
+the spread of either. Both scale with the number of regions, so they are worth
+measuring again on alioth's 226.
+
+RenderThread sync (means 0.77–0.96 ms) and RenderEngine (means 114–132 ms per
+composited frame) stayed within their noise in every row: what the first fix
+cost was the companion's own UI-thread work, about 3.2 ms per launcher frame
+for the on-screen check. The final fix costs nothing measurable: its sync is
+within the baseline's range, and counting the sweep's own time in (an
+instrumented copy) does not move it either. Frame time from gfxinfo (p50
+125–150 ms, p90 200–350 ms) is the emulator's software GPU and did not move.
+
+The skipped fade targets the phone. On alioth the region dump had 226
+regions, about 120 of them app drawer icons hidden with the drawer, and each
+drawer icon's fade measures how much of it is on screen, every frame. The
+Pixel launcher does not theme drawer icons, so the AVD had no such regions (37
+in all: home screen icons, widgets and a folder, the dock's search bar and the
+drawer's search box) and nothing for the change to skip. Worth measuring on
+crDroid.
+
+**The engine's draw log** (a lead from the phone: a line for each region
+drawn, from inside SurfaceFlinger). The engine logs a draw when its geometry,
+role and parameters are not among the last 16 it logged (`shouldLog`), and
+writes at most 12 lines a second. A home screen page and its dock are 17–29
+regions, more than 16, so while SurfaceFlinger keeps compositing them each one
+has dropped out by the time it comes round again, and the log runs at its cap:
+- every `perf_home.sh` run above logged 271–336 engine lines, in a workload
+  whose pauses alone take 20 s, whatever the build;
+- alioth's two logcats from the bug (`captures/2026-11-18-home-ghost-glass/`)
+  have 12 draw lines in every second that has any.
+
+So the work is bounded: 12 log writes a second from SurfaceFlinger's
+RenderEngine thread. The change tried, 64 slots instead of 16, was not
+measured:
+- The test held the stress page still and made SurfaceFlinger repaint over and
+  over with its debug transaction 1004. On the AVD that did not make it
+  composite the launcher again in RenderEngine: 1 and 0 client-composited
+  frames of 114 and 280, and 12 and 0 engine lines in 6 s on the installed
+  engine. There was nothing to compare.
+- Putting the build on glass17 needs SurfaceFlinger restarted
+  (`stop`/`start`). The framework did not come back: adb offline and a black
+  screen for about 25 minutes, until the AVD was killed and cold-booted.
+
+Rejected, not measured. The source is back to 16 slots, and `engine/out` was
+rebuilt to its earlier hashes. On alioth the change could save at most those
+12 lines a second.
+
+Not measured: anything on alioth (Adreno, an AOT-compiled framework, 120 Hz),
+so no absolute figure here carries over; crDroid Launcher3's drawer icons; a
+live wallpaper. Also seen: regions in the windows of Wallpaper & style's home
+screen previews stay in the companion's set after the preview has gone (six
+per visit; 102 to 136 at the end of each full 60-trial chaos run, still there
+afterwards). They cannot reach SurfaceFlinger; each costs the per-frame sync one
+check.
+
+## The companion: toasts (A17 AVD, engine 0.4.11; not yet run with the companion)
+
+Since Android 12 SystemUI draws apps' text toasts (`ToastUI`, `SystemUIToast`,
+the framework's `ToastPresenter`), so a toast was never a blur region and
+stayed stock. The new part `toast` (`Toasts.java`; `persist.sys.glass.app.toast`,
+default 1; `glassctl app toast on|off`; "Toasts" in the WebUI) gives SystemUI's
+text toast glass from its own window's `ViewRootImpl`, as the toolbar and the
+screenshot bar have it (ARCHITECTURE.md).
+
+**Not verified yet.** The part is in the final build, but SystemUI never
+loaded it. Its session came after the engine test in the previous section,
+which hung glass17. After the cold boot the AVD was SELinux enforcing, with
+adbd not root:
+- the engine reported `not-hooked` (SELinux denied SurfaceFlinger `execmod`);
+- `dev_attach.sh` needs `adb root`.
+
+Neither was changed here. So there is no stock vs glass image of a toast yet,
+and no region dump of one.
+
+What did run, without the companion: `tools/toast_check.sh` (Settings → About
+emulated device, Build number tapped four times) put up "You are now 3 steps
+away from being a developer." on the stock plate. While it showed,
+SurfaceFlinger had a `VRI-Toast` layer with no blur regions (`sf=0`); 4 s
+later there was no toast layer (`sf=-`). Developer options stayed off. Two
+fixes to the script came out of it:
+- It found Build number with uiautomator, which never finds that page idle
+  (its Uptime row changes every second). It now moves D-pad focus down to the
+  last row and presses Enter, and starts Settings afresh so that taps from an
+  earlier run do not add up.
+- It printed `-` for a toast layer with no regions as well as for no layer.
+  A17 prints `blurRegions.size()` only when it is not 0.
+
+To finish on glass17 once root and the engine are back:
+1. `./dev_attach.sh systemui`; SystemUI should log `toasts hooked:
+   ToastPresenter.show`.
+2. `tools/toast_check.sh <prefix>`. A pass is `shown=1 sf=1` while the toast
+   shows, then no shown or stale region and `sf=-`.
+3. The same with `persist.sys.glass.app.toast=0`: `sf=0` while it shows.
+4. The two `<prefix>.shown.png`, cropped to the toast, side by side in
+   `verify/`.
+
+May differ on crDroid (not run there): its own toast settings. A switch that
+hides the app icon only changes what is inside the plate. A toast animation
+chosen there may animate the toast's window instead of `SystemUIToast`'s
+views; the region then moves with the layer, but whether SurfaceFlinger fades
+the region with the layer's alpha was not checked. A plate from a theme
+overlay that is not a `GradientDrawable` or a plain colour keeps `app.fill`
+(its tone is not read), and its region takes the drawable's outline, or a pill
+if it has none. A `ToastPlugin`'s toast stays stock.
+
+## On alioth: the stale-glass fix and toasts (0.4.13), Quick Settings fixes (0.4.14)
+
+**2026-11-18, alioth, crDroid 13.1, Vector 2.2.** At 13:51, module v0.4.13 and
+the companion with the stale-glass fix and toasts went in. At 14:18, module
+v0.4.14 and a companion with the Quick Settings fixes below went in. Each was
+installed over the running module: SurfaceFlinger kept its pid and wrote no
+tombstone. After each reboot `sys.glass.engine=glass`, Vector loaded the new
+APK into SystemUI and launcher3, and neither restarted. Vector's modules log had
+no StockGlass lines. The companion's warnings and errors go there through
+`XposedBridge.log`, so every hook attached, `Toasts` and `QsTiles.Clip`
+included. The info lines that name each hook had already left logcat's main
+buffer before adb reconnected.
+
+Not yet seen on alioth: a glass toast, or the stale-glass fix acting. When the
+fix acts, the launcher logs `applied N region moves` or `put N region rects …
+back`.
+
+**Quick Settings, from the user's screenshots on 0.4.13** (dark theme, glass
+on, default settings):
+- **Two fills.** Active tiles showed two fills: the glass had rounder corners
+  than the tile's own fill. On the Home tile, the fill's squarer corners
+  (`#57526b`, the fill at 0.3 over the shade) stood outside the tinted glass
+  (`#8e89ab`). A17 animates a tile's corners as it turns on or off. It does
+  that inside one remembered `RoundedCornerShape` whose `CornerSize` reads the
+  animated value in `toPx`. `QsTiles` cached the radii by shape and size, so
+  they stayed as they were at the tile's first draw. The radii are now read on
+  every draw, which also subscribes that draw to the animation.
+- **Solid colour.** Active tiles read as solid colour: tint 0.8 under a fill of
+  0.3 is about 86% the tile's colour. The user asked for about 60% tint and 50%
+  of the tile's own colour. `app.tint` now defaults to 0.6, and the new
+  `app.tilecolor` (0.5) is what an active tile's fill keeps over its glass,
+  about 80% colour in all. An inactive tile keeps `app.fill`.
+- **Glass through the notifications.** With the panel part way closed, tile
+  glass showed through the notification cards, as two pills inside the first
+  card. While the shade moves, QS leaves the notification stack's rounded
+  rect undrawn: `QSFragmentCompose.setFancyClipping` passes the rect, and
+  `FrameLayoutTouchPassthrough.dispatchDraw` clips it out with `clipOutPath`
+  after undoing its own `translationY` (read from crDroid's SystemUI with
+  jadx). A region knows nothing of a clip. `QsTiles.Clip` keeps the rect from
+  an after-hook, and fades a tile to 0 when its region, as hwui last reported
+  it, overlaps the rect by more than a pixel.
+
+Asked how the tiles and the shade looked on 0.4.14, the user said they look
+good.
+
+**One-colour shade.** The shade's two scrims differ. The behind scrim, in the
+shade panel colour, covers the whole shade; the notifications scrim, in
+another colour, covers only the stack. `app.scrimcolor` black, white or tint
+gives the behind scrim that colour at its own alpha and clears the
+notifications scrim. Tint is `system_accent1_800` when the stock panel colour
+is dark and `system_accent1_100` when it is light. The WebUI has the choice
+under Advanced → Apps, with an `app.scrim` slider. A mock of the device in
+headless Chrome showed the controls under their parts, and clicking them sent
+`glassctl app scrimcolor black` and `glassctl app tint '0.4'`.

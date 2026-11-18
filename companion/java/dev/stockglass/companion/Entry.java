@@ -34,6 +34,7 @@ public final class Entry implements IXposedHookLoadPackage {
                 Sliders.install(p.classLoader);
                 ShadeGlass.install(p.classLoader);
                 TextToolbar.install(p.classLoader);
+                Toasts.install(p.classLoader);
                 ClockGlass.install(p.classLoader);
                 Gate.watch();
                 break;

@@ -1,5 +1,7 @@
 package dev.stockglass.companion;
 
+import android.content.Context;
+import android.graphics.Color;
 import android.graphics.drawable.Drawable;
 import android.view.View;
 import de.robv.android.xposed.XC_MethodHook;
@@ -32,7 +34,11 @@ import java.util.WeakHashMap;
  *    the UNLOCKED and SHADE_LOCKED ScrimStates' setShadePanelColor and
  *    setNotificationScrimColor, which ScrimController.updateThemeColors calls
  *    with the theme's colours. The keyguard, bouncer and AOD scrims are not
- *    touched;
+ *    touched. The two scrims differ in colour, and the notifications scrim
+ *    covers only the stack, so the shade is two-toned. app.scrimcolor black,
+ *    white or tint makes it one colour: the behind scrim, which covers the
+ *    whole shade, takes that colour at its own alpha, and the notifications
+ *    scrim is cleared;
  *  - a heads-up keeps its card's region. ExpandableNotificationRow
  *    .usesTransparentBackground() is false for a row that must stay on screen
  *    (a pinned heads-up), so the row drops its blur drawable and paints an
@@ -128,7 +134,16 @@ final class ShadeGlass {
                 try {
                     // A setter declared on ScrimState itself serves every state.
                     if (!isShadeState(param.thisObject) || !Gate.shade()) return;
-                    param.args[0] = scaleAlpha((Integer) param.args[0], Gate.scrim());
+                    int color = scaleAlpha((Integer) param.args[0], Gate.scrim());
+                    String one = Gate.scrimColor();
+                    if (!one.equals("stock")) {
+                        if (param.method.getName().equals("setNotificationScrimColor")) {
+                            color &= 0x00ffffff;
+                        } else {
+                            color = (color & 0xff000000) | (oneColour(one, color) & 0x00ffffff);
+                        }
+                    }
+                    param.args[0] = color;
                 } catch (Throwable e) {
                     L.once("scrim", "scrim hook failed; the shade's scrim stays stock", e);
                 }
@@ -226,6 +241,26 @@ final class ShadeGlass {
             if (s.equals(name)) return true;
         }
         return false;
+    }
+
+    /**
+     * The one colour of app.scrimcolor, as RGB. tint is the palette's accent
+     * at tone 20 for a dark shade or tone 90 for a light one, judged by the
+     * shade panel colour SystemUI passed ({@code stock}), so a ROM that keeps
+     * its shade dark in a light theme stays dark.
+     */
+    private static int oneColour(String which, int stock) {
+        if (which.equals("black")) return 0x000000;
+        if (which.equals("white")) return 0xffffff;
+        try {
+            Context c = (Context) Class.forName("android.app.ActivityThread")
+                    .getMethod("currentApplication").invoke(null);
+            boolean dark = Color.luminance(stock | 0xff000000) < 0.5f;
+            return c.getColor(dark ? android.R.color.system_accent1_800 : android.R.color.system_accent1_100);
+        } catch (Throwable e) {
+            L.once("scrim-tint", "cannot read the palette's accent; the shade keeps its own colour", e);
+            return stock;
+        }
     }
 
     static int scaleAlpha(int color, float k) {

@@ -24,6 +24,7 @@ import java.util.concurrent.CopyOnWriteArrayList;
  *   persist.sys.glass.app.sliders=0 leave Quick Settings' brightness and volume sliders alone
  *   persist.sys.glass.app.toolbar=0 leave the text selection toolbar (Copy, Paste) alone
  *   persist.sys.glass.app.screenshot=0 leave the screenshot UI's action bar alone
+ *   persist.sys.glass.app.toast=0   leave toasts alone
  *   persist.sys.glass.app.drawer=0  leave the app drawer's icons alone
  *   persist.sys.glass.app.search=0  leave the launcher's search boxes alone
  *   persist.sys.glass.app.clock=0   leave the lockscreen clock alone (ClockGlass); "plain":
@@ -33,12 +34,17 @@ import java.util.concurrent.CopyOnWriteArrayList;
  *   persist.sys.glass.app.fill      alpha kept on a neutral fill (default 0.3)
  *   persist.sys.glass.app.accent    alpha kept on a coloured fill, e.g. an active tile (default 0.75)
  *   persist.sys.glass.app.tint      strength of the engine's tinted glass under a QS tile
- *                                   that is on, in the tile's own colour (default 0.8;
+ *                                   that is on, in the tile's own colour (default 0.6;
  *                                   0 = untinted glass and app.accent on the fill)
+ *   persist.sys.glass.app.tilecolor alpha kept on the fill of a QS tile that is on, over
+ *                                   its tinted glass (default 0.5)
  *   persist.sys.glass.app.contrast  alpha kept on a widget's plate when its text would be
  *                                   hard to read on the glass (default 0.65; see LauncherWidgets)
  *   persist.sys.glass.app.radius    blur radius of the regions in px; 0 = the framework default
  *   persist.sys.glass.app.scrim     the shade's scrim alpha is multiplied by this (default 0.5)
+ *   persist.sys.glass.app.scrimcolor stock: the shade's two scrims in their own colours;
+ *                                   black, white or tint: one colour over the whole shade
+ *                                   (tint: the palette's accent, dark or light with the theme)
  *   persist.sys.glass.app.cards     a notification card's fill alpha is multiplied by this
  *                                   (default 0.6)
  *   persist.sys.glass.app.punch     1: every region clears what its window drew under
@@ -86,11 +92,11 @@ final class Gate {
     private static int debuggable = -1;
     private static String engineSeen;
     private static boolean glass, qs, folders, icons, widgets, shade, headsUp, sliders, toolbar, screenshot,
-            drawer, search, clock, clockPlain, debug, rtFollow = true;
-    private static String punch = "";
+            toast, drawer, search, clock, clockPlain, debug, rtFollow = true;
+    private static String punch = "", scrimColor = "stock";
     private static String debugMode = "0";
-    private static float fill = 0.3f, accent = 0.75f, tint = 0.8f, contrast = 0.65f, scrim = 0.5f,
-            cards = 0.6f, clockTint = 0.5f;
+    private static float fill = 0.3f, accent = 0.75f, tint = 0.6f, tileColor = 0.5f, contrast = 0.65f,
+            scrim = 0.5f, cards = 0.6f, clockTint = 0.5f;
     private static int radius;
 
     private Gate() {}
@@ -177,6 +183,11 @@ final class Gate {
         return glass && screenshot;
     }
 
+    static boolean toast() {
+        refresh();
+        return glass && toast;
+    }
+
     static boolean drawer() {
         refresh();
         return glass && drawer;
@@ -246,6 +257,18 @@ final class Gate {
         return tint;
     }
 
+    /** Alpha kept on the fill of a QS tile that is on, over its tinted glass. */
+    static float tileColor() {
+        refresh();
+        return tileColor;
+    }
+
+    /** "stock", "black", "white" or "tint" (see the class comment). */
+    static String scrimColor() {
+        refresh();
+        return scrimColor;
+    }
+
     static int radius() {
         refresh();
         return radius;
@@ -262,9 +285,9 @@ final class Gate {
         if (now < next) return;
         next = now + REFRESH_MS;
         String was = glass + " " + qs + " " + folders + " " + icons + " " + widgets + " " + shade + " " + headsUp
-                + " " + sliders + " " + toolbar + " " + screenshot + " " + drawer + " " + search + " " + clock
-                + " " + clockPlain + " " + clockTint + " " + fill + " " + accent + " " + tint + " " + contrast + " " + scrim + " " + cards + " " + radius
-                + " " + punch;
+                + " " + sliders + " " + toolbar + " " + screenshot + " " + toast + " " + drawer + " " + search + " " + clock
+                + " " + clockPlain + " " + clockTint + " " + fill + " " + accent + " " + tint + " " + tileColor + " " + contrast
+                + " " + scrim + " " + scrimColor + " " + cards + " " + radius + " " + punch;
         String mode = prop("mode", "");
         glass = engineLive()
                 && (mode.equals("glass") || mode.equals("on"))
@@ -279,6 +302,7 @@ final class Gate {
         sliders = !prop("app.sliders", "1").equals("0");
         toolbar = !prop("app.toolbar", "1").equals("0");
         screenshot = !prop("app.screenshot", "1").equals("0");
+        toast = !prop("app.toast", "1").equals("0");
         drawer = !prop("app.drawer", "1").equals("0");
         search = !prop("app.search", "1").equals("0");
         String clockMode = prop("app.clock", "1");
@@ -287,9 +311,12 @@ final class Gate {
         clockTint = clamp(num(prop("app.clocktint", ""), 0.5f));
         fill = clamp(num(prop("app.fill", ""), 0.3f));
         accent = clamp(num(prop("app.accent", ""), 0.75f));
-        tint = clamp(num(prop("app.tint", ""), 0.8f));
+        tint = clamp(num(prop("app.tint", ""), 0.6f));
+        tileColor = clamp(num(prop("app.tilecolor", ""), 0.5f));
         contrast = clamp(num(prop("app.contrast", ""), 0.65f));
         scrim = clamp(num(prop("app.scrim", ""), 0.5f));
+        String sc = prop("app.scrimcolor", "stock");
+        scrimColor = sc.equals("black") || sc.equals("white") || sc.equals("tint") ? sc : "stock";
         cards = clamp(num(prop("app.cards", ""), 0.6f));
         radius = Math.max(0, Math.round(num(prop("app.radius", ""), 0f)));
         punch = prop("app.punch", "");
@@ -297,9 +324,9 @@ final class Gate {
         debugMode = prop("app.debug", "0");
         debug = !debugMode.isEmpty() && !debugMode.equals("0");
         String is = glass + " " + qs + " " + folders + " " + icons + " " + widgets + " " + shade + " " + headsUp
-                + " " + sliders + " " + toolbar + " " + screenshot + " " + drawer + " " + search + " " + clock
-                + " " + clockPlain + " " + clockTint + " " + fill + " " + accent + " " + tint + " " + contrast + " " + scrim + " " + cards + " " + radius
-                + " " + punch;
+                + " " + sliders + " " + toolbar + " " + screenshot + " " + toast + " " + drawer + " " + search + " " + clock
+                + " " + clockPlain + " " + clockTint + " " + fill + " " + accent + " " + tint + " " + tileColor + " " + contrast
+                + " " + scrim + " " + scrimColor + " " + cards + " " + radius + " " + punch;
         if (primed && !is.equals(was)) {
             for (Runnable r : listeners) handler().post(r);
         }

@@ -343,15 +343,16 @@ in the module, and the engine draws it as a pane.
 
 | surface | process | before-hook | what it changes |
 |---|---|---|---|
-| QS tiles | `com.android.systemui` | `…qs.panels.ui.compose.infinitegrid.TileKt.TileExpandable` (a static composable) | wraps `color: () -> Color`, alpha × `app.fill` (neutral fill) or × `app.accent` (coloured: an active tile); adds a `drawBehind` to `modifier` that draws the tile's region with the corner radii of its `Shape`. With `app.tint` > 0 an active tile's region asks the engine for glass tinted in the tile's own colour (the v0.4.6 corner-radius encoding, `module/README.md` "Tinted glass for apps"), at `app.tint` (0.8) times how far its colour is from neutral, and its fill keeps `app.fill`. Below about 0.8 a dark-theme tile's dark icon is lost over the dark shade (VERIFIED.md). On Google's build a dual-target large tile shows "on" in its icon square only, which is not a region |
+| QS tiles | `com.android.systemui` | `…qs.panels.ui.compose.infinitegrid.TileKt.TileExpandable` (a static composable) | wraps `color: () -> Color`, alpha × `app.fill` (neutral fill) or × `app.accent` (coloured: an active tile); adds a `drawBehind` to `modifier` that draws the tile's region with the corner radii of its `Shape`. With `app.tint` > 0 an active tile's region asks the engine for glass tinted in the tile's own colour (the v0.4.6 corner-radius encoding, `module/README.md` "Tinted glass for apps"), at `app.tint` (0.6) times how far its colour is from neutral, and its fill keeps `app.tilecolor` (0.5) over it, so an active tile is about 80% its colour and the glass shows through. Much less loses a dark-theme tile's dark icon over the dark shade (VERIFIED.md). The shape's radii are read on every draw: A17 animates a tile's corners inside one remembered `RoundedCornerShape`, so a cache by shape and size kept the corners the tile had before it was turned on or off. An after-hook on `…qs.composefragment.QSFragmentCompose.setFancyClipping` records the rounded rect the notification stack covers while the shade opens and closes, which the QS root view clips out of its drawing; a tile whose region overlaps it is faded to 0. On Google's build a dual-target large tile shows "on" in its icon square only, which is not a region |
 | folder icons | `com.android.launcher3`, `com.google.android.apps.nexuslauncher` | `com.android.launcher3.folder.PreviewBackground.drawBackground(Canvas)` | `mBgColor` alpha × `app.fill`; region at the folder shape's bounds (`basePreviewOffsetX/Y`, `getScaledRadius()`), corners from the theme's folder shape |
 | themed app icons | the same two | `…launcher3.icons.FastBitmapDrawable.draw(Canvas)`, then `…icons.mono.ThemedIconDelegate.drawContent(BitmapInfo, IconShape, Canvas, Rect, Paint)` | the plate's `Paint` alpha × `app.fill`, glyph untouched; region at the theme's icon shape in the drawable's bounds (`IconShape.path`/`pathSize`, scaled by `IconNormalizer.ICON_VISIBLE_AREA_FACTOR` as `drawContent` does), corners measured from the path; home screen and dock under `app.icons`, the app drawer's grid, predictions and search results (`mDisplay` 1, 8, 9) under `app.drawer` |
 | home screen widgets | the same two | `com.android.launcher3.CellLayout.dispatchDraw(Canvas)`, which gives each `…launcher3.widget.LauncherAppWidgetHostView` on the page a drawable in its `ViewOverlay` | the plate's alpha × `app.fill`, or × `app.contrast` where the widget's text would be lost; the plate is the view the launcher rounds (`RoundedCornerEnforcement.findBackground`); region at the launcher's enforced rect and radius, else the plate's outline, else `system_app_widget_background_radius`; workspace only |
-| shade scrims | `com.android.systemui` | the `UNLOCKED` and `SHADE_LOCKED` `…statusbar.phone.ScrimState`s' `setShadePanelColor(int)` / `setNotificationScrimColor(int)` | the colour's alpha × `app.scrim`; `ScrimController.updateThemeColors()` and `applyAndDispatchState()` re-apply it on a switch |
+| shade scrims | `com.android.systemui` | the `UNLOCKED` and `SHADE_LOCKED` `…statusbar.phone.ScrimState`s' `setShadePanelColor(int)` / `setNotificationScrimColor(int)` | the colour's alpha × `app.scrim`; with `app.scrimcolor` black, white or tint the behind scrim takes that colour and the notifications scrim is cleared, so the shade is one colour; `ScrimController.updateThemeColors()` and `applyAndDispatchState()` re-apply it on a switch |
 | notification cards | `com.android.systemui` | `com.android.internal.graphics.drawable.BackgroundBlurDrawable.setColor(int)` when its callback is a `…notification.row.NotificationBackgroundView` | the card fill's alpha × `app.cards`; the region is the framework's own |
 | heads-up notifications | `com.android.systemui` | after-hook on `…notification.row.ExpandableNotificationRow.usesTransparentBackground()` | true instead of false while a heads-up must stay on screen, when row transparency is on and not on the keyguard; LSPosed only |
 | QS brightness slider, crDroid's volume slider | `com.android.systemui` | `androidx.compose.material3.SliderDefaults.Track-mnvyFg4` (an instance method of `SliderDefaults.INSTANCE`) | `colors` (a `SliderColors`) remade with the active track's alpha × `app.accent` and the inactive track's × `app.fill`, thumb and ticks unchanged; a `drawBehind` on `modifier` draws a region at the track's bounds with its outer corner radius (the `cornerDp` argument); only a track in the shade's window (`TYPE_NOTIFICATION_SHADE`), not the volume or brightness dialogs |
 | text selection toolbar (Cut, Copy, Paste) | `com.android.systemui` | `…selectiontoolbar.app.ui.RemoteSelectionToolbar.show(ShowInfo)` | `ViewGlass` on its public `contentContainer` (the framework's `floating_popup_container`), shadow off; every app's toolbar, with no app in scope (below) |
+| text toasts | `com.android.systemui` | `android.widget.ToastPresenter.show(View, IBinder, IBinder, int, int, int, int, float, float, ITransientNotificationCallback, boolean)` (the framework class, in SystemUI's process) | `ViewGlass` on the toast's root (`text_toast`, background `toast_frame`), shadow off; only views holding SystemUI's `R.id.text`; the plate keeps `app.fill`, or `app.contrast` when its tone is not the theme's; every app's text toast, with no app in scope (below) |
 | screenshot action bar | `com.android.systemui:screenshot` | `…screenshot.ScreenshotShelfViewProxy$prepareEntranceAnimation$1.onPreDraw()` | `ViewGlass` on `ScreenshotShelfView.actionsContainerBackground`, shadow off |
 | drawer search box | the two launchers | `…allapps.search.AppsSearchContainerLayout.onLayout` (crDroid), `…nexuslauncher.allapps.UniversalSearchInputView.onLayout` (Pixel) | `ViewGlass` on the view; it follows the launcher's own pill alpha (Pixel hides the pill while search is open) and crDroid's new background on every layout |
 | dock search bar, crDroid | `com.android.launcher3` | `com.android.launcher3.qsb.QsbLayout.onMeasure` | `ViewGlass` on the accent ring (`outer`), else the pill (`inner`); the pill and the Gemini circle inside the ring get only the fill cut; fades as the drawer opens |
@@ -448,6 +449,22 @@ process, already in scope, and its region is on the SCVH's layer
 (`blurRegions.size()=1` there). An app on a build without that flag, or with an
 old target, uses `LocalFloatingToolbarPopup` in its own process; that path is
 not hooked, and would need every app in the module's scope.
+
+Since Android 12, apps do not draw their text toasts either: the toast goes
+to NotificationManagerService, which asks SystemUI's `ToastUI` to show it.
+`ToastUI` builds a `SystemUIToast` (SystemUI's `text_toast` layout: the app's
+icon and the text on the framework's `toast_frame`, a rounded plate in the
+theme's surface colour with 2 dp of elevation) and passes its view to a new
+`ToastPresenter`, whose `show()` adds it as a window of its own (`TYPE_TOAST`,
+titled `Toast`); `hide()` removes the window after the exit animation. So the
+region is in the toast's own window and goes with it: SurfaceFlinger has no
+layer left to draw it on. The region follows the view's alpha and scale through
+`SystemUIToast`'s entrance and exit. A toast floats over an app SystemUI cannot
+see, so for the contrast rule (widgets, above) its backdrop is taken to be in
+the system theme, as apps usually are: A17's plate follows the theme and keeps
+`app.fill`; a plate whose tone differs from the theme (a ROM's fixed toast
+style) keeps `app.contrast`. A `ToastPlugin`'s view and custom-view toasts are
+left alone; the latter are deprecated and drawn in the app's own process.
 
 The screenshot UI runs in SystemUI's second process,
 `com.android.systemui:screenshot`, which LSPosed also loads the module into;
@@ -602,6 +619,36 @@ Framework behaviours the companion changes:
   started asks the window for one (`app.rtfollow`, default on). A17 has no
   RenderThread backend for `View.animate()`, so this has not caught a case on
   the AVD; it is a guard.
+- **A region's rect is held to what hwui last reported.** The aggregator
+  queues each position hwui reports by the frame number of the window's
+  surface and applies them in number order with the frame it sends. It sends
+  none while no region is above alpha 0 (overview and app launches fade the
+  launcher's pages), so moves pile up; when the window stops, hwui reports
+  every region lost as frame 0, and a window that starts again draws into a
+  new surface whose frames count from 1. The old moves then sort after
+  everything the new surface reports and come back once its count passes
+  theirs: a home screen page drawn as glass over another at the scale overview
+  left it at, a loss stuck behind the new numbers, or glass under the dock a
+  page width off. hwui reports a node again only when it moves, so nothing
+  corrected those. Two parts:
+  - Before each frame, the sync applies any queued move numbered past the
+    surface's next frame (only an earlier surface can have numbered it), in
+    order, so the losses and the new surface's positions land after them
+    (`Region.replayOldSurface`; it logs `applied N region moves from frames
+    A-B of an earlier surface`). Looking only on a new surface's first frame
+    was not enough (VERIFIED.md).
+  - The region's own position listener (above) also keeps where hwui last put
+    the node, or that it lost it, in the order hwui reports them; it is moved
+    ahead of the drawable's own listener, so it has each move before the
+    aggregator does. 300 ms after a window draws, and every 300 ms while it
+    keeps drawing, if the aggregator has applied everything it queued, a region
+    whose rect differs from that record gets the record's rect, and the next
+    frame sends it (`Region.sweep`; it logs `put N region rects ... back`).
+    That catches a misordering whatever its cause, for a field read per region
+    per sweep. A per-frame check of whether each control is on screen
+    (`getGlobalVisibleRect`) did the same job for stale glass at about 3 ms of
+    the launcher's UI thread per frame on the AVD, and could not correct glass
+    left on a control that is on screen.
 - **Switches are pushed, not only pulled.** A control re-reads the switches when
   it is drawn, and a host does not redraw what it has no reason to. Tiles in an
   open QS and a folder on an idle home screen kept their regions and translucent
@@ -677,6 +724,7 @@ outside the window.
    `persist.sys.glass.app.shade=0` (scrims and cards),
    `persist.sys.glass.app.headsup=0`, `persist.sys.glass.app.sliders=0`,
    `persist.sys.glass.app.toolbar=0`, `persist.sys.glass.app.screenshot=0`,
+   `persist.sys.glass.app.toast=0`,
    `persist.sys.glass.app.drawer=0` (drawer icons),
    `persist.sys.glass.app.search=0` (drawer and dock search boxes),
    `persist.sys.glass.app.clock=0` (the lockscreen clock; `plain` keeps its

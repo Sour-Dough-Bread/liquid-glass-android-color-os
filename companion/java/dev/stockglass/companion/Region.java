@@ -4,8 +4,12 @@ import android.graphics.Canvas;
 import android.graphics.Paint;
 import android.graphics.PorterDuff;
 import android.graphics.PorterDuffXfermode;
+import android.graphics.Rect;
 import android.graphics.Xfermode;
 import android.graphics.drawable.Drawable;
+import android.util.ArraySet;
+import android.util.LongSparseArray;
+import android.view.Surface;
 import android.view.View;
 import android.view.ViewTreeObserver;
 import java.lang.ref.Reference;
@@ -171,7 +175,12 @@ final class Region {
                 release();
                 bbd = (Drawable) createMethod(vri).invoke(vri);
                 root = vri;
-                followRenderThread();
+                int id;
+                synchronized (lastReported) {
+                    id = ++nodeId;
+                    lastReported.setEmpty();
+                }
+                followRenderThread(id);
                 visible = true; // the aggregator registers it as soon as it is created
                 defaultRadius = blurRadiusField(bbd).getInt(bbd);
                 l = t = r = b = 0;
@@ -241,11 +250,22 @@ final class Region {
     // ---- RenderThread frames ----------------------------------------------
 
     private static Class<?> positionListener;
-    private static Method addPositionListener;
-    private static Field renderNodeField;
+    private static Method addPositionListener, removePositionListener;
+    private static Field renderNodeField, ownListenerField;
     private volatile Window window;
     /** RenderThread: the window's pre-draw count when this region last moved. */
     private int movedAt = -1;
+    /**
+     * Where hwui last put this region's node, in window coordinates, or empty
+     * once it reported the node lost: written on RenderThread, in the order
+     * the moves happen, before the aggregator queues them. sweep() holds the
+     * aggregator to it. Guards itself and {@link #nodeId}.
+     */
+    private final Rect lastReported = new Rect();
+    /** Which drawable's node lastReported follows: the listener of a replaced one is ignored. */
+    private int nodeId;
+    /** Main thread: lastReported is written before the aggregator hears of a move. */
+    private boolean recorded;
 
     /**
      * hwui reports where the region's node is on every frame it renders, UI
@@ -257,25 +277,45 @@ final class Region {
      * moved and the glass stayed. So the region also listens to its node, and
      * a move on a frame no pre-draw started asks the window for a UI frame,
      * which sends the positions hwui has kept for it.
+     *
+     * The same listener keeps lastReported, for sweep().
      */
-    private void followRenderThread() {
+    private void followRenderThread(final int id) {
+        recorded = false;
         try {
             if (addPositionListener == null) {
                 positionListener = Class.forName("android.graphics.RenderNode$PositionUpdateListener");
-                addPositionListener = Class.forName("android.graphics.RenderNode")
-                        .getMethod("addPositionUpdateListener", positionListener);
+                Class<?> renderNode = Class.forName("android.graphics.RenderNode");
+                addPositionListener = renderNode.getMethod("addPositionUpdateListener", positionListener);
                 renderNodeField = bbd.getClass().getDeclaredField("mRenderNode");
                 renderNodeField.setAccessible(true);
+                try {
+                    removePositionListener = renderNode.getMethod("removePositionUpdateListener",
+                            positionListener);
+                    ownListenerField = bbd.getClass().getDeclaredField("mPositionUpdateListener");
+                    ownListenerField.setAccessible(true);
+                } catch (ReflectiveOperationException e) {
+                    L.w("cannot reorder a region's position listeners (" + e + "); regions are not"
+                            + " checked against hwui");
+                }
             }
             final WeakReference<Region> self = new WeakReference<>(this);
             Object l = java.lang.reflect.Proxy.newProxyInstance(positionListener.getClassLoader(),
                     new Class<?>[] {positionListener}, (p, m, a) -> {
                         switch (m.getName()) {
-                            case "positionChanged":
-                            case "positionLost":
+                            case "positionChanged": {
                                 Region r = self.get();
-                                if (r != null) r.movedOnRenderThread((Long) a[0]);
+                                if (r != null) {
+                                    r.movedOnRenderThread(id, (Long) a[0], (Integer) a[1], (Integer) a[2],
+                                            (Integer) a[3], (Integer) a[4]);
+                                }
                                 return null;
+                            }
+                            case "positionLost": {
+                                Region r = self.get();
+                                if (r != null) r.movedOnRenderThread(id, (Long) a[0], 0, 0, 0, 0);
+                                return null;
+                            }
                             case "equals":
                                 return p == a[0];
                             case "hashCode":
@@ -286,15 +326,29 @@ final class Region {
                                 return null; // applyStretch
                         }
                     });
-            addPositionListener.invoke(renderNodeField.get(bbd), l);
+            Object node = renderNodeField.get(bbd);
+            addPositionListener.invoke(node, l);
+            // The node calls its listeners in the order they were added. With the
+            // drawable's own behind this one, a move is in lastReported before
+            // the aggregator has it, so sweep() never finds the aggregator ahead.
+            Object own = ownListenerField == null ? null : ownListenerField.get(bbd);
+            if (own != null) {
+                removePositionListener.invoke(node, own);
+                addPositionListener.invoke(node, own);
+                recorded = true;
+            }
         } catch (Throwable e) {
             L.once("region-rt", "cannot follow a region on RenderThread; glass moved by a"
                     + " RenderThread animation catches up at the next redraw", e);
         }
     }
 
-    /** RenderThread. */
-    private void movedOnRenderThread(long frameNumber) {
+    /** RenderThread; a lost node reports an empty rect. */
+    private void movedOnRenderThread(int id, long frameNumber, int left, int top, int right, int bottom) {
+        synchronized (lastReported) {
+            if (id != nodeId) return; // the node of a drawable this region has replaced
+            lastReported.set(left, top, right, bottom);
+        }
         Window w = window;
         if (w == null) return;
         long last = w.lastFrame;
@@ -318,12 +372,35 @@ final class Region {
         /** The tree observer the per-frame sync is listening on. */
         WeakReference<ViewTreeObserver> vto = new WeakReference<>(null);
         volatile int preDraws;
+        /** Main thread: time in syncWindow since the last dump, and the count at that dump. */
+        long syncNanos;
+        int dumpedAt;
         /** RenderThread: the last frame number hwui reported a move on. */
         long lastFrame;
+        /** Main thread: a sweep is posted, and the pre-draw count it last looked at. */
+        boolean sweepPending;
+        int sweptAt;
+        final Runnable sweeper = this::sweepNow;
 
         Window(View root) {
             this.root = new WeakReference<>(root);
             name = root.getClass().getSimpleName() + "@" + Integer.toHexString(System.identityHashCode(root));
+        }
+
+        /** Posted by a frame: sweeps, and again later while the window keeps drawing. */
+        private void sweepNow() {
+            View rv = root.get();
+            if (rv == null) {
+                sweepPending = false;
+                return;
+            }
+            sweep(rv, name);
+            if (preDraws != sweptAt && rv.isAttachedToWindow()) {
+                sweptAt = preDraws;
+                rv.postDelayed(sweeper, SWEEP_MS);
+            } else {
+                sweepPending = false;
+            }
         }
     }
 
@@ -362,7 +439,14 @@ final class Region {
             View rv = win.root.get();
             if (rv != null) {
                 win.preDraws++;
+                long start = System.nanoTime();
                 syncWindow(rv);
+                if (!win.sweepPending) {
+                    win.sweepPending = true;
+                    win.sweptAt = win.preDraws;
+                    rv.postDelayed(win.sweeper, SWEEP_MS);
+                }
+                win.syncNanos += System.nanoTime() - start;
             }
             return true;
         });
@@ -420,6 +504,7 @@ final class Region {
         } catch (Throwable e) {
             return;
         }
+        replayOldSurface(vri);
         boolean changed = false;
         long now = android.os.SystemClock.uptimeMillis();
         boolean trace = Gate.debug() && now - lastTrace > 1000;
@@ -441,6 +526,153 @@ final class Region {
             }
         }
         if (changed) rootView.postInvalidateOnAnimation();
+    }
+
+    private static Field rtUpdatesField, rtLockField, surfaceField;
+    private static Method nextFrameNumber;
+    private static boolean queueUnreadable, unswept;
+
+    /**
+     * hwui reports each move of a region's node with the frame number of the
+     * window's surface, and the window's blur aggregator queues the moves by
+     * that number and applies them in number order when it sends a frame to
+     * SurfaceFlinger. It only sends frames while it has a region at an alpha
+     * above 0, so through overview or an app launch, where the launcher fades
+     * its pages and every region is at 0, the moves pile up unapplied. When
+     * the window then stops, hwui reports every region lost with frame 0, and
+     * a window that starts again draws into a new surface, which numbers its
+     * frames from 1. The queue then sorts the old moves after everything the
+     * new surface reports: the losses apply on the first new frame, and once
+     * the new surface's count passes the old numbers, the old rects come back
+     * for controls that are no longer there. That was a home screen page
+     * drawn as glass over another one, at the scale overview had left it at,
+     * until that page was drawn again.
+     *
+     * A move numbered past the surface's next frame can only be from an
+     * earlier surface, so this applies those now, in order, before the
+     * aggregator sends this frame. They happened before the losses and before
+     * anything the new surface has reported, and are applied before those.
+     * Every frame: looking only on a new surface's first frame left glass
+     * behind in a chaos run (VERIFIED.md), and the check is a lock and a size.
+     */
+    private static void replayOldSurface(Object vri) {
+        if (queueUnreadable || aggregatorField == null) return;
+        try {
+            Object aggregator = aggregatorField.get(vri);
+            if (aggregator == null) return;
+            if (rtUpdatesField == null) {
+                Class<?> c = aggregator.getClass();
+                rtUpdatesField = c.getDeclaredField("mFrameRtUpdates");
+                rtUpdatesField.setAccessible(true);
+                rtLockField = c.getDeclaredField("mRtLock");
+                rtLockField.setAccessible(true);
+                surfaceField = vri.getClass().getDeclaredField("mSurface");
+                surfaceField.setAccessible(true);
+                nextFrameNumber = Surface.class.getMethod("getNextFrameNumber");
+            }
+            LongSparseArray<?> queue = (LongSparseArray<?>) rtUpdatesField.get(aggregator);
+            synchronized (rtLockField.get(aggregator)) {
+                replayLocked(vri, queue);
+            }
+        } catch (Throwable e) {
+            queueUnreadable = true;
+            L.once("region-queue", "cannot read the blur aggregator's queue; after the window"
+                    + " restarts, an old rect can come back until its control is drawn again", e);
+        }
+    }
+
+    /** replayOldSurface, holding the aggregator's lock. */
+    private static void replayLocked(Object vri, LongSparseArray<?> queue) throws Exception {
+        int n = queue.size();
+        if (n == 0) return;
+        long newest = queue.keyAt(n - 1);
+        if (newest <= 1) return;
+        Surface surface = (Surface) surfaceField.get(vri);
+        if (surface == null || !surface.isValid()) return;
+        long next = (Long) nextFrameNumber.invoke(surface);
+        if (newest <= next) return;
+        int first = n;
+        while (first > 0 && queue.keyAt(first - 1) > next) --first;
+        int moves = 0;
+        for (int i = first; i < n; ++i) {
+            ArraySet<?> frameMoves = (ArraySet<?>) queue.valueAt(i);
+            for (int j = 0; j < frameMoves.size(); ++j) {
+                ((Runnable) frameMoves.valueAt(j)).run();
+                ++moves;
+            }
+        }
+        long oldest = queue.keyAt(first);
+        for (int i = n - 1; i >= first; --i) queue.removeAt(i);
+        L.i("applied " + moves + " region moves from frames " + oldest + "-" + newest
+                + " of an earlier surface; the window's next frame is " + next);
+    }
+
+    /** How long after a frame a window's regions are swept, and how often while it draws. */
+    private static final long SWEEP_MS = 300;
+
+    /**
+     * hwui's word against the aggregator's. Once the aggregator has applied
+     * every move it has queued, each region's rect should be where hwui last
+     * reported its node, or empty if hwui last reported it lost
+     * (lastReported, which sees the moves in the order they happened, not in
+     * frame number order). One that is not got its moves applied out of
+     * order, whatever the cause, and SurfaceFlinger would keep its glass
+     * where its control no longer is: an off-screen page's over the page on
+     * screen, or a page's own at another scale. hwui only reports a node
+     * again when it moves, so nothing else would correct it. This puts such
+     * rects back and has the next frame send them.
+     *
+     * Runs SWEEP_MS after a window draws, and every SWEEP_MS while it keeps
+     * drawing; moves still in the queue are left for the next sweep.
+     */
+    private static void sweep(View rootView, String name) {
+        if (unswept || queueUnreadable || rtUpdatesField == null) return;
+        Object vri;
+        try {
+            vri = viewRoot(rootView);
+        } catch (Throwable e) {
+            return;
+        }
+        if (vri == null) return;
+        Owner[] all;
+        synchronized (owners) {
+            all = owners.toArray(new Owner[0]);
+        }
+        int fixed = 0, shown = 0, lost = 0;
+        try {
+            Object aggregator = aggregatorField.get(vri);
+            if (aggregator == null) return;
+            @SuppressWarnings("unchecked")
+            LongSparseArray<Object> queue = (LongSparseArray<Object>) rtUpdatesField.get(aggregator);
+            synchronized (rtLockField.get(aggregator)) {
+                replayLocked(vri, queue);
+                if (queue.size() > 0) return;
+                for (Owner o : all) {
+                    Region r = o.region;
+                    if (r.root != vri || r.bbd == null || !r.recorded) continue;
+                    Rect rect = r.aggregatorRect();
+                    synchronized (r.lastReported) {
+                        if (rect.equals(r.lastReported)) continue;
+                        rect.set(r.lastReported);
+                    }
+                    ++fixed;
+                    if (r.visible && r.alpha > 0) ++shown; // in what SurfaceFlinger has
+                    if (rect.isEmpty()) ++lost;
+                }
+                // An empty frame of moves: the aggregator sends its regions with the next frame.
+                if (shown > 0) queue.put(0, new ArraySet<Runnable>());
+            }
+        } catch (Throwable e) {
+            unswept = true;
+            L.once("region-sweep", "cannot check regions against hwui; a rect applied out of order"
+                    + " stays until its control moves", e);
+            return;
+        }
+        if (fixed == 0) return;
+        if (shown > 0) rootView.postInvalidateOnAnimation();
+        L.i("put " + fixed + " region rect" + (fixed == 1 ? "" : "s") + " in " + name
+                + " back where hwui last reported " + (fixed == 1 ? "its node" : "their nodes") + " ("
+                + shown + " with glass, " + lost + " lost)");
     }
 
     private static long lastTrace;
@@ -488,8 +720,16 @@ final class Region {
         }
         StringBuilder w = new StringBuilder();
         for (java.util.Map.Entry<View, Window> e : watched.entrySet()) {
-            if (e.getKey() != null) w.append(' ').append(e.getKey().getClass().getSimpleName()).append('=')
-                    .append(e.getValue().preDraws);
+            if (e.getKey() == null) continue;
+            Window win = e.getValue();
+            int n = win.preDraws - win.dumpedAt;
+            w.append(' ').append(e.getKey().getClass().getSimpleName()).append('=').append(win.preDraws);
+            if (n > 0) {
+                w.append(String.format(java.util.Locale.ROOT, " (%d since the last dump, %.1f us each)", n,
+                        win.syncNanos / 1000.0 / n));
+            }
+            win.syncNanos = 0;
+            win.dumpedAt = win.preDraws;
         }
         L.i("dump: " + live + " regions; UI pre-draws per window:" + w);
     }
@@ -498,26 +738,44 @@ final class Region {
         return Integer.toHexString(System.identityHashCode(this));
     }
 
-    /** Debug: where the host is in its window now, and whether any of it is on screen. */
+    /**
+     * Debug: where the host is in its window now, whether any of it is on
+     * screen, and which window that is ("detached" once the window is gone,
+     * where the region can no longer reach SurfaceFlinger).
+     */
     private static String where(View h) {
         int[] xy = new int[2];
         h.getLocationInWindow(xy);
         android.graphics.Rect vis = new android.graphics.Rect();
-        boolean shown = h.isAttachedToWindow() && h.getGlobalVisibleRect(vis);
-        return xy[0] + "," + xy[1] + " " + h.getWidth() + "x" + h.getHeight() + (shown ? " shown" : " off");
+        boolean attached = h.isAttachedToWindow();
+        boolean shown = attached && h.getGlobalVisibleRect(vis);
+        View root = h.getRootView();
+        return xy[0] + "," + xy[1] + " " + h.getWidth() + "x" + h.getHeight() + (shown ? " shown" : " off")
+                + " in " + root.getClass().getSimpleName() + "@"
+                + Integer.toHexString(System.identityHashCode(root)) + (attached ? "" : " detached");
     }
 
-    /** Debug: the rect hwui last reported for this region (window coordinates). */
-    private String reported() {
-        try {
-            if (rectField == null) {
-                rectField = bbd.getClass().getDeclaredField("mRect");
-                rectField.setAccessible(true);
-            }
-            return String.valueOf(rectField.get(bbd));
-        } catch (Throwable e) {
-            return "?";
+    /** The rect the aggregator sends for this region (window coordinates), as it has applied hwui's moves. */
+    private Rect aggregatorRect() throws Exception {
+        if (rectField == null) {
+            rectField = bbd.getClass().getDeclaredField("mRect");
+            rectField.setAccessible(true);
         }
+        return (Rect) rectField.get(bbd);
+    }
+
+    /** Debug: the aggregator's rect, and hwui's last word on the node if they differ. */
+    private String reported() {
+        String s;
+        try {
+            s = String.valueOf(aggregatorRect());
+        } catch (Throwable e) {
+            s = "?";
+        }
+        synchronized (lastReported) {
+            if (recorded && !s.equals(String.valueOf(lastReported))) s += " (hwui: " + lastReported + ")";
+        }
+        return s;
     }
 
     private static String chain(View v) {
@@ -556,6 +814,18 @@ final class Region {
                     + ancestors + ")");
         }
         return true;
+    }
+
+    /**
+     * Where hwui last put this region's node, in window coordinates, copied
+     * into {@code out}: empty before the first report, after a loss, and when
+     * the region cannot follow RenderThread. A frame behind at most.
+     */
+    Rect windowRect(Rect out) {
+        synchronized (lastReported) {
+            out.set(lastReported);
+        }
+        return out;
     }
 
     /** Takes the region out of the window's blur regions until the next draw. */

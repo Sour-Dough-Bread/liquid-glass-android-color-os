@@ -12,7 +12,7 @@ their own:
 - Quick Settings tiles;
 - the launcher's icons, folders, widgets and search box;
 - heads-up notifications;
-- sliders, the text selection toolbar and the screenshot UI;
+- sliders, the text selection toolbar, toasts and the screenshot UI;
 - the lockscreen clock.
 
 There's a write-up of how it works on my site:
