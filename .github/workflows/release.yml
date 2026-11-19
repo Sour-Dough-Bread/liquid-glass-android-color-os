@@ -1,0 +1,118 @@
+name: Release
+
+# Every push to main is tested, built and published as a GitHub release.
+#
+# A push that brings a new version= in module/module.prop becomes that
+# version's release. Any other push becomes a pre-release named after the
+# version it follows (v0.4.20-3-g1a2b3c4), and the module inside carries that
+# name: .github/scripts/release.sh has the rules.
+#
+# The build uses the repository's own scripts, the ones a developer runs. The
+# third-party code they fetch is pinned in engine/vendor/fetch_*.sh.
+#
+# The companion APK is built only when the repository holds its signing key:
+#   COMPANION_KEYSTORE_B64   the keystore, base64 (base64 -w0 file.keystore)
+#   COMPANION_KEYSTORE_PASS  its password (store and key); "android" if unset
+# Without the key the release is the module alone. An APK signed with a new
+# key in every run could never update the one a phone already has.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      NDK_VERSION: 29.0.14206865
+      BUILD_TOOLS_VERSION: 36.0.0
+      PLATFORM_VERSION: android-33
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # the build is named from the tags and the history
+          fetch-tags: true
+
+      - name: Name this build
+        id: name
+        run: .github/scripts/release.sh name
+
+      - name: Host tests
+        run: |
+          command -v busybox >/dev/null || sudo apt-get install -y --no-install-recommends busybox-static
+          engine/test/host.sh
+          module/tools/guard_test.sh
+
+      - name: Android NDK, build tools and platform
+        run: |
+          # The runner image has an SDK; this adds only what it lacks.
+          sdkmanager=$(ls "$ANDROID_HOME"/cmdline-tools/*/bin/sdkmanager | head -n 1)
+          want=("ndk;$NDK_VERSION" "build-tools;$BUILD_TOOLS_VERSION" "platforms;$PLATFORM_VERSION")
+          yes | "$sdkmanager" --licenses >/dev/null || true
+          "$sdkmanager" --install "${want[@]}" >/dev/null \
+            || sudo env "PATH=$PATH" "JAVA_HOME=$JAVA_HOME" "$sdkmanager" --install "${want[@]}" >/dev/null
+          test -x "$ANDROID_HOME/ndk/$NDK_VERSION/toolchains/llvm/prebuilt/linux-x86_64/bin/clang"
+          test -f "$ANDROID_HOME/platforms/$PLATFORM_VERSION/android.jar"
+          {
+            echo "ANDROID_NDK=$ANDROID_HOME/ndk/$NDK_VERSION"
+            echo "ANDROID_BUILD_TOOLS=$ANDROID_HOME/build-tools/$BUILD_TOOLS_VERSION"
+            echo "ANDROID_JAR=$ANDROID_HOME/platforms/$PLATFORM_VERSION/android.jar"
+          } >> "$GITHUB_ENV"
+
+      - name: Third-party code, pinned
+        run: |
+          engine/vendor/fetch_skia_headers.sh
+          engine/vendor/fetch_xz.sh
+          engine/vendor/fetch_frida_gum.sh
+          engine/vendor/fetch_patchelf_android.sh
+
+      - name: Build the module
+        run: module/pack.sh
+
+      - name: Build the companion
+        env:
+          COMPANION_KEYSTORE_B64: ${{ secrets.COMPANION_KEYSTORE_B64 }}
+          COMPANION_KEYSTORE_PASS: ${{ secrets.COMPANION_KEYSTORE_PASS }}
+        run: |
+          if [ -z "$COMPANION_KEYSTORE_B64" ]; then
+            echo "::notice::No COMPANION_KEYSTORE_B64 secret, so this release has no companion APK."
+            exit 0
+          fi
+          umask 077
+          printf '%s' "$COMPANION_KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/companion.keystore"
+          COMPANION_KEYSTORE="$RUNNER_TEMP/companion.keystore" companion/build.sh
+          rm -f "$RUNNER_TEMP/companion.keystore"
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.name.outputs.tag }}
+          KIND: ${{ steps.name.outputs.kind }}
+        run: |
+          files=(module/out/stockglass-*.zip)
+          if [ -f companion/out/stockglass-companion.apk ]; then
+            files+=(companion/out/stockglass-companion.apk)
+          fi
+          .github/scripts/release.sh notes "$TAG" "$KIND" "${files[@]}" > "$RUNNER_TEMP/notes.md"
+          cat "$RUNNER_TEMP/notes.md" >> "$GITHUB_STEP_SUMMARY"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "::notice::$TAG is already published. Nothing to do."
+            exit 0
+          fi
+          flags=()
+          if [ "$KIND" = prerelease ]; then flags+=(--prerelease); fi
+          gh release create "$TAG" --target "$GITHUB_SHA" --title "Stock Glass $TAG" \
+            --notes-file "$RUNNER_TEMP/notes.md" "${flags[@]}" "${files[@]}"

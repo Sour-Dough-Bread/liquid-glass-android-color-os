@@ -25,7 +25,14 @@ OUT="$HERE/patchelf-android"
 
 rm -rf "$WORK"; mkdir -p "$WORK" "$OUT"
 curl -fsSL "https://github.com/NixOS/patchelf/releases/download/$VER/patchelf-$VER.tar.gz" \
-  | tar xz -C "$WORK" --strip-components=1
+  -o "$WORK/patchelf.tar.gz"
+# The module runs this on the device as root: the 0.18.0 tarball is checked
+# against the one it was first built from. Another version is taken as it comes.
+if [ "$VER" = 0.18.0 ]; then
+  echo "64de10e4c6b8b8379db7e87f58030f336ea747c0515f381132e810dbf84a86e7  $WORK/patchelf.tar.gz" \
+    | sha256sum -c --status - || { echo "FATAL: patchelf-$VER.tar.gz is not the pinned tarball" >&2; exit 1; }
+fi
+tar xzf "$WORK/patchelf.tar.gz" -C "$WORK" --strip-components=1
 
 declare -A TRIPLE=([arm64-v8a]=aarch64-linux-android [x86_64]=x86_64-linux-android)
 for abi in arm64-v8a x86_64; do

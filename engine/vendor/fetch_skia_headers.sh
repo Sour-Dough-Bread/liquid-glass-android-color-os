@@ -28,9 +28,28 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 DEST="$HERE/skia"
 REMOTE=https://android.googlesource.com/platform/external/skia
 
+# The commit of each branch whose layout was checked against a real
+# SurfaceFlinger. A release branch can still move, and a build must not then
+# compile against headers nobody has looked at: a pinned branch is fetched at
+# its pin. SKIA_COMMIT overrides; a branch with no pin is taken at its tip.
+declare -A PIN=([android16-release]=bcb0f77c44783b1800ba37641ba7ecab04f05e07)
+COMMIT="${SKIA_COMMIT:-${PIN[$BRANCH]:-}}"
+
 rm -rf "$DEST" "$HERE/.skia-tmp"
 # blobless + sparse: the full tree is ~1 GB of sources we do not want.
-git clone --depth 1 --filter=blob:none --sparse -b "$BRANCH" "$REMOTE" "$HERE/.skia-tmp"
+if [ -n "$COMMIT" ]; then
+  git init -q "$HERE/.skia-tmp"
+  git -C "$HERE/.skia-tmp" remote add origin "$REMOTE"
+  git -C "$HERE/.skia-tmp" config remote.origin.promisor true
+  git -C "$HERE/.skia-tmp" config remote.origin.partialclonefilter blob:none
+  git -C "$HERE/.skia-tmp" sparse-checkout init --cone
+  git -C "$HERE/.skia-tmp" sparse-checkout set include modules/skcms android/include
+  git -C "$HERE/.skia-tmp" fetch -q --depth 1 --filter=blob:none origin "$COMMIT"
+  git -C "$HERE/.skia-tmp" checkout -q FETCH_HEAD
+else
+  echo "no pinned commit for $BRANCH: taking its tip"
+  git clone --depth 1 --filter=blob:none --sparse -b "$BRANCH" "$REMOTE" "$HERE/.skia-tmp"
+fi
 # android/include/config/SkUserConfig.h is AOSP's Skia build config. It is NOT
 # optional decoration: it defines SK_GANESH, SK_GL, SK_VULKAN,
 # SK_ENABLE_ANDROID_UTILS, SK_SUPPORT_PDF and friends, and those change which

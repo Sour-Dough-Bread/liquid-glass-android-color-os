@@ -55,10 +55,16 @@ From a Poco F3 on crDroid 13.1, Android 17.
 
 ## Download
 
-| Build | sha256 |
+| Build | Where |
 |---|---|
-| [Module, v0.4.14](https://bnlg.capthnds.me/KfLzkdXetoZ-UXCZ65/stockglass-v0.4.14.zip) | `c1d99a8fbacae5d0751ffc0e747ad5ccf62bf61f25678eba03db3fc4b243fe6d` |
-| [Companion APK](https://bnlg.capthnds.me/X1l-_U6YeApbAXKOM3/stockglass-companion.apk) | `baa9efa6ba9591560aba6c5be6ef16cdeaa1bad83a582767974823eea9783774` |
+| Module | [The latest release](https://github.com/capthndsme/liquid-glass-android/releases/latest), with its sha256 |
+| [Companion APK, 0.1](https://bnlg.capthnds.me/X1l-_U6YeApbAXKOM3/stockglass-companion.apk) | sha256 `baa9efa6ba9591560aba6c5be6ef16cdeaa1bad83a582767974823eea9783774` |
+
+GitHub Actions builds every push to this repository and publishes it under
+[Releases](https://github.com/capthndsme/liquid-glass-android/releases). The
+latest release is the newest numbered version. A build between two versions is
+a pre-release named like `v0.4.20-3-g1a2b3c4`, and the module in it reports
+that name. When a release has a companion APK attached, take that one.
 
 It's experimental and needs root on Android 14 to 17. The installer checks the
 ROM's SurfaceFlinger first and refuses to install if the engine can't drive it.
@@ -98,9 +104,14 @@ Android SDK (build-tools 36.0.0, platform android-33) and a JDK.
 engine/vendor/fetch_skia_headers.sh
 engine/vendor/fetch_xz.sh
 engine/vendor/fetch_frida_gum.sh
+engine/test/host.sh  # the tests that need no device
 module/pack.sh       # module/out/stockglass-v<version>.zip
 companion/build.sh   # companion/out/stockglass-companion.apk
 ```
+
+The fetch scripts take pinned commits and checked archives, so a build made
+elsewhere compiles the same third-party code. The release workflow
+(`.github/workflows/release.yml`) runs these same scripts.
 
 ## Credits
 

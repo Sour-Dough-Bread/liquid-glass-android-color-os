@@ -16,7 +16,12 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 DEST="$HERE/xz"
 TMP="$HERE/.xz-tmp"
 
-[ -d "$TMP" ] || git clone --depth 1 https://github.com/tukaani-project/xz-embedded.git "$TMP"
+# Pinned. This decoder runs inside SurfaceFlinger, and a build, a release
+# build above all, must not take whatever upstream's HEAD is that day.
+COMMIT="${XZ_EMBEDDED_COMMIT:-ae63ae3a36ed01724674e8f3d750dc47bf125410}"
+rm -rf "$TMP"; git init -q "$TMP"
+git -C "$TMP" fetch -q --depth 1 https://github.com/tukaani-project/xz-embedded.git "$COMMIT"
+git -C "$TMP" checkout -q FETCH_HEAD
 
 rm -rf "$DEST"; mkdir -p "$DEST"
 for f in xz_crc32.c xz_dec_lzma2.c xz_dec_stream.c xz_dec_bcj.c \

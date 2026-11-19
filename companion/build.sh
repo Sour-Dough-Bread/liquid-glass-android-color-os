@@ -5,6 +5,11 @@
 #
 #   ./build.sh        -> out/stockglass-companion.apk
 #
+# The tool paths and the signing key are this machine's unless the environment
+# says otherwise (the release workflow does): ANDROID_BUILD_TOOLS, ANDROID_JAR,
+# ANDROID_NDK, and COMPANION_KEYSTORE with COMPANION_KEYSTORE_PASS. An update
+# installs over an earlier APK only when both carry the same key's signature.
+#
 # Outputs:
 #   classes.dex                 the module. Compiled against the Xposed API in
 #                               devloader/java but never containing it, so
@@ -16,13 +21,16 @@
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
-BT="$HOME/Android/Sdk/build-tools/36.0.0"
+BT="${ANDROID_BUILD_TOOLS:-$HOME/Android/Sdk/build-tools/36.0.0}"
 # android-33 for the same reason as the harness: the code only needs public
 # View/Drawable/Canvas API, and everything hidden is reached by reflection.
-ANDROID_JAR="$HOME/Android/sdk/platforms/android-33/android.jar"
+ANDROID_JAR="${ANDROID_JAR:-$HOME/Android/sdk/platforms/android-33/android.jar}"
 NDK="${ANDROID_NDK:-$HOME/Android/Sdk/ndk/29.0.14206865}"
 TC="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
-KEYSTORE="$HOME/.android/debug.keystore"
+KEYSTORE="${COMPANION_KEYSTORE:-$HOME/.android/debug.keystore}"
+# Exported: apksigner reads the password from the environment (env:KS_PASS), so
+# it is on no command line.
+export KS_PASS="${COMPANION_KEYSTORE_PASS:-android}"
 OUT="$HERE/out"
 # jvmti.h comes from the local JDK (the NDK has none). Only that one header is
 # copied, so Android's own jni.h is the one it includes.
@@ -40,7 +48,9 @@ fi
 
 javac_() {
   # Same flags as the harness: JDK 25 rejects -bootclasspath with -source.
-  javac -source 17 -target 17 -nowarn "$@" 2>&1 \
+  # The encoding is said outright: before JDK 18 javac reads sources in the
+  # locale's, and under a C locale a comment's arrow stops the build.
+  javac -encoding UTF-8 -source 17 -target 17 -nowarn "$@" 2>&1 \
     | grep -vE "bootstrap class path|source value|target value|To suppress warnings" || true
 }
 
@@ -86,7 +96,7 @@ echo "==> package"
 cp "$OUT/dex-module/classes.dex" "$OUT/classes.dex"
 (cd "$OUT" && zip -q -u base.apk classes.dex)
 "$BT/zipalign" -f 4 "$OUT/base.apk" "$OUT/aligned.apk"
-"$BT/apksigner" sign --ks "$KEYSTORE" --ks-pass pass:android --key-pass pass:android \
+"$BT/apksigner" sign --ks "$KEYSTORE" --ks-pass env:KS_PASS --key-pass env:KS_PASS \
   --out "$OUT/stockglass-companion.apk" "$OUT/aligned.apk"
 rm -f "$OUT/stockglass-companion.apk.idsig"
 echo "OK: $OUT/stockglass-companion.apk ($(stat -c%s "$OUT/stockglass-companion.apk") bytes)"

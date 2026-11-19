@@ -4015,6 +4015,17 @@ How it reads:
   there costs about twice Android's blur, where it cost more than three
   times.
 
+**The same engine from a clean machine.** The release workflow's steps, run
+in an Ubuntu 24.04 container on a fresh clone with nothing of the
+development machine but the NDK (29.0.14206865, mounted read-only): the
+pinned fetches, the host tests, `module/pack.sh`, `companion/build.sh` under
+JDK 17. Both engines came out byte for byte as the ones above (arm64
+`959271dc…`, the one on the phones, and x86_64 `f53d014a…`), and so did
+`glasscheck`. `patchelf` did not, and the zip differs with it and with its
+README and timestamps. The companion needed `-encoding UTF-8` to compile
+there: JDK 17 reads sources in the locale's encoding, and a comment has an
+arrow in it. The workflow itself has not run on GitHub yet.
+
 Not measured: the home screen swiped on either phone (it needs an unlocked
 phone nobody is using; the commands are below), anything on alioth with
 v0.4.20, two layers (`lean_soft` against `full`).
