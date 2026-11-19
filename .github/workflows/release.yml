@@ -41,7 +41,7 @@ jobs:
       BUILD_TOOLS_VERSION: 36.0.0
       PLATFORM_VERSION: android-33
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           fetch-depth: 0   # the build is named from the tags and the history
           fetch-tags: true

@@ -4024,7 +4024,12 @@ JDK 17. Both engines came out byte for byte as the ones above (arm64
 `glasscheck`. `patchelf` did not, and the zip differs with it and with its
 README and timestamps. The companion needed `-encoding UTF-8` to compile
 there: JDK 17 reads sources in the locale's encoding, and a comment has an
-arrow in it. The workflow itself has not run on GitHub yet.
+arrow in it.
+
+The workflow's first run on GitHub, the same day, took 1 min 13 s and
+published v0.4.20 (zip `61877542…`) with the same two engines and the same
+`glasscheck`, so the release carries the engine the phones run. Its other
+files are the commit's.
 
 Not measured: the home screen swiped on either phone (it needs an unlocked
 phone nobody is using; the commands are below), anything on alioth with
