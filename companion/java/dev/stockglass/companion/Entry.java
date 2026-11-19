@@ -24,6 +24,13 @@ public final class Entry implements IXposedHookLoadPackage {
             Gate.watch();
             return;
         }
+        // system_server, which LSPosed loads as package "android" (its process
+        // name has been reported both as "android" and as "system_server").
+        if ("android".equals(p.packageName)) {
+            AppDialogs.install(p.classLoader);
+            Gate.watch();
+            return;
+        }
         // Otherwise only the package's own main process; other packages can
         // load this code (createPackageContext with CONTEXT_INCLUDE_CODE) and
         // SystemUI runs helper processes that draw no tiles.
@@ -35,6 +42,8 @@ public final class Entry implements IXposedHookLoadPackage {
                 ShadeGlass.install(p.classLoader);
                 TextToolbar.install(p.classLoader);
                 Toasts.install(p.classLoader);
+                AxionVolume.install(p.classLoader);
+                DialogGlass.install(p.classLoader);
                 ClockGlass.install(p.classLoader);
                 Gate.watch();
                 break;
@@ -45,6 +54,7 @@ public final class Entry implements IXposedHookLoadPackage {
                 LauncherIcons.install(p.classLoader);
                 LauncherWidgets.install(p.classLoader);
                 LauncherSearch.install(p.classLoader);
+                LauncherOverview.install(p.classLoader);
                 Gate.watch();
                 break;
             default:

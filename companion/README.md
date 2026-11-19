@@ -2,9 +2,10 @@
 
 An LSPosed module that turns Quick Settings tiles and the brightness slider,
 the text selection toolbar (Cut, Copy, Paste), apps' text toasts, the
-screenshot UI's action bar, launcher folder icons, themed app icons (home
-screen, dock and app drawer), home screen widgets and the launcher's search
-boxes into blur regions, so that
+screenshot UI's action bar, SystemUI's own dialogs (the Quick Settings
+popups), AxionOS's volume panel, launcher folder icons, themed app icons (home
+screen, dock and app drawer), home screen widgets, the launcher's search boxes
+and the buttons in Overview into blur regions, so that
 the Stock Glass engine draws Liquid Glass under them. In the notification shade it uncovers the glass Android 17
 already puts under each card (lighter scrims, a lighter card fill), and it lets
 heads-up notifications keep that glass. The lockscreen clock is not a region:
@@ -12,7 +13,8 @@ SystemUI draws its glyphs as refracting glass itself (`ClockGlass`, after
 Kyant0's AndroidLiquidGlass lockscreen demo), on the flex clock, crDroid's
 clock styles and the digital clock faces from plugins (Inflate, NumOverlap,
 Growth, Calligraphy, Metro). It draws nothing unless the engine is running and
-in glass mode.
+in glass mode. From system_server it also puts a blurred backdrop behind
+every app's dialogs (a window attribute, so no app needs to be in scope).
 
 - Design, hooks, cost, opt-in: `../docs/ARCHITECTURE.md`, "The companion".
 - What was verified, and how: `../docs/VERIFIED.md`, "The companion on the A17
@@ -46,6 +48,16 @@ Android 17 SystemUI draws every app's toolbar and text toast. Toasts an app
 draws with its own view (deprecated since Android 11) are drawn in the app's
 process and stay stock. The screenshot UI runs in SystemUI's own
 `com.android.systemui:screenshot` process, which the System UI scope covers.
+The blur behind apps' dialogs needs System Framework (`android`) in the scope
+as well, and a reboot; without it everything else still works.
+
+New in 0.2: the Quick Settings popups (`DialogGlass`), AxionOS's volume panel
+(`AxionVolume`), the Overview buttons (`LauncherOverview`) and the blur behind
+apps' dialogs (`AppDialogs`). All four were seen working on a Poco F1
+(AxionOS, A17), and all but the AxionOS panel on a Poco F3 (crDroid, A17).
+Under System Framework scope the hook loads in system_server on both, with no
+crashes. Vector added that scope by itself when 0.2 replaced 0.1 on the F1,
+but not on the F3.
 
 App icons get glass only when they are themed: "Themed icons" in a Pixel
 build's wallpaper and style settings, the "Minimal" app icon style in crDroid's
@@ -84,6 +96,12 @@ Read at most every 500 ms, while a control draws.
 | `persist.sys.glass.app.toast` | 1 | 0 leaves toasts stock |
 | `persist.sys.glass.app.drawer` | 1 | 0 leaves the app drawer's themed icons stock |
 | `persist.sys.glass.app.search` | 1 | 0 leaves the drawer's and the dock's search boxes stock |
+| `persist.sys.glass.app.volume` | 1 | 0 leaves AxionOS's volume panel stock (the stock volume dialog has blur of its own) |
+| `persist.sys.glass.app.dialogs` | 1 | 0 leaves SystemUI's dialogs stock: the Quick Settings popups (Internet, Bluetooth, Do Not Disturb, Cast, …) and their confirmations |
+| `persist.sys.glass.app.overview` | 1 | 0 leaves the buttons in Overview (Screenshot, Clear all, …) stock |
+| `persist.sys.glass.app.appdialogs` | 1 | 0: no blur behind apps' dialogs (needs System Framework in scope) |
+| `persist.sys.glass.app.dialogdim` | 0.5 | an app dialog's dim is multiplied by this while it has blur behind it (AOSP's power menu uses 0.54 with blur, 0.88 without) |
+| `persist.sys.glass.app.dialogradius` | 0 | the blur radius behind apps' dialogs in px; 0 is the framework's largest window blur |
 | `persist.sys.glass.app.clock` | 1 | 0 leaves the lockscreen clock stock; `plain` gives it translucent glass that refracts nothing (what a live wallpaper gets) |
 | `persist.sys.glass.app.clocktint` | 0.5 | how much of a plugin clock face's own colours (Inflate, NumOverlap, …) shows in its glass: 0 is the flex clock's clear glass, 1 the face as drawn with the glass rim on top |
 | `persist.sys.glass.app.fill` | 0.3 | alpha kept on a neutral fill |

@@ -27,6 +27,14 @@ import java.util.concurrent.CopyOnWriteArrayList;
  *   persist.sys.glass.app.toast=0   leave toasts alone
  *   persist.sys.glass.app.drawer=0  leave the app drawer's icons alone
  *   persist.sys.glass.app.search=0  leave the launcher's search boxes alone
+ *   persist.sys.glass.app.volume=0  leave the volume panel alone
+ *   persist.sys.glass.app.dialogs=0 leave SystemUI's dialogs (Quick Settings popups, ...) alone
+ *   persist.sys.glass.app.overview=0 leave the buttons in Overview (recents) alone
+ *   persist.sys.glass.app.appdialogs=0 no blur behind apps' dialogs (system_server)
+ *   persist.sys.glass.app.dialogdim an app dialog's dim is multiplied by this while it is
+ *                                   blurred behind (default 0.5)
+ *   persist.sys.glass.app.dialogradius blur behind an app dialog, in px; 0 = the framework's
+ *                                   largest window blur (max_window_blur_radius)
  *   persist.sys.glass.app.clock=0   leave the lockscreen clock alone (ClockGlass); "plain":
  *                                   translucent glass with no refraction, as with a live wallpaper
  *   persist.sys.glass.app.clocktint how much of a plugin clock face's own colours shows in its
@@ -92,12 +100,12 @@ final class Gate {
     private static int debuggable = -1;
     private static String engineSeen;
     private static boolean glass, qs, folders, icons, widgets, shade, headsUp, sliders, toolbar, screenshot,
-            toast, drawer, search, clock, clockPlain, debug, rtFollow = true;
+            toast, drawer, search, clock, clockPlain, volume, dialogs, overview, appDialogs, debug, rtFollow = true;
     private static String punch = "", scrimColor = "stock";
     private static String debugMode = "0";
     private static float fill = 0.3f, accent = 0.75f, tint = 0.6f, tileColor = 0.5f, contrast = 0.65f,
-            scrim = 0.5f, cards = 0.6f, clockTint = 0.5f;
-    private static int radius;
+            scrim = 0.5f, cards = 0.6f, clockTint = 0.5f, appDialogDim = 0.5f;
+    private static int radius, appDialogRadius;
 
     private Gate() {}
 
@@ -198,6 +206,38 @@ final class Gate {
         return glass && search;
     }
 
+    static boolean volume() {
+        refresh();
+        return glass && volume;
+    }
+
+    static boolean dialogs() {
+        refresh();
+        return glass && dialogs;
+    }
+
+    static boolean overview() {
+        refresh();
+        return glass && overview;
+    }
+
+    static boolean appDialogs() {
+        refresh();
+        return glass && appDialogs;
+    }
+
+    /** An app dialog's dim is multiplied by this while it is blurred behind. */
+    static float appDialogDim() {
+        refresh();
+        return appDialogDim;
+    }
+
+    /** Blur behind an app dialog in px; 0 for the framework's own radius. */
+    static int appDialogRadius() {
+        refresh();
+        return appDialogRadius;
+    }
+
     static boolean clock() {
         refresh();
         return glass && clock;
@@ -286,6 +326,7 @@ final class Gate {
         next = now + REFRESH_MS;
         String was = glass + " " + qs + " " + folders + " " + icons + " " + widgets + " " + shade + " " + headsUp
                 + " " + sliders + " " + toolbar + " " + screenshot + " " + toast + " " + drawer + " " + search + " " + clock
+                + " " + volume + " " + dialogs + " " + overview + " " + appDialogs
                 + " " + clockPlain + " " + clockTint + " " + fill + " " + accent + " " + tint + " " + tileColor + " " + contrast
                 + " " + scrim + " " + scrimColor + " " + cards + " " + radius + " " + punch;
         String mode = prop("mode", "");
@@ -305,6 +346,12 @@ final class Gate {
         toast = !prop("app.toast", "1").equals("0");
         drawer = !prop("app.drawer", "1").equals("0");
         search = !prop("app.search", "1").equals("0");
+        volume = !prop("app.volume", "1").equals("0");
+        dialogs = !prop("app.dialogs", "1").equals("0");
+        overview = !prop("app.overview", "1").equals("0");
+        appDialogs = !prop("app.appdialogs", "1").equals("0");
+        appDialogDim = clamp(num(prop("app.dialogdim", ""), 0.5f));
+        appDialogRadius = Math.max(0, Math.round(num(prop("app.dialogradius", ""), 0f)));
         String clockMode = prop("app.clock", "1");
         clock = !clockMode.equals("0");
         clockPlain = clockMode.equals("plain");
@@ -325,6 +372,7 @@ final class Gate {
         debug = !debugMode.isEmpty() && !debugMode.equals("0");
         String is = glass + " " + qs + " " + folders + " " + icons + " " + widgets + " " + shade + " " + headsUp
                 + " " + sliders + " " + toolbar + " " + screenshot + " " + toast + " " + drawer + " " + search + " " + clock
+                + " " + volume + " " + dialogs + " " + overview + " " + appDialogs
                 + " " + clockPlain + " " + clockTint + " " + fill + " " + accent + " " + tint + " " + tileColor + " " + contrast
                 + " " + scrim + " " + scrimColor + " " + cards + " " + radius + " " + punch;
         if (primed && !is.equals(was)) {

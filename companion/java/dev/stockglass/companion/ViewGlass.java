@@ -239,6 +239,12 @@ final class ViewGlass extends Drawable {
             region.hide();
             return;
         }
+        // The overlay draws in the view's scrolled space; the background (and
+        // so the outline) does not, View.drawBackground undoes the scroll. A
+        // single-line centred TextView, which every Button is, scrolls by about
+        // half of TextView's 1 << 20 px line: Overview's buttons put their
+        // glass 524,000 px to the left until this was undone here too.
+        rect.offset(v.getScrollX(), v.getScrollY());
         region.draw(v, canvas, rect.left, rect.top, rect.right, rect.bottom, r, r, r, r,
                 Gate.radius(), false, originalAlpha / (float) peak);
     }
