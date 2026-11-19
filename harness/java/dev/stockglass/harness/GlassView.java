@@ -295,6 +295,13 @@ public class GlassView extends View {
         // Uniforms a RuntimeShader is never given read as zero, and a zero
         // toneScale or filterColor would draw the pane black.
         glass.setFloatUniform("softenRadius", params.f("softenDp") * dp);
+        // The sharp bitmap is the see-through child here, read at full detail.
+        glass.setFloatUniform("softenFast", 0f);
+        glass.setFloatUniform("rimFrost", 0f);
+        // How far in the edge reaches, as the engine computes it (fillUniforms).
+        glass.setFloatUniform("deepBand", Math.max(Math.max(params.f("refractionWidthDp"),
+                params.f("refractionHeightDp")), Math.max(params.f("highlightWidthDp"), 7f)) * dp
+                + 0.5f);
         glass.setFloatUniform("fillLighten", params.f("fillLighten"));
         glass.setFloatUniform("fillDarken", params.f("fillDarken"));
         glass.setFloatUniform("lumaLimit", params.f("lumaLimit"));
