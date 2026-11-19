@@ -32,11 +32,36 @@ log() { echo "$@" >> "$LOG"; }
 # Deliberately does NOT trip on a crash after boot completed: by then the device
 # is usable and the user can uninstall normally, whereas disabling on any crash
 # would turn an unrelated SurfaceFlinger restart into a silent uninstall.
+#
+# The one exception is a boot in which the overlay was provably not mounted:
+# post-mount.sh, which runs after the manager has mounted modules and before
+# SurfaceFlinger starts, left overlay_absent behind. SurfaceFlinger then ran
+# the ROM's own build and nothing of ours was in the process, so whatever
+# stopped that boot was not this module (a GPU that never came up, a
+# metamodule that mounted nothing). Without that marker (Magisk has no
+# post-mount stage, or the marker was lost to a hard reset) the guard stays
+# as strict as it always was, because an unloadable library leaves no other
+# trace: the linker rejects SurfaceFlinger before any code of ours runs.
 if [ -f "$STATE/boot_pending" ]; then
   rm -f "$STATE/boot_pending"
-  : > "$STATE/disabled"
-  log "previous boot did not complete with the module active; disabling"
+  if [ -f "$STATE/overlay_absent" ]; then
+    log "previous boot did not complete, but the overlay was not mounted in it"
+    log "(SurfaceFlinger was the ROM's own), so it was not this module; not disabling"
+  else
+    : > "$STATE/disabled"
+    log "previous boot did not complete with the module active; disabling"
+  fi
 fi
+rm -f "$STATE/overlay_absent"
+
+# Whether anything will mount the overlay this boot, for the log and glassctl.
+. "$MODDIR/meta.sh" 2>/dev/null && case "$(mount_state)" in
+  none)   log "KernelSU without a metamodule: the overlay will not be mounted."
+          log "Install one (e.g. meta-overlayfs) and reboot." ;;
+  broken) log "metamodule $META_NAME is installed but KernelSU will not run it:"
+          log "$MOUNT_WHY. Nothing from any module is mounted; reinstall it." ;;
+  off)    log "metamodule $META_NAME: $MOUNT_WHY. Nothing will be mounted." ;;
+esac
 
 # Every way out below that must leave the compositor stock does BOTH of these:
 # removes our system/ and sets skip_mount. Removing system/ is enough for a
@@ -96,14 +121,7 @@ fi
 # Mounting is wanted this boot; clear a skip_mount left by an earlier stand-down.
 rm -f "$MODDIR/skip_mount"
 
-# KernelSU 3.0 and later no longer mount modules themselves; a metamodule
-# (meta-overlayfs is the reference one) does. Without one the overlay above is
-# built and never mounted, the engine never loads, and the device boots exactly
-# as stock — which is safe, but looks like the module silently doing nothing.
-if [ -x /data/adb/ksud ] && grep -q metamodule /data/adb/ksud 2>/dev/null \
-   && [ ! -e /data/adb/metamodule ]; then
-  log "KernelSU without a metamodule: the overlay will not be mounted."
-  log "Install one (e.g. meta-overlayfs) and reboot."
-fi
-
+# Synced: the boot this marker guards against is one that ends in a hard reset,
+# and an unsynced new file may not survive one.
 : > "$STATE/boot_pending"
+sync

@@ -129,16 +129,35 @@ if [ -d "$LIVE" ] && [ -d "$MODPATH/system" ]; then
     ui_print "- Swapped $swapped running file(s) for new ones; the running copies stay in use until the reboot"
 fi
 
+# Installing again is how a stand-down is retried (under a metamodule it is
+# also the only way to give it a fresh copy of the overlay), so it clears the
+# boot guard's verdict. The guard itself stays armed for the next boot.
+if [ -f /data/adb/glass/disabled ]; then
+  rm -f /data/adb/glass/disabled /data/adb/glass/boot_pending
+  ui_print "- Cleared the earlier stand-down after a failed boot; the guard"
+  ui_print "  still protects the next one"
+fi
+
 ui_print ""
 ui_print "- Installed. Reboot to apply."
-if [ "$KSU" = true ] && grep -q metamodule /data/adb/ksud 2>/dev/null \
-   && [ ! -e /data/adb/metamodule ]; then
-  ui_print ""
-  ui_print "! KernelSU 3+ mounts modules only through a metamodule, and"
-  ui_print "! none is installed. Without one this module is installed but"
-  ui_print "! never mounted, and the engine will not load. Install a"
-  ui_print "! metamodule such as meta-overlayfs, then reboot."
-fi
+. "$MODPATH/meta.sh" 2>/dev/null && case "$(mount_state)" in
+  none)
+    ui_print ""
+    ui_print "! KernelSU 3+ mounts modules only through a metamodule, and"
+    ui_print "! none is installed. Without one this module is installed but"
+    ui_print "! never mounted, and the engine will not load. Install a"
+    ui_print "! metamodule such as meta-overlayfs, then reboot." ;;
+  broken)
+    ui_print ""
+    ui_print "! The metamodule ($META_NAME) is installed, but KernelSU will"
+    ui_print "! not run it: $MOUNT_WHY."
+    ui_print "! Until it is reinstalled, no module is mounted, this one"
+    ui_print "! included. Reinstall it from the manager, then reboot." ;;
+  off)
+    ui_print ""
+    ui_print "! The metamodule ($META_NAME) is $MOUNT_WHY,"
+    ui_print "! so no module is mounted. Enable it, then reboot." ;;
+esac
 ui_print "- If a boot ever fails with this installed, the module disables"
 ui_print "  itself on the next boot rather than looping."
 ui_print ""
