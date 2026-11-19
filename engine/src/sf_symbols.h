@@ -136,6 +136,11 @@ enum Index : size_t {
     kCanvasGetTotalMatrix,
     kPaintSetShader,
 
+    // ---- kOptional: a copy of part of the snapshot (snapshotCopy=bounds);
+    // without both, panes go on reading the snapshot itself
+    kImageMakeSubset,
+    kCanvasBaseRecorder,
+
     // ---- kBlurGenerate: BlurFilter::generateTemporaryImage per filter (A17)
     kGenerateKawase,
     kGenerateGaussian,

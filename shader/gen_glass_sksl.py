@@ -89,12 +89,12 @@ BASE_UNIFORMS = [
     "size", "offset", "crop", "cornerExtents", "cornerShapes", "unitScale",
     "refractionScale", "refractionAmount", "refractionSwirl", "depthEffect",
     "profilePower", "profileBias",
-    "blurMix", "blurFalloff", "lensBlur",
+    "blurMix", "blurFalloff", "lensBlur", "rimFrost",
     "tintColor", "frostColor",
     "highlightIntensity", "highlightDir", "highlightWidth", "highlightFalloff",
     "lightIntensity", "glassOpacity", "saturation", "hdrHeadroom",
     "touchPos", "touchGlow", "touchLens",
-    "softenRadius",
+    "softenRadius", "softenFast", "deepBand",
     "fillLighten", "fillDarken", "lumaLimit", "toneScale", "toneBias", "filterColor",
 ]
 DISPERSION_UNIFORMS = [
@@ -194,6 +194,26 @@ uniform float  blurFalloff;
 // physically right, but it is the reason not to simply pin this at 1.
 uniform float  lensBlur;
 
+// How frosted the RIM is, against the inside of the pane.
+//
+// The handover above fades the frost out toward the edge: frostT is blurMix
+// deep inside and 0 at the rim. lensBlur was meant to make up for it, and the
+// presets pin it to blurMix "so the rim is no sharper than the pane it
+// borders". It does not: lensBlur is taken off the see-through view at the rim
+// AND inside, and blurMix on top of that only inside, so the see-through view
+// keeps (1 - lensBlur) of its strength at the rim against
+// (1 - lensBlur)(1 - blurMix) inside. At 0.3 and 0.3 that is 70% against 49%:
+// a rim band visibly clearer than the pane, with the colour fringe drawn at
+// the strength of the clear part. Measured on the AVD as 1.4 times the
+// contrast in the band.
+//
+// rimFrost 1 mixes the frost in at full blurMix across the band, so the rim
+// is as frosted as the inside, and takes that frost from where the lens read
+// (the same bend as the see-through view) rather than from straight behind
+// the fragment, which would ghost a bent image against an unbent one. 0 is
+// the handover as it was, exactly.
+uniform float  rimFrost;
+
 uniform float4 tintColor;        // straight (non-premultiplied) RGBA
 uniform float4 frostColor;       // rgb = system background, a = frostAmount
 uniform float  highlightIntensity;
@@ -221,6 +241,20 @@ uniform float  touchLens;        // 0..1 gate on the press's optical half
 // the image along the displacement, so there each tap steps sideways instead
 // (see the dispersion loop): the same blur, still one read per tap.
 uniform float  softenRadius;
+
+// 1 when the see-through child is itself a blur: a pane over a backdrop reads
+// the backdrop's quarter-resolution image there, which has no detail finer
+// than four pixels for a nine-tap kernel to resolve. Four taps at the same
+// variance then give the same picture for less than half the reads.
+// 2 is for the sharp child: five taps on a rotated grid in the nine's place
+// (sampleSoft), which is what a phone's GPU can afford per pixel.
+uniform float  softenFast;
+
+// How far in from the edge the edge still does anything, px: the widest of the
+// refraction band, the rim light and the sheen (set CPU-side). A fragment
+// deeper than this is plain pane: undisplaced, t == 1, no light. Most of a
+// large pane is, and main() skips the whole lens for it (see `deep`).
+uniform float  deepBand;
 
 // iOS's regular glass, as Core Animation draws it (ported from the maths a
 // WebGPU reimplementation of QuartzCore uses; uikit.even.how, datamined into
@@ -397,6 +431,30 @@ float4 sampleBlurred(float2 viewPx) { return toStraight(blurredContent.eval(warp
 float4 sampleSoft(float2 viewPx) {
     if (softenRadius <= 0.0) return sampleSharp(viewPx);
     float s = 0.57735 * softenRadius + 0.5;
+    if (softenFast > 1.5) {
+        // The centre and (2,1), (-1,2), (-2,-1), (1,-2) times k: no two taps
+        // share a row or a column, so each axis sees five positions, -2k to
+        // 2k, from five reads. Weights 0.36 and 0.16 with k = 0.585 s give
+        // the nine taps' variance, 0.548 s^2 on each axis, and no direction
+        // is left without a tap near it the way a plain X or + would leave.
+        float k = 0.585 * s;
+        float4 c = float4(sharpContent.eval(warpToLocal(viewPx)));
+        float4 r = float4(sharpContent.eval(warpToLocal(viewPx + float2( 2.0 * k,  k))))
+                 + float4(sharpContent.eval(warpToLocal(viewPx + float2(-k,  2.0 * k))))
+                 + float4(sharpContent.eval(warpToLocal(viewPx + float2(-2.0 * k, -k))))
+                 + float4(sharpContent.eval(warpToLocal(viewPx + float2( k, -2.0 * k))));
+        return toStraight(half4(c * 0.36 + r * 0.16));
+    }
+    if (softenFast > 0.5) {
+        // The nine taps below have a variance of 0.548 s^2 on each axis; four
+        // at (+-d, +-d) have d^2.
+        float d = 0.7403 * s;
+        float4 q = float4(sharpContent.eval(warpToLocal(viewPx + float2( d,  d))))
+                 + float4(sharpContent.eval(warpToLocal(viewPx + float2(-d,  d))))
+                 + float4(sharpContent.eval(warpToLocal(viewPx + float2( d, -d))))
+                 + float4(sharpContent.eval(warpToLocal(viewPx + float2(-d, -d))));
+        return toStraight(half4(q * 0.25));
+    }
     float4 c = float4(sharpContent.eval(warpToLocal(viewPx)));
     float4 a = float4(sharpContent.eval(warpToLocal(viewPx + float2( s, 0.0))))
              + float4(sharpContent.eval(warpToLocal(viewPx + float2(-s, 0.0))))
@@ -435,31 +493,7 @@ half4 main(float2 fragCoord) {
         return half4(0.0);
     }
 
-    float4 maxGradExtent = float4(min(halfSize.x, halfSize.y));
-    float4 gradExtents = min(cornerExtents * 1.5, maxGradExtent);
-    float2 normal = safeNormalize(
-        gradGlassRect(centered, halfSize, gradExtents, cornerShapes),
-        float2(0.0, 1.0));
-
-    float2 radial = safeNormalize(centered, float2(0.0));
-
-    // The light axis: highlightDir rotated +90 degrees - the same axis the
-    // HIGHLIGHT lobes sit on, so `highlight.angle` steers both. At swirl 0 the
-    // sum is exactly the iOS/Kyant gradient.
-    float2 lobeDir = float2(-highlightDir.y, highlightDir.x);
-    float2 direction = safeNormalize(
-        normal + depthEffect * radial + refractionSwirl * lobeDir, normal);
-
-    // Anisotropic refraction height: n^2 . refractionScale yields
-    // refractionScale.x on a vertical edge and .y on a horizontal one.
-    float2 limit = max(halfSize, float2(1e-3));
-    float2 scale2 = clamp(refractionScale, float2(1e-3), limit);
-    float scale = max(dot(normal * normal, scale2), 1e-3);
-
-    float t = clamp(-min(sd, 0.0) / scale, 0.0, 1.0);
     float inside = -min(sd, 0.0);
-
-    float touchBoost = 1.0 + 0.35 * touchGlow * touchLens;
 
     // ---- the frost handover -------------------------------------------------
     // One blurred read, always, at the UNDISPLACED position: the compositor
@@ -469,12 +503,69 @@ half4 main(float2 fragCoord) {
     // the default blurMix == 1. The branch is uniform-coherent across that
     // region, so it is close to free.
     float4 fr = sampleBlurred(pixels);
-    float frostT = pow(smoothstep(0.0, 1.0, t), max(blurFalloff, 1e-3)) * blurMix;
-
     float3 color = fr.rgb;
     float bdAlpha = fr.a;
 
-    if (frostT < 0.999) {
+    // Past deepBand the edge is out of reach: t is exactly 1, so frostT is
+    // blurMix, the lens reads straight through, and the rim and the sheen have
+    // both faded to nothing. Those fragments take the short way: none of the
+    // gradient, the three normalizes, the two pow() or the dispersion below.
+    // Every line of it is the line of the long way with t == 1 put in, so the
+    // two agree exactly where they meet.
+    bool deep = inside >= deepBand;
+
+    float2 normal = float2(0.0, 1.0);
+    float2 lobeDir = float2(-highlightDir.y, highlightDir.x);
+
+    if (deep) {
+        float frostT = blurMix;
+        if (frostT < 0.999) {
+            float4 sIn = sampleSoft(pixels);
+            float3 lens = sIn.rgb;
+            float lensA = sIn.a;
+            if (lensBlur > 0.0) {
+                lens = mix(lens, fr.rgb, lensBlur);
+                lensA = mix(lensA, fr.a, lensBlur);
+            }
+            float3 face = lens;
+            if (fillLighten + fillDarken > 0.0) {
+                face = fillLighten * max(lens, fr.rgb) + fillDarken * min(lens, fr.rgb)
+                     + (1.0 - fillLighten - fillDarken) * lens;
+            }
+            color = mix(face, fr.rgb, frostT);
+            bdAlpha = mix(lensA, fr.a, frostT);
+        }
+    } else {
+    float4 maxGradExtent = float4(min(halfSize.x, halfSize.y));
+    float4 gradExtents = min(cornerExtents * 1.5, maxGradExtent);
+    normal = safeNormalize(
+        gradGlassRect(centered, halfSize, gradExtents, cornerShapes),
+        float2(0.0, 1.0));
+
+    float2 radial = safeNormalize(centered, float2(0.0));
+
+    // The light axis: highlightDir rotated +90 degrees - the same axis the
+    // HIGHLIGHT lobes sit on, so `highlight.angle` steers both. At swirl 0 the
+    // sum is exactly the iOS/Kyant gradient.
+    float2 direction = safeNormalize(
+        normal + depthEffect * radial + refractionSwirl * lobeDir, normal);
+
+    // Anisotropic refraction height: n^2 . refractionScale yields
+    // refractionScale.x on a vertical edge and .y on a horizontal one.
+    float2 limit = max(halfSize, float2(1e-3));
+    float2 scale2 = clamp(refractionScale, float2(1e-3), limit);
+    float scale = max(dot(normal * normal, scale2), 1e-3);
+
+    float t = clamp(inside / scale, 0.0, 1.0);
+
+    float touchBoost = 1.0 + 0.35 * touchGlow * touchLens;
+
+    float handover = pow(smoothstep(0.0, 1.0, t), max(blurFalloff, 1e-3));
+    float frostT = mix(handover, 1.0, rimFrost) * blurMix;
+
+    // With rimFrost the lens runs even under full frost: the rim then shows
+    // the blur bent, where it used to show the screen.
+    if (frostT < 0.999 || rimFrost > 0.0) {
         float3 lens = fr.rgb;
         float lensA = fr.a;
         // Where the lens ended up reading. Needed so lensBlur can re-read the
@@ -596,22 +687,32 @@ REFRACTION_ONLY = """\
 
 FROST_MERGE = """\
         // Fold the compositor's own blur back into the lens, at the position the
-        // lens actually read from. Guarded so the default costs nothing.
+        // lens actually read from. Guarded so the default costs nothing. Past
+        // the rim the lens read at this very fragment, where the blurred child
+        // was already read (`fr`), so only the rim reads it again.
+        float4 lb = fr;
+        if (inside < scale && (lensBlur > 0.0 || rimFrost > 0.0)) {
+            lb = sampleBlurred(lensPos);
+        }
         if (lensBlur > 0.0) {
-            float4 lb = sampleBlurred(lensPos);
             lens = mix(lens, lb.rgb, lensBlur);
             lensA = mix(lensA, lb.a, lensBlur);
         }
 
+        // The frost this band is mixed with (see rimFrost): the blur behind
+        // the fragment, or the blur where the lens read. `fr` exactly at 0.
+        float4 frost = mix(fr, lb, rimFrost);
+
         // The blur fill (see fillLighten). Exactly `lens` when both are 0.
         float3 face = lens;
         if (fillLighten + fillDarken > 0.0) {
-            face = fillLighten * max(lens, fr.rgb) + fillDarken * min(lens, fr.rgb)
+            face = fillLighten * max(lens, frost.rgb) + fillDarken * min(lens, frost.rgb)
                  + (1.0 - fillLighten - fillDarken) * lens;
         }
-        color = mix(face, fr.rgb, frostT);
-        bdAlpha = mix(lensA, fr.a, frostT);
+        color = mix(face, frost.rgb, frostT);
+        bdAlpha = mix(lensA, frost.a, frostT);
     }
+    }   // !deep
 
 """
 
@@ -661,23 +762,28 @@ HIGHLIGHT = """\
     // There is deliberately NO drawn dark line. The dark edge real iOS glass
     // shows is the refraction FOLD imaging a dark stripe, not ink - our profile
     // folds the same way, so inking it on top double-darkens every strong edge.
-    float rim = pow(abs(dot(normal, lobeDir)), highlightFalloff);
-    float rimT = clamp(inside / max(highlightWidth, 1e-3), 0.0, 1.0);
-    float rimBand = 1.0 - smoothstep(0.0, 1.0, rimT);
-
-    // The faint broad glow under the lit edges, ~7 pt deep at ~0.18x the rim's
-    // weight. This is what lets the crisp line drop to hairline width without
-    // the edge going dead.
-    float sheenT = clamp(inside / (7.0 * unitScale), 0.0, 1.0);
-    float sheen = 1.0 - smoothstep(0.0, 1.0, sheenT);
-
     float glint = 1.0 + (hdrHeadroom - 1.0) * 0.75;
 
     // The interior is min()'d to the headroom first - glass does not amplify
     // what it merely transmits - and only its own light scales into HDR.
     color = min(color * (1.0 + lightIntensity * glint), hdrHeadroom);
-    color += rim * rimBand * highlightIntensity * glint;
-    color += rim * sheen * highlightIntensity * 0.18;
+
+    // Past deepBand both bands below are exactly zero, so there is no light to
+    // add (and no pow to take).
+    if (!deep) {
+        float rim = pow(abs(dot(normal, lobeDir)), highlightFalloff);
+        float rimT = clamp(inside / max(highlightWidth, 1e-3), 0.0, 1.0);
+        float rimBand = 1.0 - smoothstep(0.0, 1.0, rimT);
+
+        // The faint broad glow under the lit edges, ~7 pt deep at ~0.18x the
+        // rim's weight. This is what lets the crisp line drop to hairline
+        // width without the edge going dead.
+        float sheenT = clamp(inside / (7.0 * unitScale), 0.0, 1.0);
+        float sheen = 1.0 - smoothstep(0.0, 1.0, sheenT);
+
+        color += rim * rimBand * highlightIntensity * glint;
+        color += rim * sheen * highlightIntensity * 0.18;
+    }
 
 """
 
@@ -706,6 +812,260 @@ MAIN_EPILOGUE = """\
     return half4(color * alpha, alpha);
 }
 """
+
+
+# ---------------------------------------------------------------------------- tone
+#
+# A toned backdrop (the shade, a dialog's blur-behind) is the glass with the
+# lens off: the blurred child everywhere, a saturation and a veil. Run through
+# the shader above it costs the whole lens per pixel of a full-screen region
+# (the SDF gradient, three normalizes, the rim's pow) to add nothing, and it
+# names the sharp child, which makes Skia copy the framebuffer (the snapshot
+# cannot be sampled while it is being drawn into). This is the same picture
+# with what is left once every lens term is zero: each line below is the line
+# of the main shader it stands for, in the same order, so the two agree to the
+# last bit. Only for a backdrop past its fade-in; while the blur ramps up the
+# main shader still cross-fades the sharp child in.
+
+TONE_HEADER = """\
+// =========================================================================
+//  glass_tone.sksl - GENERATED by shader/gen_glass_sksl.py. Do not edit.
+//
+//  A toned backdrop: Android's blur, a saturation and a veil in the frost
+//  colour. What glass_high.sksl computes when every lens term is zero, with
+//  one child and one read.
+// =========================================================================
+
+const float kNormEps = 1e-6;
+
+uniform shader blurredContent;   // <- blurredImage, Kawase output, 0.25x
+
+uniform float2 size;             // effectRegion.rect() size, px
+uniform float2 offset;           // -rect.topLeft(): fragCoord -> view-local px
+uniform float4 crop;             // blurRect in local space (minX,minY,maxX,maxY)
+uniform float4 cornerExtents;    // px, packed (BL, BR, TR, TL)
+uniform float4 cornerShapes;     // superellipse exponent per corner
+uniform float4 frostColor;       // rgb = the veil's colour, a = its strength
+uniform float  glassOpacity;     // blurAlpha from drawBlurRegion, folded in
+uniform float  saturation;
+uniform float  hdrHeadroom;      // display HDR/SDR ratio, >= 1
+
+"""
+
+TONE_MAIN = """\
+float4 toStraight(half4 h) {
+    float4 c = float4(h);
+    return float4(c.rgb / max(c.a, 1e-4), c.a);
+}
+
+half4 main(float2 fragCoord) {
+    float2 pixels = fragCoord + offset;
+    float2 halfSize = size * 0.5;
+    float2 centered = pixels - halfSize;
+
+    float sd = sdGlassRect(centered, halfSize, cornerExtents, cornerShapes);
+    float aa = 1.0;
+    float shapeAlpha = 1.0 - smoothstep(-aa, aa, sd);
+    if (shapeAlpha <= 0.001) {
+        return half4(0.0);
+    }
+
+    float4 fr = toStraight(blurredContent.eval(clamp(pixels - offset, crop.xy, crop.zw)));
+    float3 color = clamp(fr.rgb, 0.0, 1.0);
+    float bdAlpha = fr.a;
+
+    float luma = dot(color, float3(0.2126, 0.7152, 0.0722));
+    color = mix(float3(luma), color, saturation);
+
+    float surfaceAlpha = frostColor.a;
+    float3 surfacePremul = frostColor.rgb * frostColor.a;
+    float transmitWeight = (1.0 - surfaceAlpha) * bdAlpha;
+    float cover = surfaceAlpha + transmitWeight;
+    color = (color * transmitWeight + surfacePremul) / max(cover, 1e-4);
+
+    color = min(color, hdrHeadroom);
+    color = clamp(color, 0.0, hdrHeadroom);
+
+    float alpha = shapeAlpha * glassOpacity * cover;
+    return half4(color * alpha, alpha);
+}
+"""
+
+TONE_UNIFORMS = [
+    "size", "offset", "crop", "cornerExtents", "cornerShapes",
+    "frostColor", "glassOpacity", "saturation", "hdrHeadroom",
+]
+
+
+def build_tone(lean: bool = False) -> str:
+    # The SDF is the main shader's own text, so the two outline one shape.
+    start = FUNCTIONS.index("// Quadrant-select any per-corner packed float4")
+    end = FUNCTIONS.index("// In the corner cell the outward direction")
+    if not lean:
+        return TONE_HEADER + FUNCTIONS[start:end] + TONE_MAIN
+    assert TONE_HEADER.count("glass_tone.sksl") == 1
+    return (TONE_HEADER.replace("glass_tone.sksl", "glass_tone_lean.sksl")
+            + round_only(FUNCTIONS[start:end], grad=False) + TONE_MAIN)
+
+
+# ---------------------------------------------------------------------------- lean
+#
+# The shader above decides what it does from its uniforms: no fringe when
+# dispersionAmount is 0, no grain when noiseAmount is, no press dent or glow
+# when touchGlow is, one read when softenRadius is. A phone's GPU does not
+# reliably skip what such a test rules out. On a Poco F1 (Adreno 630) a pane
+# with the lens band a third as wide, or with the lens off and one read, cost
+# what a whole pane does (docs/VERIFIED.md, v0.4.20), where the arithmetic
+# written for those cases is a fraction of it: code that a branch should have
+# skipped was being paid for.
+#
+# So the same shader is built again with those parts left out of the text, and
+# the engine draws a pane with the leanest build whose missing parts are all
+# zero for that pane. Every line that is left is a line of the shader above
+# with the zero put in, so the picture is the same:
+#
+#   lean       no fringe, grain or touch; sampleSoft is its single read
+#   lean_soft  the same with sampleSoft as it is (softenRadius above zero)
+#
+# Both also leave out the superellipse corner (round_only): they are for panes
+# whose corners are all circular, which is every pane unless cornerShape is
+# set. glass_tone_lean.sksl is the tone shader with the same done to it.
+#
+# The uniforms are declared exactly as in HIGH, used or not, so that one
+# uniform block serves all three; the engine checks that the offsets agree.
+
+SD_SUPER = """\
+    float E = cornerParam(c, extents);
+    float n = cornerParam(c, shapes);
+    float2 innerHalf = halfSize - float2(E);
+    float2 q = abs(c) - innerHalf;
+    float2 qp = max(q, float2(0.0));
+    float outside;
+    if (n > 2.001 && qp.x > 0.0 && qp.y > 0.0) {
+        float g = max(pow(pow(qp.x, n) + pow(qp.y, n), 1.0 / n), kNormEps);
+        float2 dg = pow(qp / g, float2(n - 1.0));
+        outside = (g - E) / max(length(dg), kNormEps);
+    } else {
+        outside = length(qp) - E;
+    }
+"""
+SD_ROUND = """\
+    float E = cornerParam(c, extents);
+    float2 innerHalf = halfSize - float2(E);
+    float2 q = abs(c) - innerHalf;
+    float2 qp = max(q, float2(0.0));
+    float outside = length(qp) - E;
+"""
+GRAD_SUPER = """\
+    float E = cornerParam(c, extents);
+    float n = cornerParam(c, shapes);
+    float2 innerHalf = halfSize - float2(E);
+    float2 q = abs(c) - innerHalf;
+
+    float insideCorner = step(0.0, min(q.x, q.y));
+    float xMajor = step(q.y, q.x);
+    float2 gradEdge = float2(xMajor, 1.0 - xMajor);
+    float2 qp = max(q, float2(0.0));
+    float2 dir = qp;
+    if (n > 2.001) {
+        float g = max(pow(pow(qp.x, n) + pow(qp.y, n), 1.0 / n), kNormEps);
+        dir = pow(qp / g, float2(n - 1.0));
+    }
+    float2 gradCorner = safeNormalize(dir, float2(0.0));
+"""
+GRAD_ROUND = """\
+    float E = cornerParam(c, extents);
+    float2 innerHalf = halfSize - float2(E);
+    float2 q = abs(c) - innerHalf;
+
+    float insideCorner = step(0.0, min(q.x, q.y));
+    float xMajor = step(q.y, q.x);
+    float2 gradEdge = float2(xMajor, 1.0 - xMajor);
+    float2 qp = max(q, float2(0.0));
+    float2 gradCorner = safeNormalize(qp, float2(0.0));
+"""
+
+
+def round_only(functions: str, grad: bool = True) -> str:
+    """The SDF and its gradient for corners that are all circular (every
+    exponent 2, the default and all an SkRRect can mean): the superellipse
+    branches left out, which is the `else` of each. Five `pow` in the SDF and
+    four in the gradient that a phone's GPU may otherwise run to throw away."""
+    assert functions.count(SD_SUPER) == 1
+    functions = functions.replace(SD_SUPER, SD_ROUND)
+    if grad:
+        assert functions.count(GRAD_SUPER) == 1
+        functions = functions.replace(GRAD_SUPER, GRAD_ROUND)
+    return functions
+
+
+def lean_samplers(soft: bool) -> str:
+    dent = """\
+    if (touchGlow * touchLens > 0.0) {
+        float2 d = viewPx - touchPos;
+        float f = 1.0 - smoothstep(0.0, 0.6 * min(size.x, size.y), length(d));
+        viewPx -= d * (f * f * 0.22 * touchGlow * touchLens);
+    }
+"""
+    assert SAMPLERS.count(dent) == 1
+    samplers = SAMPLERS.replace(dent, "")
+    if not soft:
+        start = samplers.index("// The sharp view with softenRadius of blur")
+        samplers = (samplers[:start]
+                    + "// softenRadius is 0 for every pane drawn with this build.\n"
+                    + "float4 sampleSoft(float2 viewPx) { return sampleSharp(viewPx); }\n\n")
+    return samplers
+
+
+def lean_preamble(name: str) -> list[str]:
+    return [
+        HEADER % {"tier": name},
+        CHILDREN,
+        UNIFORM_BLOCK,
+        DISPERSION_UNIFORM_BLOCK % {"taps": TAPS["HIGH"]},
+        GRAIN_UNIFORM_BLOCK,
+        round_only(FUNCTIONS),
+    ]
+
+
+def build_lean(soft: bool) -> str:
+    # touchBoost is 1.0 + 0.35 * 0: a factor of exactly one.
+    boost = "    float touchBoost = 1.0 + 0.35 * touchGlow * touchLens;\n\n"
+    assert MAIN_PROLOGUE.count(boost) == 1
+    assert REFRACTION_ONLY.count(" * touchBoost") == 1
+    return "".join(lean_preamble("lean_soft" if soft else "lean") + [
+        lean_samplers(soft),
+        MAIN_PROLOGUE.replace(boost, ""),
+        REFRACTION_ONLY.replace(" * touchBoost", ""),
+        FROST_MERGE,
+        TONE_CHAIN,
+        HIGHLIGHT,
+        MAIN_EPILOGUE,
+    ])
+
+
+# For measuring only (debugPane=3): the lean build with no lens at all. Every
+# fragment takes what the shader calls its deep path: the blur, the see-through
+# read, the tone chain, the pane's own light; no gradient, no bend, no rim. It
+# is not glass (a pane drawn with it has no edge), and what it costs next to
+# `lean` is what the lens costs when it is really gone, which a narrower lens
+# band did not show on a phone.
+def build_deep() -> str:
+    head = MAIN_PROLOGUE[:MAIN_PROLOGUE.index("    // Past deepBand the edge is out of reach")]
+    a = MAIN_PROLOGUE.index("    if (deep) {\n") + len("    if (deep) {\n")
+    b = MAIN_PROLOGUE.index("    } else {\n", a)
+    light = HIGHLIGHT[:HIGHLIGHT.index("    // Past deepBand both bands below")]
+    assert "float glint" in light and "lightIntensity" in light
+    return "".join(lean_preamble("deep") + [
+        lean_samplers(False),
+        head,
+        "    {\n",
+        MAIN_PROLOGUE[a:b],
+        "    }\n\n",
+        TONE_CHAIN,
+        light,
+        MAIN_EPILOGUE,
+    ])
 
 
 def build(tier: str) -> tuple[str, list[str]]:
@@ -758,6 +1118,18 @@ def main() -> None:
         path.write_text(src)
         manifest.append(f"{tier.lower()}\t{len(src)}\t{len(live)}\t" + ",".join(live))
         print(f"{path.name:24} {len(src):6d} bytes  {len(live):2d} live uniforms")
+
+    for name, text in (("glass_lean.sksl", build_lean(False)),
+                       ("glass_lean_soft.sksl", build_lean(True)),
+                       ("glass_deep.sksl", build_deep()),
+                       ("glass_tone_lean.sksl", build_tone(lean=True))):
+        (out_dir / name).write_text(text)
+        print(f"{name:24} {len(text):6d} bytes")
+
+    tone = build_tone()
+    (out_dir / "glass_tone.sksl").write_text(tone)
+    manifest.append(f"tone\t{len(tone)}\t{len(TONE_UNIFORMS)}\t" + ",".join(TONE_UNIFORMS))
+    print(f"{'glass_tone.sksl':24} {len(tone):6d} bytes  {len(TONE_UNIFORMS):2d} live uniforms")
 
     # The uploader consults this: Skia throws at draw time for a declared
     # uniform that was never set, and the LOW tier drops five of them.

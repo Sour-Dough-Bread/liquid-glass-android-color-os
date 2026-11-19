@@ -17,6 +17,19 @@
 #                                Material You palette (0 = off)
 #   glassctl backdrop [style]    what full-screen blurs (the shade) get:
 #                                stock, tone or glass; panes always get glass
+#   glassctl perf                the Performance settings: what glass may give
+#                                up of its look to draw faster
+#   glassctl perf layers two|one two: glass mixes the screen behind it with a
+#                                blur of it. one: a single blur stands in for
+#                                both (tiles and cards show the shade's)
+#   glassctl perf fringe on|off  the colour fringe at a pane's edge (off
+#                                unless asked for; the prism preset asks)
+#   glassctl perf resolution full|quarter
+#                                what clear glass shows through with two
+#                                layers: the screen itself, or a quarter-size,
+#                                slightly blurred copy of it
+#   glassctl perf best | fast    all three at their best-looking (fringe on),
+#                                or fastest
 #   glassctl set <name> <value>  override one setting on top of the preset
 #   glassctl unset <name>        drop one override
 #   glassctl reset               drop every override, keep mode and preset
@@ -56,10 +69,15 @@ CHECK="$MODDIR/bin/$ABI/glasscheck"
 # Properties that are switches rather than tuning. `reset` and `preset` leave
 # these alone. The three Basic sliders are among them: the variant is what the
 # basic preset is made of, and intensity and Liquid Material apply on top of
-# any preset.
+# any preset. So are the engine's own ways of working (lazyBlur, paneBlur,
+# toneShader, stats) and the Performance settings (paneBlur again, fringe,
+# glassResolution): someone who turned one off for their ROM or their battery
+# did not ask for it back by picking a preset.
 is_switch() {
   case "$1" in
     mode|preset|enabled|follow_theme|variant|fillBlurScale|materialTint) return 0 ;;
+    lazyBlur|paneBlur|toneShader|coveredPanes|snapshotCopy|leanShader|stats) return 0 ;;
+    fringe|glassResolution|softenTaps|debugPane) return 0 ;;
     frostR|frostG|frostB|accentR|accentG|accentB)
       # Owned by glass-theme.sh while it is following the theme.
       [ "$(getprop $P.follow_theme)" != "0" ] && return 0 ;;
@@ -71,7 +89,7 @@ is_switch() {
 # regions of what Android never blurs (Quick Settings tiles, launcher icons...).
 # Each reads persist.sys.glass.app.<part> and is on unless that is 0. Not
 # settings of the engine's, so `reset` and `preset` leave them alone.
-APP_PARTS="clock qs sliders shade headsup toolbar screenshot toast icons folders widgets drawer search"
+APP_PARTS="clock qs sliders shade headsup volume dialogs toolbar screenshot toast icons folders widgets drawer search overview appdialogs"
 
 app_on() { [ "$(getprop $P.app.$1)" != 0 ]; }
 
@@ -121,20 +139,87 @@ backdrop() {
   esac
 }
 
+# The Performance settings: three parts of the look that each cost frame time.
+# What each one is to the engine is in glass_params.cpp; the names here are the
+# ones the WebUI's Performance card uses. Two layers and full resolution are
+# the defaults; the fringe is off unless asked for (a preset may ask: prism).
+perf_layers() { case "$(effective paneBlur)" in 2|2.0) echo one ;; *) echo two ;; esac; }
+perf_fringe() { case "$(effective fringe)" in 0|0.0) echo off ;; *) echo on ;; esac; }
+perf_resolution() { case "$(effective glassResolution)" in 1|1.0) echo quarter ;; *) echo full ;; esac; }
+
+perf_set() {
+  case "$1:$2" in
+    # Two layers is every value but `through`: one set to `own` stays as it is.
+    layers:two)         [ "$(perf_layers)" = two ] || setprop $P.paneBlur "" ;;
+    layers:one)         setprop $P.paneBlur through ;;
+    # Said outright both ways, so that it holds whatever the preset wants.
+    fringe:on)          setprop $P.fringe 1 ;;
+    fringe:off)         setprop $P.fringe 0 ;;
+    resolution:full)    setprop $P.glassResolution "" ;;
+    resolution:quarter) setprop $P.glassResolution quarter ;;
+    *) return 1 ;;
+  esac
+}
+
+perf_status() {
+  l=$(perf_layers) f=$(perf_fringe) r=$(perf_resolution)
+  case "$l" in
+    two) echo "Layers:      two      (glass mixes the screen behind it with a blur of it)" ;;
+    one) echo "Layers:      one      (a single blur for both; tiles and cards show the shade's)" ;;
+  esac
+  case "$f" in
+    on)  echo "Fringe:      on       (the colour fringe at a pane's edge)" ;;
+    off) echo "Fringe:      off      (no colour fringe at a pane's edge)" ;;
+  esac
+  case "$l:$r" in
+    one:*)     echo "Resolution:  $r$([ "$r" = full ] && echo "    " || echo " ") (not used with one layer, which reads a quarter-size blur already)" ;;
+    *:full)    echo "Resolution:  full     (clear glass shows the screen itself)" ;;
+    *:quarter) echo "Resolution:  quarter  (clear glass shows a quarter-size, slightly blurred copy)" ;;
+  esac
+  [ "$(getprop sys.glass.regen)" = 0 ] &&
+    echo "Layers and resolution need Android 17: on this build only the fringe changes anything."
+  return 0
+}
+
 # Whether the engine is actually running inside the compositor right now. Every
 # switch above is inert until it is, which is the first thing to rule out when
 # a setting "does nothing".
+# mount_state (meta.sh): will the manager mount the overlay at all. A copy of
+# glassctl from before meta.sh only knew "no metamodule at all".
+if [ -f "$MODDIR/meta.sh" ]; then
+  . "$MODDIR/meta.sh"
+else
+  mount_state() { MOUNT_WHY="" META_NAME=""; echo self; }
+fi
+
+# Where the engine stands, one word: loaded, disabled (the boot guard stood the
+# module down), no-metamodule, metamodule-broken or metamodule-off (KernelSU 3+
+# will not mount anything; MOUNT_WHY says why), not-mounted (post-mount.sh saw
+# no overlay this boot), or absent.
 engine_state() {
   if [ -f "$STATE/disabled" ]; then echo disabled; return; fi
   pid=$(pidof surfaceflinger 2>/dev/null)
   if [ -n "$pid" ] && grep -q libglassengine.so "/proc/$pid/maps" 2>/dev/null; then
     echo loaded
-  elif [ -x /data/adb/ksud ] && grep -q metamodule /data/adb/ksud 2>/dev/null \
-       && [ ! -e /data/adb/metamodule ]; then
-    echo no-metamodule
-  else
-    echo absent
+    return
   fi
+  case "$(mount_state)" in
+    none)   echo no-metamodule ;;
+    broken) echo metamodule-broken ;;
+    off)    echo metamodule-off ;;
+    *)      if [ -f "$STATE/overlay_absent" ]; then echo not-mounted; else echo absent; fi ;;
+  esac
+}
+
+# How to retry after the boot guard stood the module down. Under a metamodule
+# the mounted overlay is a copy taken at install (meta-overlayfsx even deletes
+# it on a stand-down), so only installing again brings it back; installing
+# also clears the stand-down.
+retry_hint() {
+  case "$(mount_state)" in
+    self) echo "rm $STATE/disabled and reboot to retry, or install the module again" ;;
+    *)    echo "install the module again (that also clears this) and reboot" ;;
+  esac
 }
 
 # What the engine reported about itself (sys.glass.engine), and whether it
@@ -178,16 +263,25 @@ status() {
                 *)          echo "Engine:  loaded in SurfaceFlinger" ;;
               esac ;;
     disabled) echo "Engine:  DISABLED after a boot that did not complete"
-              echo "         rm $STATE/disabled and reboot to retry" ;;
-    *)        if [ -x /data/adb/ksud ] && grep -q metamodule /data/adb/ksud 2>/dev/null \
-                 && [ ! -e /data/adb/metamodule ]; then
-                echo "Engine:  not loaded — KernelSU 3+ only mounts modules through a"
-                echo "         metamodule, and none is installed. Install one (e.g."
-                echo "         meta-overlayfs) and reboot."
-              else
-                echo "Engine:  not loaded. Last boot said:"
-                sed 's/^/         /' "$STATE/last_boot.log" 2>/dev/null | tail -3
-              fi ;;
+              echo "         $(retry_hint)" ;;
+    no-metamodule)
+              echo "Engine:  not loaded — KernelSU 3+ only mounts modules through a"
+              echo "         metamodule, and none is installed. Install one (e.g."
+              echo "         meta-overlayfs) and reboot." ;;
+    metamodule-broken)
+              mount_state >/dev/null
+              echo "Engine:  not loaded — the metamodule ($META_NAME) is installed, but"
+              echo "         KernelSU will not run it: $MOUNT_WHY."
+              echo "         No module is mounted at all. Reinstall the metamodule and reboot." ;;
+    metamodule-off)
+              mount_state >/dev/null
+              echo "Engine:  not loaded — the metamodule ($META_NAME) is $MOUNT_WHY,"
+              echo "         so no module is mounted. Enable it and reboot." ;;
+    not-mounted)
+              echo "Engine:  not loaded — the overlay was not mounted this boot, so"
+              echo "         SurfaceFlinger is the ROM's own. Install the module again and reboot." ;;
+    *)        echo "Engine:  not loaded. Last boot said:"
+              sed 's/^/         /' "$STATE/last_boot.log" 2>/dev/null | tail -3 ;;
   esac
   t=$(tripped)
   if [ -n "$t" ]; then
@@ -195,6 +289,12 @@ status() {
     echo "         while drawing Liquid Glass, so the engine switched to Android's"
     echo "         blur. /data/tombstones has the crash. 'glassctl glass' turns it on again."
   fi
+  # What is not at its default.
+  s=""
+  [ "$(perf_layers)" = one ] && s="one layer"
+  [ "$(perf_layers)" = two ] && [ "$(perf_resolution)" = quarter ] && s="${s:+$s, }quarter resolution"
+  [ "$(perf_fringe)" = on ] && s="${s:+$s, }colour fringe on"
+  [ -n "$s" ] && echo "Speed:   $s  (glassctl perf)"
   o=$(overrides)
   if [ -n "$o" ]; then
     echo "Tuning on top of the preset:"
@@ -214,8 +314,15 @@ json() {
     app_on "$k" && v=true || v=false
     app="$app$sep\"$k\":$v"; sep=,
   done
-  printf '{"engine":"%s","engineStatus":"%s","tripped":"%s","regen":"%s","followTheme":%s,"app":{%s},"clockTint":"%s","tileTint":"%s","tileColor":"%s","scrim":"%s","scrimColor":"%s","state":%s}\n' \
-    "$(engine_state)" "$(engine_status)" "$(tripped)" "$(getprop sys.glass.regen)" "$ft" "$app" \
+  # The metamodule's state, for the WebUI to say why nothing is mounted.
+  # mountWhy and metaName are our own strings plus a module's name: drop
+  # anything that would end the JSON string.
+  ms=$(mount_state)
+  mount_state >/dev/null   # again in this shell, for MOUNT_WHY and META_NAME
+  mw=$(printf '%s' "$MOUNT_WHY" | tr -d '"\\')
+  mn=$(printf '%s' "$META_NAME" | tr -d '"\\')
+  printf '{"engine":"%s","engineStatus":"%s","mount":"%s","mountWhy":"%s","metaName":"%s","tripped":"%s","regen":"%s","followTheme":%s,"app":{%s},"clockTint":"%s","tileTint":"%s","tileColor":"%s","scrim":"%s","scrimColor":"%s","state":%s}\n' \
+    "$(engine_state)" "$(engine_status)" "$ms" "$mw" "$mn" "$(tripped)" "$(getprop sys.glass.regen)" "$ft" "$app" \
     "$(getprop $P.app.clocktint)" "$(getprop $P.app.tint)" "$(getprop $P.app.tilecolor)" \
     "$(getprop $P.app.scrim)" "$(getprop $P.app.scrimcolor)" "$st"
 }
@@ -281,11 +388,25 @@ case "$cmd" in
       *) die "usage: glassctl backdrop [stock|tone|glass]" ;;
     esac
     ;;
+  perf)
+    case "$#:$1" in
+      0:) perf_status ;;
+      1:best) perf_set layers two; perf_set fringe on; perf_set resolution full; perf_status ;;
+      1:fast) perf_set layers one; perf_set fringe off; perf_set resolution quarter; perf_status ;;
+      2:*) perf_set "$1" "$2" ||
+             die "usage: glassctl perf [best|fast | layers two|one | fringe on|off | resolution full|quarter]"
+           ;;
+      *) die "usage: glassctl perf [best|fast | layers two|one | fringe on|off | resolution full|quarter]" ;;
+    esac
+    ;;
   set)
     [ $# -eq 2 ] || die "usage: glassctl set <name> <value>"
     param_names | grep -qx "$1" || die "no setting '$1'"
     case "$1:$2" in
       backdrop:stock|backdrop:tone|backdrop:glass) ;;
+      paneBlur:own|paneBlur:derive|paneBlur:through) ;;
+      snapshotCopy:full|snapshotCopy:bounds) ;;
+      glassResolution:full|glassResolution:quarter) ;;
       *:|*:*[!0-9.eE+-]*) die "'$2' is not a number" ;;
     esac
     setprop "$P.$1" "$2"
@@ -341,6 +462,6 @@ case "$cmd" in
     echo "$1: $2"
     ;;
   json) json ;;
-  -h|--help|help) sed -n '2,41p' "$0" | sed 's/^# \{0,1\}//' ;;
+  -h|--help|help) sed -n '2,54p' "$0" | sed 's/^# \{0,1\}//' ;;
   *) die "unknown command '$cmd' (glassctl help)" ;;
 esac

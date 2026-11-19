@@ -107,6 +107,21 @@ enum ParamId : size_t {
     // engine
     P_radius,  // != 0 overrides the compositor's blur radius. Debug aid from M0.
     P_bypass,  // != 0 forces stock whatever the mode says. Kept for old scripts.
+    // what the glass costs (glass_engine.cpp, "Blur made to order")
+    P_lazyBlur,    // 0 = Android blurs every region before the engine sees it
+    P_paneBlur,    // a pane's blurred read: 0 own, 1 derive, 2 through; or the names
+    P_toneShader,  // 0 = a toned backdrop runs the whole glass shader
+    P_coveredPanes,  // 0 = panes under another layer's backdrop still read the snapshot
+    P_snapshotCopy,  // what a pane showing the snapshot reads: 0 full, 1 bounds
+    P_leanShader,    // 0 = every pane is drawn by the full glass shader
+    // the look traded for speed (the WebUI's Performance card)
+    P_fringe,           // 0 = no colour fringe at a pane's edge
+    P_glassResolution,  // what glass shows through it: 0 full, 1 quarter
+    P_softenTaps,       // reads softenDp takes of the sharp screen: 9 or 5
+    P_rimFrost,         // 1 = the rim as frosted as the inside; 0 = the frost fades out to it
+    P_debugPane,        // measuring aid: 1 draws panes flat (the tone shader), 2 not at
+                        // all, 3 with the glass shader less its lens
+    P_stats,       // != 0 logs what the engine made and drew, once a second
     P_count,
 };
 

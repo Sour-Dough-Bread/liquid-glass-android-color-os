@@ -3068,3 +3068,964 @@ is dark and `system_accent1_100` when it is light. The WebUI has the choice
 under Advanced → Apps, with an `app.scrim` slider. A mock of the device in
 headless Chrome showed the controls under their parts, and clicking them sent
 `glassctl app scrimcolor black` and `glassctl app tint '0.4'`.
+
+## The Poco F1 on AxionOS: a boot guard that blamed the wrong thing (2026-11-18)
+
+Poco F1 (beryllium), AxionOS (Lineage-based, Android 17, CP2A.260605.016),
+kernel 4.19.325, KernelSU 4.2.0-rc3 with susfs, metamodule meta-overlayfsx
+1.3.4. v0.4.14 and the companion were installed at 15:56. The engine had
+never loaded on this phone, and the module had switched itself off.
+
+What happened, from KernelSU's per-boot logs (`/data/adb/ksu/log/logcat.old.log`
+and `dmesg.old.log`), pstore (`/sys/fs/pstore/console-ramoops-0`) and the
+files themselves:
+
+- **No module was mounted.** meta-overlayfsx's `module.prop` was 343 bytes of
+  zeros. Without its `metamodule=1` line, ksud skipped `metamount.sh`: the log
+  goes straight from the post-fs-data scripts to `post-mount.sh`, and the
+  metamodule's image still held a `ViPER4Android-RE_update` that had never
+  been applied. The metamodule rewrites that file with `sed -i` at every boot
+  to show a status line, and a hard reset before the data reached flash left
+  the zeros. Once zeroed, sed finds no line to change and keeps writing the
+  zeros back; specter's `module.prop` was in the same state. Five tombstones
+  written just before the same hard reset were all zeros as well.
+- **A boot failed because of the GPU.** In the boot after the install,
+  `kgsl kgsl-3d0: Switch to unsecure failed to idle`, then
+  `open(/dev/kgsl-3d0) failed: errno 110` and "stub the gpu"; SurfaceFlinger
+  aborted with `Failed to create a valid texture ... [384,384]` in
+  `Cache::primeShaderCache`, every ~5 s. No StockGlass line appeared and no
+  `libglassengine` frame was in any backtrace: SurfaceFlinger was the ROM's
+  own, because nothing was mounted. The next boot's GPU came up normally.
+- **The guard blamed the module.** The boot never completed, the user reset
+  the phone, and `post-fs-data.sh` found `boot_pending` and disabled the
+  module. `glassctl` then advised removing the marker and rebooting, which
+  would not have helped: no metamodule was running, and meta-overlayfsx deletes
+  a `skip_mount` module's copy from its image.
+
+Checked and fine on this phone: `hookprobe` and `propprobe` in the
+surfaceflinger domain (execmem and execmod allowed, `sys.*` settable), the
+resolver against its SurfaceFlinger (scaled `drawBlurRegion` at 0x25c53c,
+KawaseDualFilterV2). `persist.sys.sf.disable_blurs=1` is still set but this
+SurfaceFlinger no longer contains the string, and WindowManager reports
+`mBlurEnabled=true`; the note above about blurs being off applied to the
+Infinity-X A16 build.
+
+Repaired with the user's OK: the metamodule's `module.prop` from its own zip,
+specter's from its `.bak`, mode stock, the guard marker removed, v0.4.14
+installed again (the install now went through metainstall), reboot. The
+engine hooked (`sys.glass.engine=hooked`, `regen=1`), the boot completed, and
+`glassctl glass` switched live with SurfaceFlinger's pid kept: the shader
+compiled (27,376 chars, 40 uniforms) and Quick Settings drew as glass. The
+volume panel on this ROM is opaque, not a blur region.
+
+**Fixes (0.4.15).**
+
+1. `post-mount.sh` (new) runs after the manager has mounted modules and
+   before init starts SurfaceFlinger. When `/system/lib64/libglassengine.so`
+   is not there, it leaves `/data/adb/glass/overlay_absent`, synced. The next
+   boot's guard does not hold a failed boot against the module when that
+   boot left this marker. Anything else still disables it, because an
+   unloadable library leaves no trace either: the linker rejects
+   SurfaceFlinger before any code of ours runs. Magisk has no post-mount
+   stage, so there the guard is exactly as before. `boot_pending` is synced
+   too.
+2. `meta.sh` (new) tells `customize.sh`, `post-fs-data.sh`, `glassctl` and the
+   WebUI whether the manager will mount anything: a metamodule that is
+   missing, disabled, or whose `module.prop` lost `metamodule=1` (zero-filled
+   included) is named, with what to do. `glassctl` reports `not-mounted` when
+   `post-mount.sh` saw no overlay this boot.
+3. Installing again clears a stand-down, and the retry advice under a
+   metamodule is to reinstall.
+
+`module/tools/guard_test.sh` runs the real scripts under busybox ash against
+fake `/data/adb` trees: 18 checks, and the guard checks fail on the 0.4.14
+scripts. The WebUI's new banner was checked in the browser pane with a stub
+root bridge. Not yet run on a phone.
+
+**Companion 0.2.0 for this ROM (not yet run).** Four new parts, written while
+the phone was away, from its own `SystemUI.apk`, `Launcher3QuickStep.apk`,
+`services.jar` and `framework.jar` (jadx, and baksmali member lists for every
+hook target and field):
+
+- `AxionVolume`: AxionOS replaces the stock volume dialog with its own Compose
+  `AxionVolumeDialog`, which has no blur at all. The panel's surfaces are
+  `background(surfaceBright, shape)` calls inside a `MaterialTheme`; inside
+  that window's theme the colour is made translucent and each such background
+  gets a region at its shape. The stock dialog (`use_axion_volume_dialog=0`)
+  already has blur regions of its own.
+- `DialogGlass`: SystemUI's dialogs (the Quick Settings popups) have an opaque
+  rounded `GradientDrawable` plate and no blur. Glass at that plate once the
+  tile's launch morph has finished, faded in over 180 ms; the morphs stay
+  opaque, since they draw a layer of their own with nothing under it.
+- `LauncherOverview`: the Overview action buttons and Clear all, which were
+  translucent pills over the overview scrim, get glass.
+- `AppDialogs` (system_server): `FLAG_BLUR_BEHIND` on apps' dialog windows
+  that dim, set in `DisplayPolicy.adjustWindowParamsLw`, with the dim
+  lightened while it blurs. Needs System Framework in the LSPosed scope.
+
+Every hook target exists with the expected signature in this build's dex.
+
+**On the phones, 2026-11-18 21:4x (module v0.4.15, companion 0.2.0 then
+0.2.1).** On the F1 every hook resolved, `apps' dialogs hooked` in
+system_server included. Each part was checked with `screencap` and the
+companion's region dump:
+
+- the AxionOS volume panel is glass;
+- the Internet dialog is glass under its plate with a lit rim (preset
+  `basic`, variant 0, so the blur is light);
+- a dialog-themed activity (Bluetooth discoverable request) and its AlertDialog
+  both carry `blurBehindRadius=150`, the backdrop is blurred and the dialog
+  stays sharp.
+
+The F3 (crDroid) loaded the same parts, apart from the AxionOS hook, which
+stays quiet there. In ChatGPT's "Delete chat" dialog,
+`Dim Layer for - Task` (alpha 0.30, i.e. the app's 0.6 × `app.dialogdim`,
+blur 150) is relative-layered directly under the dialog's surface. So the
+chat list blurs and the dialog does not.
+
+Overview's buttons were wrong in 0.2.0: their regions sat at x ≈ −524,000.
+Every Button is a single-line centred TextView, which lays its text out on
+TextView's 1 << 20 px wide line and scrolls by about half of it. A
+ViewOverlay draws in that scrolled space, while the background (and so the
+outline) is drawn with the scroll undone. 0.2.1 offsets ViewGlass's region by
+the host's scroll (DialogGlass likewise). The dump then puts both regions
+exactly on the buttons, and they show as glass pills.
+
+The F1 boot after the install never completed. Its pstore console
+(`/sys/fs/pstore/console-ramoops-0`) shows the Adreno failing as it came up:
+`kgsl-3d0: Switch to unsecure failed to idle` at 38 s with `rb=0 pos=0/0`
+(nothing submitted yet), right after the zap firmware loaded, then again every
+2–5 s. That is the same fault as the 16:01 boot that ran the ROM's own
+compositor. The overlay was mounted, so the guard disabled the module, as
+designed. A reinstall cleared that, and the next boot came up with the engine
+loaded. KernelSU's `*.old.log` copies of that boot were mostly NULs (unsynced
+when the reset came); pstore is what kept it.
+
+## What the glass costs, and blur made to order (A17 AVD on a real GPU, 2026-11-19)
+
+**The rig.** glass17 started with `-gpu host` instead of
+`swiftshader_indirect`: the guest's GLES goes through gfxstream to the host's
+Radeon (Cezanne iGPU, Mesa radeonsi), and RenderEngine runs
+`skiaglthreaded` (Ganesh GL) on it. TimeStats' RenderEngine time runs to the
+GPU fence, so for the first time the number is GPU time rather than
+SwiftShader's CPU time. It is a desktop GPU behind a command stream, not a
+phone's: small render passes are dearer than they would be natively (about
+50 µs each here) and per-pixel work cheaper.
+
+`harness/BenchActivity` draws a backdrop that scrolls 6 px a frame, so
+SurfaceFlinger composes at 60 Hz, under one translucent window of blur regions
+that never changes. Scenes, 1080×2400, laid out from alioth's region map:
+
+| scene | the layer |
+|---|---|
+| `shade` | background blur 77, a slider and five tiles at 263, three cards at 56 |
+| `dialog` | blur-behind 150 on the dim layer, nothing else |
+| `home` | a widget, eight icons and a search pill at 263, no backdrop |
+| `keyboard` | two regions at 120 across the bottom third |
+| `panel` | a volume panel: a round cap over a body, overlapping, at 80 |
+
+`harness/bench.sh` restarts the scene and reads TimeStats over a few seconds;
+`harness/ab.sh` keeps one scene running and switches engine properties by
+turns, which is what to compare with: two launches of the same scene differ by
+up to 0.3 ms, two turns on one launch by under 0.1 while the host is quiet.
+The host is shared, so every figure is a median of rounds.
+
+**Before and after, engine against engine** (0.4.15's `82bb43bb…`, then this
+tree's, one after the other on the same boot; RenderEngine ms per frame,
+median of four 3 s windows). The "now" column is build `1cbaf734…`; the build
+that ended the day (`be64d33d…`: the same paths, plus `snapshotCopy`, off, and
+the two-composite rule for covered panes) measured 5.11, 3.31 and 3.99 for
+`shade`, `dialog` and `panel`, and 5.95 for the Quick Settings cycle:
+
+| scene | 0.4.15 | now | Android's own blur |
+|---|---|---|---|
+| `shade` | 7.28 | **5.23** | 5.0–5.8 |
+| `dialog` | 4.92 | **3.41** | 3.27 |
+| `home` | 4.58 | 4.52 | 3.5–3.7 |
+| `keyboard` | 4.45 | 4.06 | 3.5 |
+| `panel` | 4.09 | 4.02 | 3.4–3.7 |
+| the real Quick Settings, opened and closed over the home screen (companion attached, `harness/qs_cost.sh`) | 7.30 | **5.86** | 3.3 without any companion region |
+
+The shade as glass now costs what the shade as Android's blur does. Android
+itself blurs that layer three times a frame (77, 263, 56), and by Skia's rule
+copies the framebuffer too, since its second and third blur read the snapshot
+after the backdrop was drawn.
+
+What the engine's own counters say for `shade` (`persist.sys.glass.stats=1`):
+
+```
+before  blurs/frame=4.00 (android 3.00 + engine 1.00) derived/frame=0.00 snapshot-copies/frame=1.00 backdrop=59 pane=531
+after   blurs/frame=1.00 (android 0.00 + engine 1.00) derived/frame=2.00 snapshot-copies/frame=0.00 tone=60 pane=540
+```
+
+**Where each part of it went** (`ab.sh`, same scene, by turns):
+
+| | ms |
+|---|---|
+| `shade`, the old paths (`lazyBlur=0 paneBlur=own toneShader=0`) | 7.38 |
+| `shade`, defaults (`paneBlur=derive`) | 5.73 |
+| `shade`, `paneBlur=through` | 5.10 |
+| `shade`, mode stock | 5.78 |
+| one 1040×126 pane, no backdrop: glass | 4.00 |
+| the same with a see-through child that is not the snapshot (test build) | 3.56 |
+| the same, mode stock | 3.54 |
+| eight 130×126 panes: glass / not the snapshot / stock | 4.05 / 3.36 / 3.28 |
+| one 1040×2000 pane: with the shader's short way / without (test build) | 4.65 / 5.01 |
+| `home` under the real shade, open: panes in full / covered | 6.57 / 6.27 |
+| the real Quick Settings cycle: old paths / `coveredPanes=0` / defaults / `through` | 7.24 / 6.02 / 5.92 / 5.64 |
+
+- For a pane that shows the snapshot, **the framebuffer copy is the whole
+  difference from Android's blur** on this GPU: with any other see-through
+  child the glass costs what stock does, whether it is one strip or eight
+  icons. That copy is what is left (ARCHITECTURE.md, "What a frame costs").
+- The two blurs derived from the backdrop cost 0.6 to 0.9 ms here, twelve
+  small passes (nine for the tiles' 263, three for the cards' 56). `through`
+  saves them and looks different (below). With the day's last build and a
+  quiet host, by turns: defaults 5.12, `through` 4.18, mode stock 5.04, so
+  `through` undercuts Android's own blur of the same layer by a sixth.
+- The short way through the shader is worth 0.2 ms per megapixel of interior.
+  Small panes have no interior: a 173 px icon is all rim.
+
+`snapshotCopy=bounds` (off by default) against the full copy, by turns, with
+the engine's count of each beside it:
+
+| | full | bounds | stock |
+|---|---|---|---|
+| `panel` | 4.12 | 3.74 | 3.65 |
+| one 1040×126 pane | 3.72 | 3.42 | 3.13 |
+| `keyboard` | 4.11 | 4.02 | 3.46 |
+
+```
+full    snapshot-copies/frame=1.00 bounds-copies/frame=0.00
+bounds  snapshot-copies/frame=0.00 bounds-copies/frame=1.00
+```
+
+With the frozen backdrop redrawn every frame (`redraw true`), `panel`,
+`keyboard` and a scene of a 126 px strip beside a 400 px pane differ between
+the two by 1 level on under 0.011% of pixels. The strip is the case that
+matters: its refraction reads 31 px past its far edge, which the copy's margin
+has to hold.
+
+**The picture.** `harness/shots.sh` freezes the backdrop and captures each
+scene; `harness/shotdiff.py` counts differing pixels below the status bar
+(largest channel difference, of 255):
+
+| | differ >2 | >8 | max |
+|---|---|---|---|
+| tone shader against the glass shader with its lens off (`dialog`) | 0 | 0 | 0 |
+| `dialog`, 0.4.15 against now | 0 | 0 | 0 |
+| `home`, `keyboard`, 0.4.15 against now | 0 | 0 | 1 |
+| `panel`, 0.4.15 against now, same region order | 0 | 0 | 1 |
+| `shade`, old paths against defaults | 2.6% | 0 | 8 |
+| `shade`, old paths against `through` | 37% | 10.5% | 46 |
+| `home` under the open shade, covered against in full | 0.56% | 0 | 6 |
+
+The 1-level differences are the deep path's `frostT = blurMix` standing in for
+`pow(1, blurFalloff) * blurMix`. The shade's are inside the panes, smooth, and
+largest in the cards, whose derived blur (12 px on the quarter-resolution
+image) is the furthest from a Kawase blur of the snapshot at 56. `through` is
+visibly less frosted: the pane's blurred read is then the backdrop's 27, not
+its own 263.
+
+A covered pane can only be photographed while frames keep coming: a
+screenshot of a still screen finds the last composite older than 250 ms and
+draws everything in full. `--es animate false --es redraw true` redraws the
+frozen backdrop every frame for that.
+
+**The real thing.** With the companion attached to SystemUI and the launcher
+the shade, Quick Settings and the home screen drew through every new path with
+no engine warning and one SurfaceFlinger process throughout, and through
+three rounds of pulls, page swipes, the volume panel, screenshots and
+`mode`/`paneBlur`/`lazyBlur`/`snapshotCopy` flips while frames were being
+drawn:
+
+```
+stats: frames=118 ... snapshot-copies/frame=0.00 tone=59 ... covered=590     shade open over ten panes
+draw #1170 pane r=263 (blurred at 263, from the backdrop's) ... under a backdrop
+```
+
+Three things found on the way:
+
+- **Android 17 stops blurring at eleven requests.** A scene with thirteen
+  regions composed at 60 Hz with no blur at all, in stock mode and glass alike,
+  and ten regions blurred: `Output.cpp` counts the blur requests of layers
+  whose owner holds none of ACCESS_SURFACE_FLINGER, ROTATE_SURFACE_FLINGER,
+  INTERNAL_SYSTEM_WINDOW and READ_FRAME_BUFFER, and past `kMaxBlurRequests`
+  (10) sets `ignoreBlur` (b/399120953, a side-channel mitigation). On the AVD
+  SystemUI and the Pixel launcher hold them. Every bench scene asks for ten
+  at most.
+- **A window's blur regions arrive in an order that changes with the
+  framework's boot.** `Window.setBackgroundBlurRadius` makes the window's
+  background one more region, and RenderEngine draws regions grouped by
+  radius in the order the window's set of drawables lists them. In one boot
+  the "backdrop" came first and the panes drew over it; in the next it came
+  last and painted over them. The shade's is a layer background blur, always
+  first, and `shade` now sets one the same way
+  (`SurfaceControl.Transaction.setBackgroundBlurRadius`). The same shows in
+  `panel`: cap first or body first, by boot, and a still screenshot differs
+  where they overlap (the merge needs a frame of memory).
+- **`adb shell stop` while glass is drawing trips the crash guard**, as a kill
+  should: the next SurfaceFlinger starts with the mode saved as stock. A test
+  that swaps the engine sets `sys.glass.active 0` first.
+
+Not measured: any of this on a phone. The copy and the small passes are the
+two things a tile-based GPU prices differently from this one.
+
+## The Performance settings, a phone's GPU at last, and the F1's boots (v0.4.16, 2026-11-19)
+
+**What was added.** Three switches that give up part of the look, on a
+Performance card under the WebUI's sliders and as `glassctl perf`
+(ARCHITECTURE.md, "What a frame costs", 8):
+
+| setting | property | faster value |
+|---|---|---|
+| Blur layers | `paneBlur` | `through`: one blur for both of a pane's reads |
+| Edge colour fringe | `fringe` | `0`: no dispersion walk at the rim |
+| See-through resolution | `glassResolution` | `quarter`: clear glass reads a 4.5 dp blur of the quarter-resolution buffer |
+
+**The look** (A17 AVD, `harness/shots.sh` with the backdrop frozen, diffed
+against the same engine at its defaults; a pixel "differs" past 2/255):
+
+| | shade | dialog | home | keyboard | panel |
+|---|---|---|---|---|---|
+| defaults against the engine before the settings | 0 | 0 | 0 | 0 | 0 |
+| one layer | 39%, max 46 | 0 | 20%, max 60 | 26%, max 86 | 4%, max 64 |
+| fringe off | | | 1.8%, max 76 | | |
+| quarter | | | 17%, max 64 | | |
+
+One layer at the three looks (`basic`, variant 0, 0.5 and 1; panes that ask for
+263 px): the one blur is made at 12, 211 and 263 px. Clear stays readable and
+slightly soft, Regular loses the bright detail that showed through its frost,
+Frosted is the same picture as with two layers. A first version scaled the
+radius by the blur's share of the mix and put a 79 px blur behind clear glass,
+which is not clear glass; what can be read through the pane is what the eye
+goes by, hence the floor at 0.3 and the smoothstep.
+
+A three-tap fringe was tried as a middle setting and dropped: visibly harsher
+than the full walk (three coloured copies, not a spectrum), and on the AVD no
+faster.
+
+**The cost on the AVD** (RenderEngine ms a frame, median of five rounds taken
+by turns, `harness/ab.sh`):
+
+| scene | two layers | one layer | one, no fringe | quarter | Android's blur |
+|---|---|---|---|---|---|
+| shade | 5.23 | 4.65 | 4.48 | 5.21 | 5.32 |
+| keyboard | 4.08 | 3.24 | 3.31 | 3.87 | 3.14 |
+| panel | 4.10 | 3.54 | 3.56 | 3.87 | 3.58 |
+| home, clear | 4.24 | 3.67 | | 4.01 | 3.35 |
+| home, regular | 4.13 | 3.79 | | | |
+| home, frosted | 4.24 | 3.72 | | | |
+
+The fringe alone: home 4.20 with, 4.08 without. Stability: every scene run
+while the three settings were flipped for about 13 s each, then fast, stock,
+glass: one SurfaceFlinger process throughout, no warning from the engine.
+
+**alioth (Poco F3, crDroid, Adreno 650, 1080×2400 at 120 Hz).** Both phones'
+`surfaceflinger` pass `engine/test/run.sh` and `abi_test` on the host (the new
+optional `makeSubset` takes its result in x8 on both). Installed over a
+running 0.4.15 (SurfaceFlinger's pid kept), glass switched off, rebooted:
+`sys.glass.engine=hooked`, regen 1. Glass switched on live: the
+same pid, `engine=glass`, no trip, no tombstone, and the log shows the new
+paths on arm64 for the first time:
+
+```
+draw #2580 pane r=225 (blurred at 271, from the backdrop's) ... through a light blur     launcher icons under the open shade
+stats: frames=121 blurs/frame=1.00 (android 0.00 + engine 1.00) derived/frame=1.28 deferred/frame=1.86 snapshot-copies/frame=0.13 ... pane=1311 covered=601 ... hook=690us/frame
+```
+
+The real launcher's icons ask for a 225 px blur (the bench's 263 was a fair
+guess). Then the first numbers from a phone, `harness/phone_ab.sh qs 2 ...`:
+Quick Settings opened and closed three times per variant, variants by turns,
+two rounds, about 300 composited frames each:
+
+| | RenderEngine ms a frame | rounds |
+|---|---|---|
+| Android's blur | 7.80 | 7.85, 7.75 |
+| glass, defaults | 23.15 | 22.95, 23.36 |
+| one layer | 21.55 | 21.38, 21.72 |
+| one layer, no fringe | 19.04 | 19.16, 18.92 |
+
+The same cycle on the AVD is 5.9 with glass, and its bench shade 5.2 against
+5.3 for Android's blur. A desktop GPU behind gfxstream charges for render
+passes and hardly at all for a pixel; this GPU is the other way round, and
+what the AVD ranked last (the fringe: 0.1 ms there) is worth 2.5 ms here. Glass costs three times Android's blur on this scene, at a
+refresh rate that leaves 8.3 ms a frame. One scene, two rounds, one phone: a
+second run that switched the shader's parts off one at a time measured
+nothing, because the phone locked itself after the second variant, and a
+secure lock is not ours to open. So what the remaining 11 ms is made of
+(shader arithmetic per pixel, the launcher's covered panes under the shade,
+the engine's own 1.5 to 2.8 ms on the render thread, which is `hook=` in the
+stats line and includes making the blur) is not known yet.
+
+**The F1 (Poco F1, AxionOS, Adreno 630).** Installed three times, never ran:
+each first boot failed, the boot guard stood the module down, and the next
+boot, without it, was fine. Milestones from the kernel log (uptime, s; pstore
+for the boots that died, KernelSU's dmesg for the others):
+
+| boot | SurfaceFlinger exec | GPU firmware asked for | zap load | regulator cleanup | what happened |
+|---|---|---|---|---|---|
+| 1, engine loaded | 32.72 | 34.25 | 35.04 to 35.98 | 35.81, `gpu_gx_gdsc: disabling` | log ends 15 ms after the zap came out of reset |
+| stood down | 31.24 | 33.80 | 34.01 to 34.63 | 35.81 | fine |
+| 2, engine loaded | 32.12 | | | | GPU up, boot animation drawn; sensors HAL crash loop |
+| stood down | 31.07 | 33.62 | to 34.65 | 35.81 | fine |
+| 3, engine loaded | 32.37 | 33.94 | from 35.11 | 35.81 | `kgsl: Switch to unsecure failed to idle` from 37.9 s |
+| stood down | 32.69 | 33.90 | 36.09 to 36.61 | 35.81 | fine |
+
+In boot 2 the engine hooked ("hook installed in 318 ms", mode stock) and
+SurfaceFlinger composed the boot animation; `android.hardware.sensors@1.0`
+then died in the vendor's `libssc.so` (`qmi_wait_for_service`), the camera
+provider aborted on "could not find sensors QMI service", system_server
+aborted on "ISensors hidl service failure" and init rebooted with
+`zygote-fatal`. In boots 1 and 3 the GPU's zap firmware was loading at
+35.81 s, the moment this kernel switches off regulators nobody has claimed:
+in boot 1 it logged `gpu_gx_gdsc: disabling` and the phone reset; in boot 3
+the GPU never idled and opening it failed ("Device open failed, stub the
+gpu"; SurfaceFlinger then aborts on "Failed to create a valid texture" every
+5 s, the picture from 2026-11-18). The three boots that were fine had the zap
+either loaded before 35.81 or started after it.
+
+What that does and does not show. Nothing in these logs is the engine failing:
+it loaded and hooked each time it was mounted. The GPU failure is a race in
+this phone's kernel that a boot can lose with the ROM's own SurfaceFlinger
+(it did on 2026-11-18). But three losses in the three boots with the engine
+and none in the three without is more than the dates before suggest by
+chance, and the engine does put 0.3 s of symbol recovery in front of
+SurfaceFlinger's start, which is of the size the margin is. Not settled. The
+battery was at 6% by the third try, which is its own way for a boot to end.
+The F1 was left stood down, on Android's blur, with v0.4.16 installed.
+
+Not verified: the Performance settings on any phone but for the two numbers
+above (the quarter setting not at all); glass on the F1's Adreno 630 with
+this engine; the WebUI card inside a manager's WebView (it was exercised in a
+desktop browser against the AVD's engine through `webui_preview.py`).
+
+## Where the glass's time goes on a phone (alioth and the F1, v0.4.16 and v0.4.17, 2026-11-19)
+
+**The tool.** `harness/phone_ab.sh <scene> <rounds> name=prop=val,...` drives
+the phone's own UI over adb (`qs`: Quick Settings opened and closed three
+times; `home`: the launcher swiped to the next page and back four times),
+takes the variants by turns, and reads per variant: TimeStats' RenderEngine
+time a composited frame, the frames SurfaceFlinger missed, the RenderEngine
+thread's own CPU time (utime + stime from /proc), and the GPU clock averaged
+over the time spent at each (kgsl's devfreq). It puts back every property it
+touched. A variant can take the companion's parts out (`app.icons=0`), which
+is how the launcher's glass and the tiles' were told apart.
+
+It needs the phone unlocked and left alone. Runs in which the owner was using
+the phone show as a handful of frames a round and were thrown away (three of
+them on alioth). The level also moves between runs with the phone's state
+(alioth's `two` was 23.2 ms just after a boot and 17.0 later), so only
+numbers from one run are compared with each other.
+
+**Home screen, swiped** (glass launcher icons with nothing blurred under
+them; RenderEngine ms a frame):
+
+| | alioth: Adreno 650, 120 Hz, v0.4.16, one round | F1: Adreno 630, 60 Hz, v0.4.17, two rounds |
+|---|---|---|
+| Android's blur | 2.08 (CPU 1.19) | 3.24 (CPU 2.10) |
+| glass, defaults | 13.23 (CPU 5.27), 530 frames missed | 31.83 (CPU 4.77) |
+| fringe off | 11.63 | 20.54 |
+| `softenTaps=5` | | 30.14 |
+| `softenDp=0` | 9.34 | |
+| See-through resolution: Quarter | 8.84 | 20.11 |
+| Blur layers: One | 7.77, 75 frames missed | 19.76 |
+| One layer, fringe off | | 16.48 |
+| One layer, fringe, soften and lens band off | 6.93 (CPU 4.19) | |
+
+**Quick Settings, opened and closed** (tiles over the toned shade, the
+launcher's icons under it):
+
+| | alioth, v0.4.16, one round | F1, v0.4.17, two rounds |
+|---|---|---|
+| Android's blur | 6.23 (CPU 3.53) | 6.81 (CPU 4.10) |
+| glass, defaults | 16.99 (CPU 7.55) | 18.66 (CPU 4.26) |
+| the paths before the rework (`lazyBlur=0,paneBlur=own,toneShader=0,coveredPanes=0`) | 22.79 | |
+| `coveredPanes=0` | 18.86 | |
+| fringe off | 15.89 | 18.13 |
+| `softenDp=0` | 15.87 | |
+| Blur layers: One | 13.41 | 18.11 |
+| One layer, fringe off | | 16.99 |
+| shade's backdrop left to Android (`backdrop=stock`) | 16.13 | |
+| no glass for the tiles and sliders (`app.qs=0,app.sliders=0`) | 13.12 | |
+| no glass for the launcher (`app.icons=0,...`) | 11.01 | |
+| highlights off, grain off, refraction amount 0 | 16.95, 16.98, 17.21 | |
+
+What that says:
+
+- Glass costs three to ten times Android's blur on these phones, and at the
+  defaults neither holds its refresh rate on a home screen of glass icons.
+  The AVD had put it within a millisecond.
+- The rework of 2026-11-19 is worth 5.8 ms a frame on alioth's Quick Settings
+  (22.8 to 17.0), a quarter of the frame.
+- Of the 10.8 ms that glass adds to that scene, 6.0 are the launcher's icons
+  under the shade, 3.9 the tiles and 0.9 the toned backdrop.
+- The Performance settings do on a phone what they did not on the AVD. One
+  layer takes 41% off the home screen on alioth and brings it back to nearly
+  every frame at 120 Hz; Quarter takes 33%. On the F1 the colour fringe alone
+  is 11.3 ms a frame of the home screen, a third of it.
+- The softening of the see-through view (nine reads of the full-resolution
+  screen for every pixel of a pane) is 3.9 ms a frame on alioth's home
+  screen. Five reads on a rotated grid (`softenTaps=5`, v0.4.17) save 1.7 ms
+  on the F1 and show: at 2x zoom text behind the glass has ghosted outlines
+  (5% of pixels off by more than 2/255, max 25 to 36, on the AVD). It stays an
+  engine switch, at nine.
+- Highlights, grain and the refraction amount cost nothing measurable, and
+  shrinking the lens band (`refractionWidthDp`, `HeightDp` 0.1, so that most
+  pixels take the shader's short way) gains 0.7 ms of 17 on alioth and 2.8 of
+  28.5 on the F1. With every per-pixel extra off and one layer, glass is still
+  4.8 ms (alioth, home) to 14 ms (F1, Quick Settings) over Android's blur.
+  That remainder is the shader's common path over a megapixel or two of
+  small panes, and the CPU below.
+
+**The render thread's CPU.** Glass costs the RenderEngine thread 4 ms more
+CPU a frame than Android's blur on alioth (7.55 against 3.53 in Quick
+Settings, 5.27 against 1.19 on the home screen), with one layer too. At
+120 Hz that is half the frame before the GPU has drawn anything. `simpleperf`
+on that thread through four Quick Settings cycles (v0.4.16, 13,729 samples):
+
+| share | where |
+|---|---|
+| 35% | surfaceflinger itself: Skia recording and flushing each pane as its own draw (`FillRectOpImpl::onExecute` 24.5% with its callees, `GrGLGpu::flushGLState` 17.5%, the program key 4.7%, `setRuntimeEffectUniforms` 6.3%) |
+| 33% | the Adreno GL driver, under those |
+| 15% | libc: allocation, memset, and `getuid` |
+| 8% | the kernel: system calls |
+| 6% | the engine's own code (`RegionMerger::merge`, `paramsRefresh`, the hook's trampoline) |
+
+Android's blur draws a layer's regions as rounded rects of one image shader,
+which Skia batches into one draw; every glass pane is a draw of its own with
+45 uniforms and two child shaders, about 0.12 to 0.16 ms of CPU each.
+
+One line of the profile was the engine's own doing: `__system_property_serial`
+7.0% with `getuid` under it. Since Android 14 bionic makes a system call
+there (`is_app_process`, for the appcompat overrides), and `paramsRefresh`
+asked for the serial of every property that exists, for every pane drawn.
+v0.4.17 asks at most every 50 ms; a passive profile of alioth on v0.4.17
+(757 samples while the phone was in use) has it at 1.8%, which is other
+callers.
+
+**v0.4.17** (zip `76159d2c…`; arm64 engine `08b836bc…`): that throttle;
+`softenTaps`; a pane under another layer's backdrop no longer draws its
+colour fringe or softens its view. On the AVD the five bench scenes draw the
+same pixels as v0.4.16 at the defaults, and a soak with the settings flipped
+kept one SurfaceFlinger process. Installed on alioth over 0.4.16 with glass
+left on: booted, `engine=glass`, no trip.
+
+**The F1 booted.** v0.4.17 was the fourth install there and the first whose
+first boot got through (glass off for the reboot): `engine=hooked`, then
+glass on live: the shader validated on the Adreno 630 ("42 uniforms + 2
+children"), same SurfaceFlinger pid, no trip, no tombstone, and the numbers
+above. So the three boots lost on 0.4.16 were the kernel's race and the
+sensor hub, as the logs said, and not the engine. Nothing was done to make
+the next boot safer.
+
+Not done: the lock screen and the keyboard as scenes; Quarter in Quick
+Settings; `softenTaps=5` and the throttle as RenderEngine times on alioth
+(the owner was using it).
+
+## A rim clearer than the pane (v0.4.18, 2026-11-19)
+
+Reported from the phone, twice: the colour fringe "is not frosted like the
+inside of the glass pane", and, on a zoomed capture of the bench scene, "the
+glass is clearer on the edges/rim, vs the insides fully normal blur".
+
+It was. The shader fades the frost out toward the edge (`frostT`, 0 at the
+rim, `blurMix` past the lens band) and has `lensBlur` to put blur back into
+the lens. The presets pin `lensBlur` to `blurMix` and say why: "so the rim is
+no sharper than the pane it borders". But `lensBlur` comes off the
+see-through view at the rim and inside alike, and `blurMix` on top of it only
+inside. The see-through view keeps `1 - lensBlur` of its strength at the rim
+and `(1 - lensBlur)(1 - blurMix)` inside: 70% against 49% at Clear, 50%
+against 25% at Regular, 15% against 2% at Frosted. Measured on the AVD
+(`home`, the large pane, the contrast of a white backdrop line through the
+glass 16 to 38 px in from the edge against 258 px in):
+
+| | rim band : inside, before | with `rimFrost` 1 |
+|---|---|---|
+| Clear | 32.9 : 23.6 = 1.40 | 23.6 : 23.6 = 1.00 |
+| Regular | 8.5 : 5.7 = 1.49 | 5.2 : 5.7 = 0.91 |
+| Frosted | 2.2 : 1.2 = 1.87 | 0.9 : 1.2 = 0.80 |
+
+`rimFrost` (a uniform and a setting; 1 in `basic` and `clear`, 0 elsewhere)
+mixes the frost in at full `blurMix` across the lens band, and takes it from
+where the lens read rather than from straight behind the fragment, so that a
+bent see-through image is not dissolved against an unbent blur. With one
+layer both reads are then the same texel and the rim no longer ghosts. Under
+full frost the lens still runs, and the rim shows the blur bent.
+
+At 0 it is the old arithmetic exactly: `clear` with `rimFrost=0` draws the
+same pixels as v0.4.17 on shade, home, keyboard and panel (the dialog capture
+differs in the navigation pill only). At 1, against 0, under `clear`: shade
+9.8% of pixels past 2/255 (max 20), home 7.5% (26), keyboard 4.9% (28), panel
+1.6% (23), all of it in the rim bands. One layer, Quarter and `blurMix=1`
+draw without artefacts; a soak across the presets and settings kept one
+SurfaceFlinger process. No cost: the blur at the lens's position was already
+read wherever `lensBlur` is above zero.
+
+`regular`, `frosted`, `prism` and `edge` keep 0. Their inside is all blur and
+their rim is the lens, which is the look they are named for.
+
+Installed on alioth as v0.4.18 (zip `05b4d711…`, arm64 engine `f0f935ee…`)
+over 0.4.17 with glass on: booted, `engine=glass`, `rimFrost` effective 1, no
+trip. The F1 was left on v0.4.17, whose boots are a lottery, with the zip in
+its Download folder. Not seen: the fix on a phone's screen by anyone but its
+owner; what the squeezed image in the lens does to softness (the softening
+is a fixed radius in the picture read, so what the lens compresses still
+looks crisper than what it does not).
+
+## Clean numbers from alioth, and what a pane's time is made of (v0.4.18 and v0.4.19, 2026-11-19)
+
+With its owner on another phone, alioth could be driven without interruption.
+Two rounds each, by turns, and the rounds agree to about 0.1 ms. RenderEngine
+ms a frame; the display is 120 Hz, so a frame has 8.3.
+
+| v0.4.18 | home screen, dragged | Quick Settings, opened and closed | app drawer, scrolled |
+|---|---|---|---|
+| Android's blur | 2.02 | 6.17 | 5.80 |
+| glass, defaults | 14.44 | 18.42 | 19.56 |
+| fringe off | 12.67 | 17.48 | |
+| `softenTaps=5` | 13.79 | | |
+| Quarter | 11.27 | | |
+| Quarter, fringe off | 9.89 | 17.05 | 16.70 |
+| One layer | 10.01 | 16.42 | 19.46 |
+| One layer, fringe off | 8.93 | 15.06 | 17.17 |
+
+The home screen's page has twelve panes (a calendar widget, icons, a folder,
+the dock, the search bar); the drawer about thirty-six icons and a search
+box over the drawer's own blurred backdrop, which is why One layer buys
+nothing there: those panes already read a blur. Even the fastest setting
+misses 28% of the home screen's frames.
+
+v0.4.19 adds `debugPane` for one question: is a pane's cost the glass
+shader's arithmetic, or the draw? `1` draws every pane with the tone shader
+(its shape, one read of its blur, a saturation, a veil: the same draws, the
+same blur, next to no arithmetic); `2` draws no pane and makes no blur for
+it. One layer and fringe off throughout:
+
+| | glass shader | flat (`debugPane=1`) | no panes (`2`) | Android's blur |
+|---|---|---|---|---|
+| alioth, home screen | 8.03 (CPU 3.38) | 4.49 (CPU 2.82) | 2.03 (CPU 1.27) | 2.02 |
+| alioth, Quick Settings | 15.15 (CPU 5.43) | 8.92 (CPU 4.61) | 5.98 (CPU 2.71) | 6.04 |
+| alioth, app drawer | 17.17 (CPU 5.34) | 8.14 (CPU 3.80) | 6.06 (CPU 2.04) | 5.97 |
+| F1, Quick Settings over its lock screen | 15.19 | 9.70 | 8.00 | |
+
+So, of what the panes add to a frame:
+
+| | the glass shader's arithmetic (glass − flat) | a draw per pane (flat − none) |
+|---|---|---|
+| alioth, home screen | 3.5 ms | 2.5 ms |
+| alioth, Quick Settings | 6.2 ms | 2.9 ms |
+| alioth, app drawer | 9.0 ms | 2.1 ms |
+| F1, Quick Settings | 5.5 ms | 1.7 ms |
+
+The arithmetic is the larger part everywhere, and three quarters of it in the
+drawer. With flat panes alioth's home screen missed 2 frames in 1640 and its
+drawer ran at 8.1 ms. The per-draw part is mostly the render thread's CPU
+(1.5 to 1.9 ms of it), whichever shader is drawn.
+
+That fits the shader. Its lens path is some five hundred operations a pixel
+(the SDF, a second SDF for the gradient, three normalizes, two or three
+`pow`, the square roots of the lens profile, the tone chain, three reads each
+with its own matrix and un-premultiply), its `deep` short cut about half
+that, the tone shader under a hundred; and icons and tiles are smaller than
+twice the lens band, so nearly every pixel of them takes the long way. None
+of it depends on what is behind the pane: for a given shape the bend, the
+rim light and the edge are the same every frame.
+
+`harness/phone_ab.sh` changed on the way, each for a run that had measured
+the wrong thing: `home` drags for 700 ms (crDroid's launcher snaps a flicked
+page in four frames); it resets with BACK, since HOME on that launcher when it
+is already home opens the app drawer; it wakes the phone and asks the
+keyguard to go before every variant, and stops if it will not; a variant
+under 100 frames is marked as not having run; `PHONE_AB_LOCKED=1` runs `qs`
+over a lock screen; `drawer` is a scene.
+
+The rim fix on the phone's own screen: alioth's home page captured with
+`rimFrost` 0 and 1, 2.2% of the screen differs past 2/255, all of it in the
+panes' rim bands.
+
+Both phones need their owner once after every reboot (the F1 too, contrary
+to an earlier note) and lock again after two idle minutes. Both are on
+v0.4.19 (zip `9d0990ab…`, arm64 engine `d3faa29c…`), glass on, the Performance
+settings at their defaults. The F1 booted first time for 0.4.19 as it had
+for 0.4.17.
+
+Not measured: the home screen and the drawer on the F1 with the split (it
+was locked); anything on a third GPU.
+
+
+## The fringe off by default, where the lens band's time is not, and lean builds (v0.4.20, 2026-11-19)
+
+**The default.** The phones' owner, after a day with both settings: "Fringe
+off seems a solid good default", and the rim of v0.4.18 "looks okay on the
+f3". `fringe` is 0 from v0.4.20. `prism`, which is named for its fringe, sets
+it for itself; `glassctl perf fringe on|off` writes 1 or 0 outright, so that
+it holds whatever the preset wants; `glassctl status` names the fringe when
+it is on; in the WebUI the fringe's width slider is dimmed while it is off.
+On the A17 AVD:
+
+| check | result |
+|---|---|
+| `fringe` unset against `fringe=0`, bench `home` and `shade` | no pixel differs |
+| unset against `fringe=1` | `home` 2.2% of pixels (max 54), `shade` 4.9% (max 9) |
+| `glassctl perf`, nothing set | `Fringe: off` |
+| `perf fringe on`, then `off` | property 1, `Speed: colour fringe on`; then 0 and no `Speed` line |
+| `preset prism`, `fringe` unset | effective 1; `perf fringe off` under it: off |
+| `perf best` | two layers, fringe 1, full |
+| WebUI in a desktop browser against the AVD's engine (`webui_preview.py`) | Off pressed with nothing set; On and Off switch it; the width slider dims and says why; no console errors |
+
+Under `prism` the bench's `home` scene draws the same pixels with the fringe
+on, off or left to the preset. That is not the switch: in the presets that
+leave `lensBlur` automatic it is 1 once a pane's blur reaches `lensBlurRef`
+(12), and the lens's own reads, the fringe with them, are then mixed away
+whole. With `lensBlur=0` prism's own fringe shows (4.3% of pixels against
+`fringe=0`, max 207). So in those presets the fringe has only ever shown on
+light blurs, and on the rest its sixteen reads were paid for and not seen.
+Left as it is.
+
+**A density that stayed.** `persist.sys.glass.density`, once set, stayed in
+force after it was emptied, until SurfaceFlinger restarted (the refresh only
+ever assigned an override). Found when it was about to be used for a
+measurement on a phone, and not used there. Now the display's own density
+comes back: on the AVD `density=1.0` moves 19.5% of `home`'s pixels and
+emptying it draws the default picture again (the status bar's clock apart).
+
+**Where the lens band's time is not.** The split of v0.4.19 called
+glass − flat "the glass shader's arithmetic", and the next step proposed from
+it was to bake the lens per shape. Before building that, the band was
+measured on the F1's home screen (v0.4.19, one layer, fringe off, two rounds
+by turns, 340 to 440 frames a round, the GPU at 520 MHz throughout;
+RenderEngine ms a frame):
+
+| | ms a frame | rounds |
+|---|---|---|
+| glass | 15.47 | 15.68, 15.26 |
+| the rim without its second read of the blur (`rimFrost=0,lensBlur=0`) | 14.83 | 15.24, 14.41 |
+| lens band a third as wide (`refractionWidthDp`, `HeightDp`, `highlightWidthDp` 0.1: the 7 dp sheen is what is left of `deepBand`, 16 px for 54) | 16.51 | 16.17, 16.85 |
+| that, with the lens off and one read (`blurMix=1,lensBlur=1,rimFrost=0`) | 13.53 | 14.21, 12.85 |
+| flat (`debugPane=1`) | 5.99 | 6.23, 5.75 |
+| no panes (`debugPane=2`) | 3.36 | 3.33, 3.39 |
+
+and in a second run:
+
+| | ms a frame | rounds |
+|---|---|---|
+| glass | 15.93 | 15.99, 15.87 |
+| four reads of the blur where there was one (`softenDp=8`) | 16.61 | 16.54, 16.67 |
+| two layers | 19.03 | 18.68, 19.38 |
+| two layers, `softenDp=0` (one read of the screen for nine) | 17.28 | 17.13, 17.43 |
+
+- A read is cheap: about 0.2 ms a frame over all of the screen's panes,
+  whether of the blur (three more: 0.7 ms) or of the screen at full
+  resolution (eight fewer: 1.75 ms). The two reads the glass shader makes
+  beyond the flat one's are under half a millisecond of the 9.5 between them.
+- The lens band is not where the rest is. With the band a third as wide most
+  of an icon's pixels are on the `deep` path, whose text is a fraction of the
+  lens's, and nothing was gained (it measured 1 ms slower, which is the
+  spread between rounds). With the lens off altogether and one read, 7.5 ms
+  of the 9.5 were still there.
+- So either the Adreno 630 is paying for code that a branch rules out (the
+  `deep` path costing what the lens does says as much), or the cost is in
+  something none of these moved. A baked lens rests on the first not being
+  so, and was put aside.
+
+Home screen and drawer on the F1 with this split were "not measured" above;
+this is the home screen. A first run, Quick Settings over the lock screen,
+was thrown away: the owner picked the phone up during it, and it showed as 25
+to 75 frames a round in four of six variants. `phone_ab.sh` now prints every
+round's frame count, where it printed the last round's.
+
+**Lean builds.** The test of "code a branch rules out" that is also the
+remedy if it holds. The generator builds the glass shader again with parts
+left out of its text, each remaining line being the full shader's with the
+zero put in:
+
+| build | left out | lines (full: 642) |
+|---|---|---|
+| `glass_lean_soft.sksl` | the fringe's loop, the grain, the press dent and glow, the superellipse corner (five `pow` in the SDF, four in its gradient) | 521 |
+| `glass_lean.sksl` | those, and the softening's taps | 481 |
+| `glass_tone_lean.sksl` | the tone shader's superellipse corner | 88 for 96 |
+| `glass_deep.sksl` | for measuring only (`debugPane=3`): `lean` with no lens at all, every fragment on what the shader calls its deep path | 378 |
+
+The glass builds declare the full shader's uniforms, used or not, so the
+engine fills one block and picks the build afterwards (`effectFor`: the full
+shader unless `dispersionAmount` and `touchGlow` are 0, `noiseAmount` is not
+above 0 and no corner's exponent is above 2.001; then `lean` where
+`softenRadius` is not above 0, else `lean_soft`). The tone shader's lean
+build is used when `cornerShape` is 2.001 or less. `leanShader=0` draws
+everything with the full shaders. On the AVD (x86_64 engine `f53d014a…`):
+
+- All four compile on Android 17's Skia with the layout of the shader they
+  stand in for ("lean shader validated (23853 chars, the glass shader's
+  uniform block)", `lean_soft` 26425, `deep` 19175, the lean tone shader
+  3708). Unused uniforms keep their place.
+- At the defaults (basic, variant 0) every pane is drawn lean: `stats` had
+  `pane=602 lean=602` (home), 540 and 540 (shade), 120 and 120 (keyboard)
+  before the tone shader's lean build was counted with them.
+- The picture: `leanShader` unset against 0 over the five bench scenes, for
+  basic at variants 0, 0.5 and 1, one layer, Quarter and `edge` (thirty
+  pairs, taken twice: before and after the corner was added to what is left
+  out, with the same result). Below the status bar and above the navigation
+  pill, which differ between any two captures, no pixel differs by more than
+  1 in 255 but for one place: sixteen to thirty pixels on the diagonal of the
+  keyboard pane's square bottom-left corner, by up to 20. There the left edge
+  and the bottom edge are equally near, the bend flips from one to the other,
+  and which a pixel on the line gets is a tie that two programs round apart.
+  The seam is there in both. Up to 0.8% of pixels differ by 1 (two layers,
+  `home` and `keyboard`, where the panes soften the screen); with one layer
+  and with Quarter, 0.001% or none. Two programs round differently.
+- `debugPane=3` with one layer draws `home` without bend or rim (14% of
+  pixels against the glass); with `leanShader=0`, or with two layers, where
+  the panes soften the screen, it changes nothing, as meant.
+- Soaks: forty-eight combinations of variant, layers, fringe, `leanShader`
+  and resolution under an animating scene, then every preset with Quick
+  Settings opened and closed; and thirty-two of `debugPane` 0 to 3, layers,
+  `leanShader` and variant, then `cornerShape=4` and back. One SurfaceFlinger
+  process each time, no trip, no error line.
+
+**v0.4.20** (zip `abdcf240…`; arm64 engine `959271dc…`). Not checked: the
+lean builds on Android 14 to 16's Skia (the layout check refuses them there
+if it differs); `prism` on a phone. What the lean builds are worth on a phone
+is the next section.
+
+## v0.4.20 on both phones, and what the lean builds are worth (2026-11-19)
+
+Installed on both phones between 14:36 and 14:51, the same zip
+(`abdcf240…`), each over a running v0.4.19 whose SurfaceFlinger kept its
+process through the install.
+
+**alioth (Poco F3, crDroid, Adreno 650).** Glass left on. Booted first time:
+`engine=glass`, `regen=1`, the installed engine is `959271dc…`, no trip, no
+new tombstone. With Quick Settings opened over the lock screen the engine
+counted `tone=62 pane=1114 lean=1176`: every backdrop and every pane drawn
+by a lean build. Its owner was using it minutes later, so nothing was
+measured there.
+
+**The F1 (Poco F1, AxionOS, Adreno 630).** Glass off for the boot, as
+before. The first boot did not complete, the guard stood the module down,
+the boot after that was fine without it, and the second install booted first
+time (`engine=hooked`, `regen=1`). Glass switched on live after that: the
+same SurfaceFlinger process, no trip. The Adreno 630's compiler took every
+build:
+
+```
+SkSL compiled by SurfaceFlinger's Skia (32853 chars)
+shader validated: 43 uniforms + 2 children resolved, blob 268 bytes, density 2.625 px/dp, 12 properties overridden
+tone shader validated (4007 chars, 9 uniforms, blob 92 bytes)
+lean shader validated (23853 chars, the glass shader's uniform block)
+lean_soft shader validated (26425 chars, the glass shader's uniform block)
+deep shader validated (19175 chars, the glass shader's uniform block)
+lean tone shader validated (3708 chars, the tone shader's uniform block)
+stats: … pane=60 covered=0 quarter=0 single=60 lean=60 skipped=0 stock=0
+```
+
+**The failed boot was the phone's, in a way not seen clearly before.** The
+engine hooked in 329 ms, logged "mode: stock" and SurfaceFlinger never
+crashed. But that boot had no `/vendor/firmware_mnt`. ueventd looked there
+for `adsp.mdt` and `cdsp.mdt` and found no file. The kernel logged "Failed to
+locate" for the audio, compute and sensor processors' firmware, thirteen
+times for the video core's, and for the modem's. Processes that opened files
+under the folder got ENOENT. With no sensor processor the sensors HAL
+crashed in `libssc.so` (`qmi_wait_for_service`) on every start, the camera
+provider aborted ("could not find sensors QMI service") and system_server
+aborted on "ISensors hidl service failure". The boot after it loaded the
+same firmware from that folder, which has its 492 files.
+
+"Boot 2" of the three failures in the F1's section above is the same thing:
+its pstore has seventeen "Failed to locate" lines, and the two GPU failures
+beside it have none. So this phone's boots after an install fail in two
+ways, neither of them the engine's: the GPU's firmware load meeting the
+regulator cleanup at 35.8 s, and the firmware partition missing from
+`/vendor` for a whole boot.
+
+What takes the folder away is not established. The metamodule
+(meta-overlayfsx 1.3.4) overlays `/vendor` for another module's files,
+cannot put `/vendor/bt_firmware` back under the overlay (ENOSYS on this
+4.19 kernel) and undoes it: "reverting", in its log of both good boots that
+day. An overlay left on `/vendor` would hide the mounts below it,
+`firmware_mnt` among them, and nothing else. The metamodule deletes its log
+at the next boot, so the failed boot's own is gone. The guard cannot tell
+such a boot from one the engine broke: the overlay was mounted and the boot
+did not complete.
+
+**What the lean builds are worth on the F1.** `harness/phone_ab.sh qs`, the
+variants by turns, the F1 as its owner keeps it (basic, variant 0, One layer,
+fringe off), on a charger. RenderEngine ms per composited frame, median of
+the rounds, the rounds in brackets.
+
+Quick Settings over the lock screen, right after the boot (three rounds of
+26 to 32 frames: the F1 opens Quick Settings there in about five frames, so
+the frames are few; one round each of `full` and `none` had 68 and 66):
+
+| variant | what draws the panes | ms a frame |
+|---|---|---|
+| `full` (`leanShader=0`) | the full shaders, as up to v0.4.19 | 15.34 (18.85, 15.34, 14.54) |
+| `lean` (the default) | `glass_lean.sksl` | **10.63** (10.63, 10.63, 10.39) |
+| `nolens` (`debugPane=3`) | `glass_deep.sksl`: lean with no lens | 9.50 (9.55, 9.50, 9.50) |
+| `flat` (`debugPane=1`) | the lean tone shader | 9.07 (9.06, 9.07, 8.77) |
+| `flat0` (and `leanShader=0`) | the full tone shader | 9.12 (9.15, 9.00, 9.12) |
+| `none` (`debugPane=2`) | nothing; the toned backdrop alone, lean | 7.71 (7.71, 8.00, 7.24) |
+| `none0` (and `leanShader=0`) | nothing; the backdrop with the full tone shader | 7.90 (7.90, 7.92, 7.75) |
+
+The same scene a day earlier with v0.4.19, whose only shader is the full
+one, gave 15.19, 9.70 and 8.00 for glass, flat and none: `full`, `flat` and
+`none` here.
+
+Then five rounds of `lean`, `full` and Android's blur. The owner had
+unlocked the phone in between, so this is most likely Quick Settings over
+the home screen, with the launcher's glass icons under the shade. The rounds
+have 232 to 302 frames against the lock screen's 30, and frames that cost
+more than any the lock screen gave. The script did not record the lock state
+then; it does now.
+
+| variant | ms a frame | frames composited | frames SurfaceFlinger missed |
+|---|---|---|---|
+| `lean` | **14.05** (13.96, 13.47, 14.38, 14.05, 14.87) | 1327 | 527 |
+| `full` | 24.64 (24.64, 25.15, 23.95, 24.15, 25.86) | 1231 | 935 |
+| Android's blur (`mode=stock`) | 7.58 (7.16, 7.61, 7.57, 7.58, 9.98) | 1369 | 23 |
+
+How it reads:
+
+- **`full` − `lean` is the finding.** 4.7 ms a frame over the lock screen,
+  three quarters of the 6.3 that glass panes cost over flat ones, and 10.6 ms
+  in the second run, where glass over Android's blur falls from 17.1 ms to
+  6.5. None of the code left out ran for these panes in the full shader
+  either: the fringe's loop sits behind `dispersionAmount`, the nine
+  softening taps behind `softenRadius`, the grain behind `noiseAmount`, all
+  zero here. The Adreno 630 charged for them anyway. The previous section's
+  guess, that this GPU pays for code a branch rules out, holds.
+- A likely reason, not shown: texture reads. The full shader's code has
+  twenty of them outside the fringe's loop (eighteen in the softening), and
+  the loop, which is written to be unrolled, makes sixteen more. `lean` has
+  two. A driver may run a read that sits in a branch for every pixel and
+  pick the result afterwards, because a read needs its neighbours'
+  coordinates. That would also fit the previous section, where each read
+  that did run cost little. The tone shader has one read in both builds, and
+  its lean build changes nothing (`flat0` − `flat` and `none0` − `none` are
+  0.05 and 0.19, inside the spread), although four `pow` went with the
+  superellipse corner. So arithmetic behind a branch seems to be free here
+  and reads behind a branch are not.
+- **`lean` − `nolens` is 1.1 ms**: the lens itself, when it is really gone,
+  over twelve tiles. A baked lens could save at most that here. It stays
+  shelved.
+- `nolens` − `flat` is 0.4 ms (the see-through read, the tone chain, the
+  tint). `flat` − `none` is 1.4 ms for drawing twelve panes at all.
+- With the lean builds SurfaceFlinger still missed 527 frames in the second
+  run, against 935 with the full shaders and 23 with Android's blur. Glass
+  there costs about twice Android's blur, where it cost more than three
+  times.
+
+Not measured: the home screen swiped on either phone (it needs an unlocked
+phone nobody is using; the commands are below), anything on alioth with
+v0.4.20, two layers (`lean_soft` against `full`).
+
+```sh
+S=192.168.50.176:39639   # wherever the F1 is
+# one layer: the full shader, lean, lean with no lens, flat, nothing, Android's blur
+ANDROID_SERIAL=$S harness/phone_ab.sh home 3 \
+  full=paneBlur=through,leanShader=0 lean=paneBlur=through \
+  nolens=paneBlur=through,debugPane=3 flat=paneBlur=through,debugPane=1 \
+  none=paneBlur=through,debugPane=2 stock=mode=stock
+# two layers, the default: full against lean_soft
+ANDROID_SERIAL=$S harness/phone_ab.sh home 3 full=paneBlur=,leanShader=0 lean=paneBlur=
+```

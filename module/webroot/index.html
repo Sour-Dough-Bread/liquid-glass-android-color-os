@@ -87,6 +87,7 @@
   .seg.three { grid-template-columns: 1fr 1fr 1fr; }
   .seg.four { grid-template-columns: repeat(4, 1fr); }
   .seg.four button { padding: 10px 4px; }
+  .seg.compact button { padding: 9px 8px; }
   .seg button[aria-pressed="true"] { background: var(--accent); color: var(--accent-text); }
   .seg button:disabled { opacity: .5; }
 
@@ -205,6 +206,44 @@
   <p class="note" id="basic-note" hidden></p>
 </section>
 
+<section class="card" id="perf-card">
+  <h2>Performance</h2>
+  <p class="note" style="margin:0 2px 10px">The parts of the look that cost the most to draw.
+    Each applies at once.</p>
+  <div class="row" id="perf-layers-row">
+    <div class="top"><label id="perf-layers-label">Blur layers</label></div>
+    <div class="seg compact" role="group" aria-labelledby="perf-layers-label">
+      <button id="perf-layers-two" aria-pressed="false">Two</button>
+      <button id="perf-layers-one" aria-pressed="false">One</button>
+    </div>
+    <p class="note">Glass mixes two pictures of what is behind it: the screen, and a blur of it.
+      One draws a single blur in place of both (a single pass). Clear glass turns slightly
+      soft, lighter frost loses the detail that showed through it, and tiles and cards on the
+      shade show the shade's blur rather than a stronger one of their own.</p>
+  </div>
+  <div class="row" id="perf-fringe-row">
+    <div class="top"><label id="perf-fringe-label">Edge colour fringe</label></div>
+    <div class="seg compact" role="group" aria-labelledby="perf-fringe-label">
+      <button id="perf-fringe-on" aria-pressed="false">On</button>
+      <button id="perf-fringe-off" aria-pressed="false">Off</button>
+    </div>
+    <p class="note">The rainbow fringe where a pane's rim bends what is behind it. Off, the
+      default, keeps the bend without the colours. On costs the most on a screen of small
+      panes, such as a page of icons.</p>
+  </div>
+  <div class="row" id="perf-resolution-row">
+    <div class="top"><label id="perf-resolution-label">See-through resolution</label></div>
+    <div class="seg compact" role="group" aria-labelledby="perf-resolution-label">
+      <button id="perf-resolution-full" aria-pressed="false">Full</button>
+      <button id="perf-resolution-quarter" aria-pressed="false">Quarter</button>
+    </div>
+    <p class="note" id="perf-resolution-note">What clear glass shows through it. Quarter reads
+      a quarter-size, slightly blurred copy of the screen in place of the screen itself, so
+      the whole screen is not copied every frame.</p>
+  </div>
+  <p class="note" id="perf-note" hidden></p>
+</section>
+
 <section class="card">
   <div class="switch">
     <label for="advanced">Advanced
@@ -310,6 +349,7 @@ const ADVANCED = [
   { k: 'backdropCoverage', label: 'Share of the screen that counts as full-screen', min: 0.5, max: 1, step: 0.01 },
   { k: 'refractionDepth', label: 'Dome depth', min: 0, max: 2, step: 0.01 },
   { k: 'paneSpanDp', label: 'Largest pane (dp) before the dome flattens', min: 0, max: 1200, step: 10 },
+  { k: 'rimFrost', label: 'Frost at the rim (1 = as frosted as the inside)', min: 0, max: 1, step: 0.01 },
   { k: 'blurFalloff', label: 'Rim-to-frost handover', min: 0.25, max: 6, step: 0.05 },
   { k: 'lensBlurRef', label: 'Radius where the rim is fully blurred', min: 1, max: 80, step: 1 },
   { k: 'crossFadeRadius', label: 'Fade-in radius', min: 0, max: 40, step: 1 },
@@ -414,13 +454,25 @@ function render() {
   chip.className = 'chip ' + (eng === 'loaded' ? 'ok' : eng === 'disabled' ? 'bad' : 'warn');
   chip.textContent = eng === 'loaded' ? 'engine running' : eng === 'disabled' ? 'disabled' : 'not loaded';
   if (eng === 'disabled') {
-    banner('The module turned itself off after a boot that did not complete. Remove ' +
-           '<code>/data/adb/glass/disabled</code> and reboot to try again; ' +
+    banner('The module turned itself off after a boot that did not complete. ' +
+           (state.mount === 'self'
+             ? 'Remove <code>/data/adb/glass/disabled</code> and reboot, or install it again, to try again; '
+             : 'Install it again from the manager (that also clears this) and reboot to try again; ') +
            '<code>/data/adb/glass/last_boot.log</code> says what happened.');
   } else if (eng === 'no-metamodule') {
     banner('The engine is not running: KernelSU 3 and later only mount modules through a ' +
            '<b>metamodule</b>, and none is installed. Install one, such as meta-overlayfs, from ' +
            'the manager and reboot. Settings made now are kept and apply once it is.');
+  } else if (eng === 'metamodule-broken') {
+    banner('The engine is not running: the metamodule <b>' + escapeHtml(state.metaName || "") + '</b> is ' +
+           'installed, but KernelSU will not run it (' + escapeHtml(state.mountWhy || "") + '), so no module ' +
+           'is mounted at all. Reinstall the metamodule from the manager and reboot.');
+  } else if (eng === 'metamodule-off') {
+    banner('The engine is not running: the metamodule <b>' + escapeHtml(state.metaName || "") + '</b> is ' +
+           escapeHtml(state.mountWhy || "") + ', so no module is mounted. Enable it and reboot.');
+  } else if (eng === 'not-mounted') {
+    banner('The engine is not running: the overlay was not mounted this boot, so ' +
+           'SurfaceFlinger is the ROM\'s own. Install the module again from the manager and reboot.');
   } else if (eng === 'loaded' && state.tripped) {
     const at = new Date(Number(state.tripped) * 1000);
     banner('SurfaceFlinger restarted at ' + at.toLocaleTimeString() + ' while drawing Liquid ' +
@@ -444,10 +496,11 @@ function render() {
   const glass = st.mode === 'glass';
   document.getElementById('mode-stock').setAttribute('aria-pressed', String(!glass));
   document.getElementById('mode-glass').setAttribute('aria-pressed', String(glass));
-  for (const id of ['basic-card', 'preset-card', 'backdrop-card', 'tune-card']) {
+  for (const id of ['basic-card', 'perf-card', 'preset-card', 'backdrop-card', 'tune-card']) {
     document.getElementById(id).classList.toggle('dim', !glass);
   }
   renderBasic();
+  renderPerf();
 
   const list = document.getElementById('presets');
   list.textContent = '';
@@ -536,7 +589,72 @@ function renderBasic() {
 
 // Properties glassctl treats as switches, which reset leaves alone.
 const SWITCHES = new Set(['mode', 'preset', 'enabled', 'follow_theme', 'variant', 'fillBlurScale',
-  'materialTint', 'frostR', 'frostG', 'frostB', 'accentR', 'accentG', 'accentB']);
+  'materialTint', 'frostR', 'frostG', 'frostB', 'accentR', 'accentG', 'accentB',
+  'lazyBlur', 'paneBlur', 'toneShader', 'coveredPanes', 'snapshotCopy', 'leanShader', 'fringe',
+  'glassResolution', 'softenTaps', 'debugPane', 'stats']);
+
+// The Performance card: three parts of the look that cost frame time. Two
+// layers and full resolution are the defaults and the fringe is off unless
+// asked for. glassctl knows which of the engine's properties each one is
+// (`glassctl perf`); what they are at comes back as the engine's own values,
+// like every other setting. `at` names the button a value belongs to.
+const PERF = {
+  layers: { param: 'paneBlur', values: ['two', 'one'],
+            at: (v) => (Math.round(v) === 2 ? 'one' : 'two') },
+  fringe: { param: 'fringe', values: ['on', 'off'],
+            at: (v) => (Number(v) === 0 ? 'off' : 'on') },
+  resolution: { param: 'glassResolution', values: ['full', 'quarter'],
+                at: (v) => (Math.round(v) === 1 ? 'quarter' : 'full') },
+};
+const PERF_RESOLUTION_NOTE = document.getElementById('perf-resolution-note').textContent;
+
+function renderPerf() {
+  const card = document.getElementById('perf-card');
+  const at = {};
+  for (const [id, spec] of Object.entries(PERF)) {
+    const p = param(spec.param);
+    if (!p) { card.hidden = true; return; }   // an engine from before the card
+    at[id] = spec.at(p.effective);
+    for (const v of spec.values) {
+      document.getElementById(`perf-${id}-${v}`).setAttribute('aria-pressed', String(v === at[id]));
+    }
+  }
+  card.hidden = false;
+  // One layer and the quarter-size copy both rest on making each blur as it
+  // is drawn, which the engine can only do on Android 17 (regen, as for Blur
+  // intensity). The fringe is the shader's own and works everywhere.
+  const old = state.regen === '0';
+  const moot = !old && at.layers === 'one';
+  document.getElementById('perf-layers-row').classList.toggle('dim', old);
+  document.getElementById('perf-resolution-row').classList.toggle('dim', old || moot);
+  for (const id of ['layers', 'resolution']) {
+    for (const v of PERF[id].values) document.getElementById(`perf-${id}-${v}`).disabled = old;
+  }
+  document.getElementById('perf-resolution-note').textContent = moot
+    ? 'With one blur layer, glass already draws from the quarter-size copy. This applies ' +
+      'again when Blur layers is Two.'
+    : PERF_RESOLUTION_NOTE;
+  // The fringe's width in Advanced does nothing while the fringe is off.
+  const width = rows.get('dispersionAmountDp');
+  if (width) {
+    const off = at.fringe === 'off';
+    width.row.classList.toggle('dim', off);
+    width.row.querySelector('label').textContent =
+      off ? `${width.spec.label} (off: see Performance)` : width.spec.label;
+  }
+  const note = document.getElementById('perf-note');
+  note.textContent = old
+    ? 'Blur layers and See-through resolution need Android 17. On this build only the ' +
+      'colour fringe can be switched.'
+    : '';
+  note.hidden = !old;
+}
+
+async function setPerf(id, value) {
+  const r = await exec(`${CTL} perf ${id} ${value}`);
+  if (r.errno) toast(r.stderr || 'Could not switch');
+  await load();
+}
 
 function showAdvanced(on) {
   advanced = on;
@@ -579,6 +697,10 @@ const APP_LABELS = {
   widgets: 'Home screen widgets',
   drawer: 'App drawer icons',
   search: 'Search boxes in the launcher',
+  volume: 'Volume panel',
+  dialogs: 'System dialogs (Quick Settings popups)',
+  overview: 'Overview buttons',
+  appdialogs: 'Blur behind app dialogs',
 };
 const appInputs = new Map();
 
@@ -775,6 +897,11 @@ for (const s of BACKDROP_STYLES) {
   document.getElementById(`bd-${s}`).addEventListener('click', () => setBackdrop(s));
 }
 buildRows(document.getElementById('adv'), ADVANCED);
+for (const [id, spec] of Object.entries(PERF)) {
+  for (const v of spec.values) {
+    document.getElementById(`perf-${id}-${v}`).addEventListener('click', () => setPerf(id, v));
+  }
+}
 
 document.getElementById('mode-stock').addEventListener('click', () => setMode(false));
 document.getElementById('mode-glass').addEventListener('click', () => setMode(true));

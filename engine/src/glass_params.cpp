@@ -19,6 +19,9 @@ struct Spec {
 };
 
 constexpr const char* kBackdropChoices[] = {"stock", "tone", "glass", nullptr};
+constexpr const char* kPaneBlurChoices[] = {"own", "derive", "through", nullptr};
+constexpr const char* kSnapshotCopyChoices[] = {"full", "bounds", nullptr};
+constexpr const char* kGlassResolutionChoices[] = {"full", "quarter", nullptr};
 
 // Defaults are the `regular` variant of expo-liquid-glass-view's
 // REGULAR_DEFAULTS, with three deliberate divergences:
@@ -180,6 +183,121 @@ constexpr Spec kSpecs[] = {
 
     {"radius", 0.0f},
     {"bypass", 0.0f},
+
+    // Android blurs a layer once for every radius its regions ask for, before
+    // drawBlurRegion is called, and glass draws few of them at the radius they
+    // asked for: a toned backdrop wants backdropBlur of it, a pane
+    // fillBlurScale of it, a pane over a backdrop none of its own. 1 puts each
+    // blur off until the region is drawn, so only what is drawn is made
+    // (Android 17, where generateTemporaryImage can be hooked). 0 is the
+    // behaviour before it: Android's blur first, the engine's on top.
+    {"lazyBlur", 1.0f},
+    // The blurred read of a pane that lies over a backdrop in its own layer (a
+    // Quick Settings tile or a notification card on the shade):
+    //   own      a blur of the layer's snapshot at the pane's own radius, as
+    //            everywhere else: a second full-screen blur each frame, read
+    //            after the backdrop was drawn, which also costs a copy of the
+    //            framebuffer
+    //   derive   the same radius, made by blurring the backdrop's own
+    //            quarter-resolution blur a little further: a sixteenth of the
+    //            pixels and no copy (the default)
+    //   through  the backdrop's blur itself, nothing more made. Unlike the
+    //            other two this changes the look (the pane is less frosted),
+    //            and it reaches further: a pane with NO backdrop under it (a
+    //            home screen icon, a keyboard, the volume panel) reads one
+    //            blur of the snapshot in place of the sharp screen and a blur
+    //            of its own: the lightest blur for clear glass, the pane's
+    //            own for frosted, between them in between (chosenViewRadius).
+    //            One read, one blur, no copy of the framebuffer: "One layer"
+    //            on the WebUI's Performance card. Android 17.
+    {"paneBlur", 1.0f, kPaneBlurChoices},
+    // 1 draws a toned backdrop with a shader of its own (one read, no lens);
+    // 0 with the glass shader and its lens off, as before. Same picture.
+    {"toneShader", 1.0f},
+    // A pane with no backdrop of its own reads the snapshot (glass shows what
+    // is behind it), and Skia copies the whole framebuffer for that. When a
+    // later layer's backdrop blurs the result anyway (the shade or a dialog's
+    // blur-behind over a home screen of glass icons), 1 has such a pane read a
+    // light blur of the snapshot instead, at half the radius the backdrop
+    // above it was last drawn with: no copy, coarser reads, and nothing the
+    // backdrop leaves visible. 0 draws every pane in full, as before.
+    {"coveredPanes", 1.0f},
+    // A pane that shows the snapshot (home screen icons, a keyboard, the
+    // volume panel) makes Skia copy the whole framebuffer, because the output
+    // cannot be sampled while it is drawn into.
+    //   full    that copy, as always (the default)
+    //   bounds  the engine copies only what the layer's panes read, before
+    //           anything is drawn, and the panes read the copy: far fewer
+    //           pixels for a keyboard or a panel, but a texture allocated
+    //           every frame. Android 17. Faster on the AVD's GPU; not yet
+    //           measured on a phone, which is why it is not the default.
+    {"snapshotCopy", 0.0f, kSnapshotCopyChoices},
+    // The glass shader tests its uniforms for what a pane does not use (no
+    // fringe, no grain, no press, no softening, no superellipse corner) and a
+    // phone's GPU may pay for it all the same. 1 draws such a pane with a
+    // build of the shader that has those parts left out of its text, and a
+    // toned backdrop with the tone shader less its superellipse corner: the
+    // same picture. 0 draws everything with the full shaders, as before.
+    {"leanShader", 1.0f},
+
+    // ---- the look traded for speed
+    //
+    // Unlike the switches above, these change what is drawn, each by a step
+    // someone may well prefer to pay in frame time instead. Together with
+    // paneBlur=through they are the WebUI's Performance card. Layers and
+    // resolution default to the best-looking setting; the fringe does not.
+    //
+    // The colour fringe at a pane's edge (dispersionAmountDp) is a walk of up
+    // to sixteen reads along the refraction, one per pixel, in the outer few
+    // dp of every pane; a small icon is nearly all edge. 0 leaves it out: the
+    // edge still bends what is behind it, in one read. A switch rather than
+    // dispersionAmountDp=0, which a preset would set back.
+    //
+    // Off unless asked for, since v0.4.20: on a phone it costs 11 ms a frame
+    // of the Poco F1's home screen and 1.8 of the F3's, for a detail a few
+    // pixels wide that the phones' owner found the rim no worse without.
+    // `prism`, which is named for it, turns it on for itself; a value set by
+    // hand wins over that either way.
+    {"fringe", 0.0f},
+    // What a pane with no backdrop under it (a home screen icon, a keyboard,
+    // the volume panel) shows through itself.
+    //   full     the screen behind it at full resolution, softened by
+    //            softenDp. Costs a copy of the framebuffer every frame and
+    //            the shader's finest reads (the default)
+    //   quarter  the compositor's quarter-resolution buffer, blurred by a few
+    //            dp, as a pane on the shade reads the shade's: no copy, coarse
+    //            reads, and what is behind the glass is blurrier. The pane's
+    //            own blur is made from that buffer. Android 17. Nothing to
+    //            add under paneBlur=through, which reads one blur already
+    {"glassResolution", 0.0f, kGlassResolutionChoices},
+    // How many reads softenDp takes of the sharp screen, per pixel of a pane
+    // that shows it: 9 (a 3x3 grid) or 5 (a rotated grid: the centre and one
+    // tap in each row and column around it, the same spread). On a phone's
+    // GPU the nine are the most expensive thing a clear pane does.
+    {"softenTaps", 9.0f},
+    // How frosted a pane's rim is against its inside (the shader's rimFrost
+    // has the arithmetic). 0: the frost fades out toward the edge over the
+    // lens band (blurFalloff), so the rim shows what is behind at 1/(1 -
+    // blurMix) the strength the inside does: the look of `regular`, `frosted`,
+    // `prism` and `edge`, whose inside is all blur and whose rim is the lens.
+    // 1: the rim is mixed like the inside. `basic` and `clear` set it: they
+    // show the screen through the whole pane, and a rim clearer than the pane
+    // reads as a defect there (reported from the phone, 2026-11-19).
+    {"rimFrost", 0.0f},
+    // For measuring only (harness/phone_ab.sh): where a pane's time goes.
+    //   1  every pane is drawn with the tone shader: its shape, one read of
+    //      its blur, a saturation and a veil. The same number of draws with
+    //      a fifth of the uniforms and next to no arithmetic, so what is
+    //      left of the frame against 0 is what the glass shader itself costs
+    //      per pixel, and what is left against 2 what a draw costs
+    //   2  no pane is drawn and no blur made for it
+    //   3  a pane with no softening is drawn by the glass shader's lean
+    //      build with the lens left out of it: the blur, the see-through
+    //      read, the tone chain, no bend and no rim. Against the lean build
+    //      itself that is what the lens costs once it is really gone; against
+    //      1, what the rest of the glass shader costs. Needs leanShader
+    {"debugPane", 0.0f},
+    {"stats", 0.0f},
 };
 // One entry per ParamId, in the same order: a missing one would shift every
 // name after it onto the wrong parameter.
@@ -203,8 +321,9 @@ static_assert(sizeof(kSpecs) / sizeof(kSpecs[0]) == P_count, "kSpecs out of step
 //    the desktop reference's radius-2 blur both do: still see-through, no
 //    longer pin-sharp.
 //  - blurMix 0.3 keeps the interior mostly the sharp view of what is behind,
-//    and lensBlur is pinned to the same 0.3 so the rim is no sharper than the
-//    interior (auto would blur it fully at any radius over 12).
+//    and lensBlur is pinned to the same 0.3, with rimFrost 1, so the rim is
+//    no sharper than the interior (auto would blur it fully at any radius
+//    over 12; lensBlur without rimFrost left the rim 1.4 times as clear).
 //  - The tint does the legibility work, as Apple's dimming layer does. It is a
 //    31% blend toward a near-black, so on its own it takes 31% of the colour
 //    out of everything seen through the pane; saturation 1.3 puts most of it
@@ -223,6 +342,7 @@ constexpr PresetEntry kClear[] = {
     {P_noise, 0.0f},
     {P_blurMix, 0.3f},
     {P_lensBlur, 0.3f},
+    {P_rimFrost, 1.0f},
     {P_tintR, 0.13f},
     {P_tintG, 0.10f},
     {P_tintB, 0.13f},
@@ -267,6 +387,7 @@ constexpr PresetEntry kPrism[] = {
     {P_refractionHeightDp, 26.0f},
     {P_refractionAmountDp, 90.0f},
     {P_dispersionAmountDp, 12.0f},
+    {P_fringe, 1.0f},
     {P_highlightIntensity, 0.4f},
 };
 
@@ -313,8 +434,17 @@ struct Slot {
 Slot g_slots[P_count];  // indexed by ParamId, so &slot - g_slots recovers the id
 float g_effective[P_count];  // override, else preset, else default
 int64_t g_last_rescan_ms = 0;
+int64_t g_last_check_ms = 0;
+// How often the properties are looked at, at most. Asking for a property's
+// serial was a read of shared memory when this was written; since Android 14
+// bionic asks getuid() on the way (the appcompat overrides), which is a system
+// call, and paramsRefresh runs for every region drawn. On a Poco F3, with
+// thirty properties set and thirty panes on screen at 120 Hz, that was 7% of
+// the render thread. Twenty times a second is as live as a slider drag is.
+constexpr int64_t kCheckMs = 50;
 char g_names[P_count][96];
 float g_unit_scale = 2.75f;
+float g_system_scale = 2.75f;  // the display's own, for when no density is set
 bool g_ready = false;
 Mode g_mode = Mode::kStock;
 size_t g_preset = kDefaultPreset;
@@ -436,14 +566,15 @@ float stops(float v, float clear, float regular, float frosted) {
 // Frosted has no reference: it is regular pushed further, mostly blur (0.85)
 // with a heavier veil, and the shade's backdrop blurred more as well.
 //
-// lensBlur follows blurMix all the way so the rim is never sharper than the
-// pane it borders, as `clear` pins it.
+// lensBlur follows blurMix all the way, and rimFrost is 1, so the rim is never
+// sharper than the pane it borders, as in `clear`.
 bool basicCompute(ParamId id, float* out) {
     const float v = raw(P_variant);
     const bool dark = darkFrost();
     switch (id) {
         case P_blurMix:
         case P_lensBlur: *out = stops(v, 0.3f, 0.5f, 0.85f); return true;
+        case P_rimFrost: *out = 1.0f; return true;
         case P_fillLighten: *out = dark ? 0.0f : stops(v, 0.0f, 0.9f, 0.9f); return true;
         case P_fillDarken: *out = dark ? stops(v, 0.0f, 0.9f, 0.9f) : 0.0f; return true;
         case P_saturation:
@@ -490,6 +621,7 @@ void paramsInit() {
     }
     g_ready = true;
     g_last_rescan_ms = -1000000;  // first refresh always looks everything up
+    g_last_check_ms = -1000000;
     // The default preset's values, before any property is read. paramsRefresh
     // only recomputes when something CHANGED, and on a device where no
     // persist.sys.glass.* has ever been set nothing does — which left the
@@ -500,7 +632,9 @@ void paramsInit() {
     paramsRefresh();
 
     const float sys = systemDensity();
-    g_unit_scale = sys > 0.0f ? sys : 2.75f;
+    g_system_scale = sys > 0.0f ? sys : 2.75f;
+    const float override_density = g_effective[P_density];
+    g_unit_scale = override_density > 0.0f ? override_density : g_system_scale;
 }
 
 void paramsRefresh() {
@@ -515,6 +649,8 @@ void paramsRefresh() {
     struct timespec now {};
     clock_gettime(CLOCK_MONOTONIC, &now);
     const int64_t ms = static_cast<int64_t>(now.tv_sec) * 1000 + now.tv_nsec / 1000000;
+    if (ms - g_last_check_ms < kCheckMs) return;
+    g_last_check_ms = ms;
     const bool rescan = ms - g_last_rescan_ms >= 500;
     if (rescan) g_last_rescan_ms = ms;
 
@@ -547,8 +683,10 @@ void paramsRefresh() {
         ++g_generation;
     }
 
+    // Either way, every time: a density taken back (the property emptied)
+    // used to stay in force until SurfaceFlinger restarted.
     const float override_density = g_effective[P_density];
-    if (override_density > 0.0f) g_unit_scale = override_density;
+    g_unit_scale = override_density > 0.0f ? override_density : g_system_scale;
 }
 
 float param(ParamId id) { return g_effective[id]; }

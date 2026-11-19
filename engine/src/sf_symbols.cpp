@@ -165,6 +165,19 @@ const char* kPaintSetShaderM[] = {
     nullptr,
 };
 
+// ---- a copy of part of the snapshot ---------------------------------------
+// Android 17's Skia takes the context through an SkRecorder, which the canvas
+// hands out. Earlier releases spell makeSubset with a GrDirectContext* and are
+// not matched: the copy is simply not made there.
+const char* kImageMakeSubsetM[] = {
+    "_ZNK12SkImage_Base10makeSubsetEP10SkRecorderRK7SkIRectN7SkImage18RequiredPropertiesE",
+    nullptr,
+};
+const char* kCanvasBaseRecorderM[] = {
+    "_ZNK8SkCanvas12baseRecorderEv",
+    nullptr,
+};
+
 // ---- kBlurGenerate -------------------------------------------------------
 // The virtual that produces a blur, one implementation per filter. Hooked only
 // to learn the arguments it was called with (the GPU context and the display),
@@ -265,6 +278,8 @@ const EntryPoint kEntryPoints[] = {
     {"SkCanvas::getTotalMatrix", kCanvasGetTotalMatrixM,
      "_ZNK8SkCanvas14getTotalMatrix", kOptional, true},
     {"SkPaint::setShader", kPaintSetShaderM, "_ZN7SkPaint9setShader", kOptional},
+    {"SkImage_Base::makeSubset(SkRecorder*)", kImageMakeSubsetM, nullptr, kOptional, true},
+    {"SkCanvas::baseRecorder", kCanvasBaseRecorderM, nullptr, kOptional},
 
     // ---- kBlurGenerate (any one enables backdropBlur) ---------------------
     {"KawaseBlurFilter::generateTemporaryImage", kGenerateKawaseM, nullptr, kBlurGenerate, true},

@@ -74,6 +74,14 @@ template <size_t N>
 struct Returned {
     alignas(alignof(void*)) unsigned char bytes[N];
     Returned() {}
+    // A returned sk_sp<T> holding `p`, whose one reference the caller of the
+    // function this is returned from takes over. For a hook that answers in
+    // the original's place; a prvalue of it is built straight into the
+    // caller's return slot, like the original's own result.
+    explicit Returned(void* p) {
+        static_assert(N == sizeof(void*), "only an sk_sp is one pointer");
+        memcpy(bytes, &p, sizeof(p));
+    }
     ~Returned() {}
     Returned(const Returned&) = delete;
     Returned& operator=(const Returned&) = delete;
@@ -162,6 +170,24 @@ struct Bridge {
     SkMatrix (*CanvasGetTotalMatrix)(const void* canvas) = nullptr;
     void (*PaintSetShader)(void* paint, void* sksp_shader_byval) = nullptr;
 
+    // ---- optional: a copy of part of an image (Android 17) -----------------
+    // sk_sp<SkImage> SkImage_Base::makeSubset(SkRecorder*, const SkIRect&,
+    //                                         SkImage::RequiredProperties) const
+    // RequiredProperties is one bool in a struct, trivially copyable, so it
+    // travels in one integer register on both ABIs, as any struct of up to
+    // eight bytes does. This twin fills that register with zeroes: the bool
+    // the callee reads is false, and so would be any flag a later Skia adds
+    // beside it.
+    struct SubsetProperties {
+        bool mipmapped = false;
+        unsigned char reserved[7] = {0, 0, 0, 0, 0, 0, 0};
+    };
+    static_assert(sizeof(SubsetProperties) == 8, "one register, all of it");
+    ReturnedSkSp (*ImageMakeSubset)(const void* image, void* recorder, const SkIRect* subset,
+                                    SubsetProperties properties) = nullptr;
+    // SkRecorder* SkCanvas::baseRecorder() const
+    void* (*CanvasBaseRecorder)(const void* canvas) = nullptr;
+
     bool compileReady() const {
         return (MakeForShader || MakeForShaderOpts) && SkStringCtor && SkStringDtor &&
                findUniform && findChild &&
@@ -213,8 +239,13 @@ inline void releaseData(const Bridge& b, void** slot) {
 // target's own compiled code and, for the zoom, AOSP android17-release.
 //
 // `zoom` is drawBlurRegion's zoomScale (A16 QPR2 onward); 1 everywhere else.
+//
+// `texel` is how many output pixels one pixel of the image covers: 4 for a blur
+// of the snapshot, 16 for a blur made from such a blur (a pane's, derived from
+// the backdrop's). Every blur filter maps by that scale from blurRect's top
+// left, whatever size its image came out at.
 SkMatrix blurredTransform(const Bridge& b, const SkCanvas* canvas, const SkRect& blur_rect,
-                          float zoom);
+                          float zoom, float texel = 4.0f);
 
 // Local matrix for the SHARP child. Not the same recipe with scale 1: the sharp
 // input is a snapshot of the whole surface, already in device space at the

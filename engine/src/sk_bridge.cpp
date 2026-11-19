@@ -159,14 +159,15 @@ SkMatrix zoomMatrix(const SkRect& blur_rect, float zoom) {
 }  // namespace
 
 SkMatrix blurredTransform(const Bridge& b, const SkCanvas* canvas, const SkRect& blur_rect,
-                          float zoom) {
+                          float zoom, float texel) {
     // MakeAll rather than SkMatrix::Scale/Translate: those are header-inline but
     // delegate to setScale/setTranslate, which are not, and resolving two more
     // symbols to write two constant matrices is a poor trade. MakeAll is inline
     // all the way down; it leaves the type mask unknown, and SurfaceFlinger's
     // own postConcat computes it — the mask is a cache, not state.
-    constexpr float kInverseInputScale = 4.0f;  // BlurFilter::kInverseInputScale
-    SkMatrix m = SkMatrix::MakeAll(kInverseInputScale, 0, 0, 0, kInverseInputScale, 0, 0, 0, 1);
+    // `texel` is BlurFilter::kInverseInputScale (4) for the compositor's own
+    // blur; see the header for the other value.
+    SkMatrix m = SkMatrix::MakeAll(texel, 0, 0, 0, texel, 0, 0, 0, 1);
     const SkMatrix translate =
         SkMatrix::MakeAll(1, 0, blur_rect.fLeft, 0, 1, blur_rect.fTop, 0, 0, 1);
     b.MatrixPostConcat(&m, &translate);

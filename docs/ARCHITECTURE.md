@@ -288,6 +288,179 @@ What the compositor cannot do: Quick Settings tiles, launcher folders and icons
 are not blurred by Android at all, so they never reach `drawBlurRegion`. Those
 need an app-side module that makes them regions: "The companion" below.
 
+## What a frame costs: blur made to order
+
+**Decision: the engine makes the blur it draws, and only that.** Glass used to
+be drawn on top of everything Android had already done for a blur layer. Per
+layer, per frame, RenderEngine takes a snapshot of the output, blurs the
+layer's whole bounds once for its background blur and once more for every
+other radius its regions ask for (each a 4x downsample, up to four halvings
+and as many upsamples), and hands each result to `drawBlurRegion`. Measured
+on the A17 AVD with a real GPU (VERIFIED.md), a shade with tiles and cards
+cost 7.3 ms of RenderEngine time a frame as glass against 5.0 as Android's
+blur, and four things made the difference:
+
+- **Blurs nobody drew.** A toned backdrop wants `backdropBlur` of the radius,
+  a pane `fillBlurScale` of it. The engine asked the filter again and left
+  Android's result unused: the default look blurred the shade three times a
+  frame (77 px unused, 27 px for the backdrop, the tiles' own), four with
+  notification cards.
+- **A copy of the framebuffer.** Skia will not sample a surface while drawing
+  into it, so a draw that names the snapshot makes it copy the whole output
+  first (`SkImage_Ganesh::ProxyChooser`). Android's blur reads the snapshot
+  only into other surfaces and skips that copy; the glass shader named the
+  snapshot in every draw, a toned backdrop's included, which never reads it.
+- **The lens on a backdrop.** A toned backdrop ran the whole glass shader over
+  the full screen (the SDF gradient, three normalizes, two `pow`) to add
+  nothing.
+- **Fine reads of a blur.** A pane over a backdrop read the backdrop's
+  quarter-resolution blur nine times per pixel to soften it by 2 dp, and once
+  per pixel along the dispersion.
+
+What the engine does about each:
+
+1. **The blur is put off until it is drawn** (`generateHook`, Android 17).
+   While glass is on, the hook on `generateTemporaryImage` answers in the
+   filter's place: it hands RenderEngine the snapshot back, untouched.
+   `drawBlurRegion` then sees a "blurred" image that is the input, and makes
+   what it is about to draw, at the radius it draws it at (`blurCached`, one
+   per source and radius per frame). Whenever Android does the drawing (stock
+   mode, a backdrop left to Android, any region handed back) the blur Android
+   asked for is made first (`drawWithAndroidsBlur`). RenderEngine draws a
+   region with every blur straight after asking for it; if a build ever asks
+   and does not draw, the engine notices at the next request and stops
+   putting blurs off until SurfaceFlinger restarts. `lazyBlur=0` is the old
+   behaviour.
+2. **A toned backdrop has a shader of its own** (`glass_tone.sksl`): one
+   child, one read, the same SDF. Line for line it is the glass shader with
+   every lens term at zero, and the two draw the same pixels (VERIFIED.md).
+   It does not name the snapshot, so nothing is copied for it. While the blur
+   is still fading in, the glass shader draws the backdrop as before, since
+   that cross-fade does read the snapshot. `toneShader=0` turns it off.
+3. **A pane over a backdrop makes its blur from the backdrop's** (`paneBlur`).
+   Nothing behind such a pane is sharper than the backdrop's blur, so its own
+   blur at radius R is the backdrop's (radius B) blurred by sqrt(R^2 - B^2)
+   more: the filter run on a quarter-resolution image, a sixteenth of the
+   pixels, sampled at 16 px to the texel. Nothing reads the snapshot after the
+   backdrop is drawn, so there is no copy. `own` is the old path (a second
+   full blur and the copy); `through` makes nothing and uses the backdrop's
+   blur for both reads, which is cheaper still and visibly less frosted. The
+   shader reads a blurred see-through child coarsely: four softening taps for
+   nine (none once the backdrop is blurred at three times `softenDp`), one
+   dispersion tap per dp for one per pixel.
+4. **A pane under another layer's backdrop reads a light blur**
+   (`coveredPanes`, `composite_memory.h`). With the shade open over a home
+   screen of glass icons, the launcher's panes were drawn in full, snapshot
+   copy included, and then blurred by the shade. The engine remembers which
+   layers the last two composites blurred, in order, and which drew a
+   backdrop over the whole output; a pane with no backdrop of its own, in a
+   layer that had one above it both times, reads a blur of the snapshot at
+   half that backdrop's radius where it read the snapshot. That grows the
+   backdrop's own blur of it by under 12% and is the path of 3 from there. A
+   wrong guess lasts one composite: the frame after a shade vanishes without
+   animating shows what is behind the icons' glass blurred by a few pixels.
+   Two composites, not one, because outputs take turns: while one app is
+   recorded or cast at the display's size, a composite without the shade
+   runs between every two of the display's, and with a memory of one each
+   would be taken for what the other follows, on every frame.
+5. **Most of a large pane takes a short way through the shader** (`deep`).
+   Past the refraction band, the rim light and the sheen (`deepBand`) a
+   fragment is undisplaced with t = 1: no gradient, normalize, `pow` or
+   dispersion. And the interior no longer reads the blurred child twice.
+   That is what the text of the shader says. On the Poco F1 a pane with its
+   band a third as wide cost what it did before (VERIFIED.md, v0.4.20), which
+   is where the lean builds below come from.
+6. **A pane outside the layer's visible bounds draws nothing**: a Quick
+   Settings page not swiped to, launcher pages either side. It keeps its place
+   in the merge memory and costs no blur and no shader.
+
+What is left is the copy for panes that do show the snapshot: home screen
+icons, a keyboard, the volume panel. On the AVD's GPU it is the whole
+difference between such a pane and Android's blur of the same region (about
+0.5 ms a frame; with a child that is not the snapshot the glass costs what
+stock does).
+
+7. **That copy can be of the panes' bounds only** (`snapshotCopy=bounds`,
+   `sharp_bounds.h`; off by default). Skia copies the whole output because a
+   draw names the snapshot. If the engine copies the part the panes read
+   itself, before anything is drawn into the output
+   (`SkImage_Base::makeSubset` through `SkCanvas::baseRecorder`, both
+   optional, Android 17), and the panes read that copy, nothing names the
+   snapshot and the full copy is never made. The first pane of a layer has to
+   decide before the others arrive, so the copy covers where the layer's
+   panes read in the last frame, grown by 32 px, and is made only when they
+   stood still for two frames and together read under 60% of the output: a
+   keyboard, a volume panel, a toast. A pane outside the copy reads the
+   snapshot, as before. On the AVD it draws the same pixels and brings a
+   volume panel to what Android's blur costs. It is not the default because
+   the copy is an unbudgeted texture, allocated and freed every frame, and
+   what that costs on a phone's driver has not been measured; and it does
+   nothing for a home screen, whose icons read most of the output between
+   them.
+
+8. **A pane is drawn by the leanest build of the shader that fits it**
+   (`leanShader`, v0.4.20; `effectFor`). The glass shader decides what a pane
+   does from its uniforms: no fringe when `dispersionAmount` is 0, no grain,
+   no press effect, a circular corner when its exponent is 2, a single read
+   where there is no softening. The generator builds it twice more with those
+   parts left out of the text (`lean`, and `lean_soft` which keeps the
+   softening), each line that is left being the full shader's line with the
+   zero put in, and the tone shader once more without its superellipse
+   corner. The glass builds declare the full shader's uniforms, used or not,
+   so one uniform block and one pair of children serve all three; the engine
+   checks at compile time that this Skia lays them out alike and otherwise
+   does not use the build. At the default settings every pane is drawn by one
+   of them. A fourth build, `deep`, is `lean` with no lens at all and draws
+   no glass: `debugPane=3` puts it in for measuring. The picture is the same to within one level
+   in 255 on under 1% of pixels (two programs round differently), and a few
+   pixels on the diagonal of a square corner, where two edges are equally
+   near, fall to the other edge. On a phone it is the largest single gain
+   so far: a Quick Settings frame on the F1 (Adreno 630, one layer, fringe
+   off) went from 15.3 ms to 10.6 over the lock screen and from 24.6 to
+   14.1 with the launcher's icons under the shade, where Android's blur is
+   7.6 (VERIFIED.md, "v0.4.20 on both phones"). The full shader never ran
+   the left-out code for those panes, and the GPU charged for it anyway.
+
+9. **Three settings change the look** (the WebUI's Performance card,
+   `glassctl perf`). Everything above draws what was drawn before. These do
+   not. Two layers and full resolution, the best-looking values, are the
+   defaults; the colour fringe is off unless asked for.
+   - *Blur layers: one* (`paneBlur=through`). A pane mixes two pictures of
+     what is behind it, the screen and a blur of it. With one layer it reads
+     a single image for both. Over a backdrop that is the backdrop's blur, and
+     nothing more is made for the pane. With nothing blurred under it, it is
+     one blur of the snapshot, made before anything is drawn into the output,
+     so no copy either. That one blur stands for a mix of two pictures, and
+     its radius (`chosenViewRadius`) follows which of them the mix is closer
+     to: mostly see-through (clear glass, a blur share of 0.3 or less) gets
+     the lightest blur a quarter-resolution image holds still at, 4.5 dp,
+     because only that keeps what is behind readable; mostly blur (0.9 and
+     up, frosted) gets the pane's own blur, which is the same picture;
+     between them a smoothstep.
+   - *Edge colour fringe* (`fringe`, 0 since v0.4.20: it cost 11 ms a frame
+     on the F1's home screen for a detail a few pixels wide). On, the rim
+     walks up to sixteen reads a pixel along the refraction; off it is one
+     read. `prism` sets it for itself, and a value set by hand wins over the
+     preset either way. In the presets that leave `lensBlur` automatic
+     (`regular`, `frosted`, `prism`, `edge`) the lens's own reads are mixed
+     away entirely once a pane's blur reaches `lensBlurRef` (12), the fringe
+     with them, so on such a pane the walk was paid for and never seen.
+   - *See-through resolution: quarter* (`glassResolution=quarter`). With two
+     layers, a pane with nothing blurred under it reads that lightest blur in
+     the screen's place and makes its own blur from the same image, as a pane
+     over a backdrop does: no copy, coarse reads.
+
+   A choice waits for the pane's blur to have faded in: until then the shader
+   cross-fades the sharp screen in, as stock does, and a blur that came on at
+   once would pop.
+
+`persist.sys.glass.stats=1` logs, once a second, what was made and drawn per
+frame (blurs by who made them, snapshot copies, panes by path).
+`harness/bench.sh` and `harness/ab.sh` time fixed scenes with it
+(`BenchActivity`: a backdrop that scrolls every frame under a window of blur
+regions laid out from the region maps measured on alioth), and
+`harness/shots.sh` with `shotdiff.py` compare what two engines draw.
+
 ## The module (Track B, shipping form)
 
 `module/` builds a flashable KernelSU / Magisk module, ~3.4 MB.
@@ -663,17 +836,24 @@ Framework behaviours the companion changes:
 
 ### What a region costs
 
-Per layer with blur, per frame, SkiaRenderEngine makes one blur *generation*
-per distinct radius, over the layer's whole bounds clipped to the display, not
-over the region (`cachedBlurs`, seeded by the layer's own background blur).
-Then it makes one `drawBlurRegion` per region, which with the engine is one
-glass shader pass over that region's rect. So:
+Per layer with blur, per frame, stock SkiaRenderEngine makes one blur
+*generation* per distinct radius, over the layer's whole bounds clipped to the
+display, not over the region. Then it makes one `drawBlurRegion` per region,
+which with the engine is one glass shader pass over that region's rect. With
+glass on, the engine makes the generations itself, and fewer of them ("What a
+frame costs", above). So:
 
-- N tiles at one radius cost one full-screen blur generation plus N small
-  shader passes. The generation is saved only on frames where their radius
-  equals the shade's. They default to the framework radius (100 dp: 263 px on
-  the AVD) against the shade's 89 (AVD) or 77 (alioth). `app.radius` can match
-  the shade, but the shade's radius animates with the expansion.
+- N tiles in the shade cost N small shader passes and one blur of the
+  backdrop's own quarter-resolution blur (a sixteenth of the pixels of a
+  generation), whatever radius they ask for: the framework's 100 dp (263 px
+  on the AVD) against the shade's 89 (AVD) or 77 (alioth). Before blurs were
+  made to order they cost a full-screen generation.
+- Android 17 draws no blur at all for a layer once the blur requests of
+  layers whose owner is not privileged pass ten (CompositionEngine's
+  `Output.cpp`, `kMaxBlurRequests`, b/399120953): each region counts, and so
+  does a background blur. SystemUI and the recents launcher hold permissions
+  that exempt them. A third-party launcher or any app in the module's scope
+  would lose every region on screen with the eleventh.
 - Regions force GPU composition. The open shade is GPU-composited anyway, but the
   home screen otherwise need not be: a folder region costs a GPU composition on
   every launcher frame (page scrolls, app-launch animations), and it blurs only
@@ -686,9 +866,11 @@ glass shader pass over that region's rect. So:
 - Off-screen pager pages are still regions (QS page 2: four), one call each
   that draws nothing visible.
 
-Measured on the A17 AVD with `companion/tools/cost.sh`: TimeStats RenderEngine
-time per composited frame over 6 QS open/close cycles, two passes in opposite
-orders. This is SwiftShader, so only the ratios carry over:
+Measured on the A17 AVD with `companion/tools/cost.sh`, before blurs were made
+to order: TimeStats RenderEngine time per composited frame over 6 QS
+open/close cycles, two passes in opposite orders. This is SwiftShader, so only
+the ratios carry over (VERIFIED.md has the same cycle on a real GPU, before
+and after):
 
 | | ms per frame |
 |---|---|
@@ -791,8 +973,57 @@ through a JVMTI agent standing in for the Xposed framework.
 which the AVD's SystemUI would refuse (a signature permission), are tested there.
 
 ## Still open
-- Cost measured only on an emulator GPU (+0.66 ms on a full-screen region).
-  Needs a real-device pass.
+- On a phone glass costs three to ten times Android's blur, and what it costs
+  is not what the AVD showed (VERIFIED.md, "Where the glass's time goes on a
+  phone"). alioth (Adreno 650, 120 Hz), home screen swiped: 2.1 ms a frame
+  for Android's blur, 13.2 for glass, 8.8 with See-through resolution at
+  Quarter, 7.8 with one Blur layer, all three with the colour fringe on, the
+  default until v0.4.20. The F1 (Adreno 630, 60 Hz): 3.2, 31.8, 20.1, 19.8,
+  and with the fringe off 20.5 for glass and 16.5 with one layer. The Performance settings
+  are the difference between holding the refresh rate and not, and even the
+  fastest misses a quarter of alioth's frames while a home screen is dragged.
+  What is left was measured by drawing the panes flat and not at all
+  (`debugPane`, VERIFIED.md): of what panes add to a frame, the glass
+  shader costs 3.5 ms more than the flat one (home screen), 6.2 (Quick
+  Settings) and 9.0 (app drawer) on alioth, and 9.5 on the F1's home screen;
+  a draw per pane is 2.1 to 2.9. Neither is a setting:
+  - The glass shader. It is not the lens band as the shader's text has it.
+    On the F1's home screen (one layer, fringe off, v0.4.19) a read of the
+    blur costs about 0.2 ms a frame over all the panes; a band a third as
+    wide, which puts most pixels on the `deep` path, changed nothing; and
+    with the lens off and one read, 7.5 of the 9.5 ms were still there
+    (VERIFIED.md, v0.4.20). The arithmetic written for those cases is a
+    fraction of the full path's, so the GPU was paying for code a branch
+    should have skipped. The lean builds (item 8) tested that on the F1 and
+    it held: three quarters of what glass panes cost over flat ones in Quick
+    Settings went with the left-out code, most likely with its texture reads
+    (the tone shader, whose lean build loses only arithmetic, gained
+    nothing). What that leaves there: 1.1 ms for the lens, 0.4 for the
+    see-through read and the tone chain, 1.4 for drawing the panes at all.
+    Next in the same direction: `lean_soft`, which draws the panes that
+    soften (two layers), still holds both softening kernels, nine taps and
+    five, where a pane uses one; and a pane that is all interior could have
+    a build without the lens. Both wait for home-screen numbers, which
+    v0.4.20 does not have yet on either phone. The baked lens (for each
+    shape, the bend, the rim light and the edge drawn once into an image the
+    pane's shader reads) could save at most that 1.1 ms and stays shelved.
+  - In the presets that leave `lensBlur` automatic, a pane whose blur is at
+    `lensBlurRef` or more shows nothing of its sharp child, yet names it:
+    the screen is copied and read for nothing. Drawing such a pane with its
+    blur as both children would be the same picture.
+  - The render thread's CPU: about 0.06 to 0.15 ms a pane, because every pane
+    is a Skia draw of its own where Android's blur batches a layer's regions
+    into one. Panes of one size on a grid (launcher icons, Quick Settings
+    tiles) could share their uniforms, with the pane's place worked out in
+    the shader from a lattice, and Skia would then merge them.
+  Panes under an open shade (the launcher's icons, 6 of the 10.8 ms glass
+  adds to alioth's Quick Settings) still run the whole shader, less the
+  fringe and the softening since v0.4.17. Under a heavy backdrop they could
+  be drawn flat; under the toned one alioth uses (27 px) they still show.
+- The engine takes about 0.3 s to find its symbols and hook when
+  SurfaceFlinger starts (318 ms on the Poco F1), before SurfaceFlinger's own
+  start-up. The installer resolves the same symbols from the same binary and
+  could hand the engine the addresses.
 - The companion has only run under its dev loader on the A17 AVD. LSPosed on
   A17, crDroid's Launcher3QuickStep at run time (folders, widgets, and icons in
   the "Minimal" style), crDroid's notification cards and heads-ups (LSPosed only),
