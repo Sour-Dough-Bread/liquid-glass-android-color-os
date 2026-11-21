@@ -343,7 +343,7 @@ void drawGlassScaledKind(void* self, SkCanvas* canvas, const SkRRect* region, ui
 //
 // The engine's own calls into SurfaceFlinger are indirect too (BLR through
 // the resolved pointers), so each must land on a `bti c`, `bti jc` or
-// `paciasp`/`pacibsp`. On all 21 BTI-built surfaceflingers in the corpus every
+// `paciasp`/`pacibsp`. On all 22 BTI-built surfaceflingers in the corpus every
 // function the engine calls starts with one: the compiler keeps a landing pad
 // on anything whose address can escape. landsOnPad() checks that again on the
 // running build. libglassengine.so is not BTI-built, so its own pages are never

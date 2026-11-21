@@ -1178,12 +1178,12 @@ which the AVD's SystemUI would refuse (a signature permission), are tested there
   could also drop or reorder plain arguments of a function it sees every
   caller of. None of the bound functions on alioth do (read off the
   disassembly), but a new target deserves the same look.
-- Branch protection. 21 of the 64 surfaceflingers in the corpus are built with
+- Branch protection. 22 of the 66 surfaceflingers in the corpus are built with
   BTI and PAC (the Pixel 8 and later from Android 17 QPR1, EvoX 12.x and
   Lineage for garnet, the FP6, the S22, Nothing's Qualcomm builds, Motorola's
-  mona), and on an ARMv9 core bionic maps their code guarded: an indirect
+  mona and ctwo), and on an ARMv9 core bionic maps their code guarded: an indirect
   branch must land on a `bti` or `paciasp`. The engine's calls into SurfaceFlinger do, since every
-  function it calls starts with one in all 21 (checked at start, and a function
+  function it calls starts with one in all 22 (checked at start, and a function
   without one would lose the guard on its first page instead). frida's way
   back from its trampoline into the hooked function lands on an ordinary
   instruction, so the engine takes the guard off the pages it patches before

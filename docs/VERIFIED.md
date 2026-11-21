@@ -4045,3 +4045,271 @@ ANDROID_SERIAL=$S harness/phone_ab.sh home 3 \
 # two layers, the default: full against lean_soft
 ANDROID_SERIAL=$S harness/phone_ab.sh home 3 full=paneBlur=,leanShader=0 lean=paneBlur=
 ```
+
+## Many SurfaceFlingers: the firmware survey (2026-11-21 and 22)
+
+After the module was posted on Reddit, users of other ROMs reported "Flash
+failed": Evolution X (EvoX) on Android 17 on a Pixel 8 and on garnet, an
+unnamed AOSP ROM, Samsung's One UI 9 and OnePlus's ColorOS 17. To see what
+breaks where, 66 `surfaceflinger` binaries were collected from official
+firmware and the shared resolver was run over all of them. Nothing in this
+section ran on a phone. The binaries and the per-family reports
+(`captures/sf-corpus/reports/<family>.md`) are under `captures/sf-corpus/`,
+which git ignores because it holds ROM files.
+
+### The corpus
+
+Each build has a directory, `captures/sf-corpus/<family>/<build>/`, with its
+`surfaceflinger`, the build.props that could be read, and `info.json`. Most
+were read with HTTP range requests: the payload manifest, then only the
+operations whose blocks `debugfs` or `dump.erofs` read, each sha256-checked.
+
+| family | builds | distinct | what | from |
+|---|---|---|---|---|
+| `pixel` | 19 | 15 | Google's OTAs, AP3A (A15, Oct 2024) to CP4A (A17 QPR2, Nov 2026), Tensor G1 to G6 | dl.google.com |
+| `lineage` | 16 | 13 | LineageOS 22.2 (A15), 23.2 (A16 QPR2), 24.0 (A17); Qualcomm, Tensor, Exynos, MediaTek | download.lineageos.org, whole zips |
+| `evox_crdroid` | 9 | 9 | EvoX 11.10 and 11.11 (A16 QPR2), 12.4 (A17); one crDroid 13.1 | cdn.evolution-x.org |
+| `top5` | 9 | 9 | Infinity-X 4.2, PixelOS 17.0, Lunaris 3.13, AxionOS 2.4, /e/OS 4.4.2 and 4.5.1, a TrebleDroid GSI | the ROMs' SourceForge projects, servers and GitHub |
+| `nothing` | 8 | 7 | Nothing OS 3.2 (A15), 4.1 (A16), 5.0 (A17); Qualcomm, MediaTek | android.googleapis.com |
+| `motorola` | 5 | 5 | moto g 2025 (A15, A16), moto g stylus 2025 (A16), edge 60 fusion and edge 50 ultra (A17) | mirrors.lolinet.com, every block checked against the AVB hashtree |
+
+"Distinct" is by sha256. `top5` holds the five most-used custom ROMs other
+than LineageOS, crDroid and EvoX, plus the GSI. The one crDroid binary,
+`crdroid-13.1-alioth-2026-11-01`, built 2026-11-08, is a system image left
+on disk by the original Android 17 bring-up. SourceForge, crDroid's only
+host, answered every download with a Cloudflare challenge.
+
+`engine/test/corpus.sh` builds `resolve_test` from the tree's resolver, the
+same table and rules as glasscheck and the engine, and runs it on every
+`surfaceflinger` in the corpus. At `db0d8c6` it prints `66 pass, 0 fail`.
+All 66 carry MiniDebugInfo, with 16,052 to 30,485 function symbols.
+v0.4.20's code ran on 42 of them, the `evox_crdroid`, `lineage`,
+`nothing` and `top5` builds, as a host glasscheck or as `resolve_test` at
+`e11c8cb`. That commit follows the tag and changes neither the engine nor
+glasscheck. v0.4.20 fails 10 of the 42: the five EvoX 12.4 builds, both
+`lineage-22.2`, both `Galaga_V3.2` and `eos_FP5_4.4.2-a15_20261027`.
+
+### Hook shapes
+
+| shape | builds | which |
+|---|---|---|
+| `(radius, alpha)` | 22 | every Android 15 build; the Android 16 builds `BP2A.250805.005-shiba`, the three Nothing OS 4.1, `kansas_W1VKS36H.9-12-9-21`, `mona_W1VAS36.62-22-16-18`, `eos_FP5_4.5.1-a16_20261117` and the GSI |
+| `(radius, scale, alpha)` | 39 | `pixel` from `BP3A.251105.015-shiba` on, `lineage` 23.2 and 24.0, Nothing OS 5.0, `scout_A171VCH.41-15`, `ctwo_A171SUVH.42-20-1`, the three EvoX 11.x, the crDroid build and the other six `top5` builds |
+| `(radius, scale, alpha, material)` | 5 | `evox-garnet-12.4-20261117`, `evox-marble-12.4-20261112`, `evox-myron-12.4-20261116`, `evox-panther-12.4-20261110`, `evox-venus-12.4-20261120` |
+
+The scaled shape already exists at Android 16 QPR1, which "Android 16 QPR2
+changes drawBlurRegion" had no build of: `BP3A.251105.015-shiba` and
+`axionos_tetris_2.4_20260222` are BP3A builds and have it.
+
+The third shape is EvoX's. "renderengine: Draw blur regions as Liquid
+Glass" (redducc) appends `int32_t material` to `drawBlurRegion`, so its name
+ends `..._ESD_i`. EvoX merged it on 2026-11-05 (`frameworks_native` `cnb`,
+`4d6548bcc2ed`), and crDroid pushed it on 2026-11-11 at 21:52 UTC (`17.0`,
+`a45f7f0c4d69`). glasscheck built from the `v0.4.20` tag prints, for
+`evox-garnet-12.4-20261117`:
+
+```
+  MISSING   drawBlurRegion: expected exactly one known shape, found 0
+FAIL  this build's Skia is not one the engine can drive.
+```
+
+and the installer stops with "Flash failed". All five EvoX 12.4 builds fail
+the same way, and nothing else is missing on them. That reproduces the
+garnet report. Against `lineage-24.0-20261118-garnet`, from the same AOSP
+tag, every Skia function the engine calls has the same size and
+`drawBlurRegion` grows from 2692 to 4140 B, so the difference is EvoX's
+source. The Pixel 8 report cannot be reproduced from official builds: there
+is no official EvoX Android 17 build for shiba, and
+`evox-shiba-11.11-20260915` passes. crDroid's current alioth build is dated
+2026-11-15, after the push; it could not be fetched.
+
+### What the resolver had to learn
+
+| finding | builds | at `db0d8c6` |
+|---|---|---|
+| a third `drawBlurRegion` shape, `..._ESD_i` | the five EvoX 12.4 | a replacement of its own, which passes the material on whenever it calls the original; which regions the glass takes is under the materials below |
+| a second `drawBlurRegion` taking an `SkPath`, which shows as drift; the RRect one is now a thin wrapper around `setupBlurPaint`, and the `SkPath` callers sit behind a flag compiled false (pixel.md, from the disassembly) | the five Pixel CP4A | nothing: the RRect overload still resolves and is hooked as before |
+| `SkRuntimeEffect::findUniform` and `findChild` inlined away; only `std::find_if` over their lambdas remains. The pinned header cannot stand in: `fUniforms` is at +0x38 on Android 15 (loaded at 0x2265d8 in `lineage-22.2-20261118-enchilada`'s `drawBlurRegion`) and at +0x40 from Android 16, where `SkRuntimeEffect` gained an `SkString fName` | 11, all Android 15: `AP3A.241005.015-shiba`, the five Pixel `BP1A`, both `lineage-22.2`, both `Galaga_V3.2`, `eos_FP5_4.4.2-a15_20261027` | lays the uniforms out from the shader's declarations and checks the total against `uniformSize()`. That layout has run only on glass17, forced with `debug.glass.noFindUniform=1`: the six shaders validated and the panes were pixel-identical to a run without it |
+| v0.4.20's x8 check gave up on functions that take x8: x8 passed on through a `bl`, a conditional branch before x8 is read, `f946200a` (`ldr x10, [x0, #0xc40]`) misread as writing x8 | `bl`: `SkImage::makeShader` in both `Galaga_V3.2` and `eos_FP5_4.4.2-a15_20261027`; branch: `SkRuntimeEffect::makeShader` in both `Galaga_V3.2`, `KawaseBlurFilter::generateTemporaryImage` on several A17 builds; `f946200a`: `SkCanvas::getTotalMatrix` on `Pong_V3.2-250708-2227`, both Qualcomm Nothing OS 4.1 and `eos_FP5_4.4.2-a15_20261027` | follows `b` and `bl`, walks both sides of a branch, decodes load classes; `MakeForShader(SkString)`, which really does not take x8 on `Pong_V3.2-250708-2227`, `kansas_V1VK35.22-125`, Lunaris and the crDroid build, is used through its `Options` form, as it has been since v0.4.1 |
+| every `generateTemporaryImage` gained a `LayerSwapChain*`; `KawaseBlurDualFilterV2` reads it (`mov x21, x6` at 0x647bcc in `CP4A.261105.040.A1-shiba`), so a call with the old arguments would hand it garbage | the five Pixel CP4A | matches generators exactly, so none resolves there; one does (`regen=yes`) on every other A17 build and Lunaris, 27 in all |
+| ROM blur filters | `KawaseDarkmoon`: EvoX 12.4, crDroid, Lunaris; AxionOS's `GlassBlurFilter`: both Infinity-X | both in the generator table |
+| RenderEngine keeps a layer's blur between frames, so the sharp snapshot `lazyBlur` hands back in place of Android's blur would be kept as the blur on later frames, and the glass would be sharp | Pixel's `BlurCache`, compiled into both CP3A but off (`lower_blur_fps` compiled false) and on in the five CP4A; a `std::deque<BlurCacheEntry>` in both Infinity-X | a marker, found on all 9; there Android's blur is never put off |
+| Graphite on stock, which v0.4.20's property check misses, read from the FlagManager accessors' code and the vendor build.props | both CP3A `shiba` (Pixel 8, Android 17 QPR1), where a rollout flag compiled true meets the vendor's `debug.renderengine.graphite_preview_optin=true`; CP4A `shiba` and `husky` (QPR2), where the vendor sets `ro.surface_flinger.renderengine_graphite_vulkan`. `CP4A.261105.040.D1-cubs` uses `debug.renderengine.graphite=true`, which v0.4.20 catches. No Lineage build runs Graphite by default | stands the glass down where `SkCanvas::recorder()` is non-null; it resolves on all 66 |
+| Stock Glass built into RenderEngine by the ROM patch | none | refuses a SurfaceFlinger with a `GlassFilter` symbol |
+| the vendor declares no window blur: `ro.surface_flinger.supports_background_blur` is not 1, so SurfaceFlinger makes no blur filter | nine: unset in every partition of both `lineage-22.2`, all three `Galaga` and both `kansas`; 0 in both `Asteroids` | nothing; the resolver passes and there is nothing to draw |
+
+`infinityx_tokay_4.2_20261119` ships `persist.sys.sf.disable_blurs=1`. Both
+`Metroid` builds set the blur property at early boot from vendor init
+scripts, so their build.props alone mislead; the installer's warning reads
+the live property. Pixel, Lineage, Nothing and Motorola carry only AOSP's
+blur filters, and EvoX draws its glass inside `drawBlurRegion`.
+
+### Branch protection
+
+22 of the 66 binaries carry a `GNU_PROPERTY_AARCH64_FEATURE_1_AND` note with
+BTI and PAC, feature bits 3 (`llvm-readelf -n`: "aarch64 feature: BTI, PAC"):
+
+| family | builds |
+|---|---|
+| `evox_crdroid` | `evox-garnet-11.11-20260917`, `evox-garnet-12.4-20261117`, `evox-marble-12.4-20261112`, `evox-myron-12.4-20261116` |
+| `lineage` | `lineage-23.2-20261006-r0s`, `lineage-23.2-20261116-FP6`, `lineage-24.0-20261118-garnet` |
+| `motorola` | `ctwo_A171SUVH.42-20-1`, `mona_W1VAS36.62-22-16-18` |
+| `nothing` | `Asteroids_B4.1-260810-1153`, `Asteroids_C5.0-261106-1007`, `Metroid_B4.1-260814-1733`, `Metroid_C5.0-260924-2115`, `Pong_V3.2-250708-2227` |
+| `pixel` | `CP3A.260905.009-shiba`, `CP3A.261005.005-shiba`, `CP4A.261105.040.A1-frankel`, `CP4A.261105.040.A1-husky`, `CP4A.261105.040.A1-shiba`, `CP4A.261105.040.D1-cubs` |
+| `top5` | `lunaris_duchamp_3.13_2026111305`, `pixelos_garnet_17.0_20261114` |
+
+Every `garnet` build has it, under three ROMs. On `shiba` only Google's
+builds from CP3A on have it. On a CPU that implements BTI, bionic maps such
+code with `PROT_BTI`, and an indirect branch into it must land on a landing
+pad. The reports name such CPUs behind `FP6`, `r0s`, `marble`, `myron`,
+`duchamp` and the six Pixel builds. garnet's Cortex-A78 and A55 lack BTI, as
+do alioth's Kryo 585 and the F1's Kryo 385.
+
+In all 22, every function the engine calls through a pointer starts on
+`bti c`, `bti jc`, `paciasp` or `pacibsp`, where a BLR may land, as a scratch
+tool (`captures/sf-corpus/work/main/btipads.cpp`) found over the resolved
+symbols. The hooks go the other way: the vendored frida-gum 17.17.0 returns
+into the hooked function with `br x16` or `br x17`, not onto a landing pad.
+Its `mprotect` drops the guard from the page it patches, so only a patch
+that ends at a page boundary returns into a guarded page (lineage.md, from
+the library's disassembly). Since `38b57cc` the engine drops the guard from
+the pages between each hook target and 32 bytes past it before patching
+(`dropBranchGuard`), and reports the state in `sys.glass.bti`.
+
+### The blurred image's scale
+
+`drawBlurRegion` maps Android's blurred image over blurRect by
+`BlurFilter::kInverseInputScale`, 4 in AOSP. The engine assumed 4 up to
+`963f45d`. From `db0d8c6` it reads the scale out of `drawBlurRegion` and the
+functions it calls before it hooks (`engine/src/blur_scale.cpp`), and
+glasscheck prints it at install. `engine/test/blur_scale_test --corpus`,
+which `corpus.sh` also runs, checks the probe's answer on all 66 binaries
+against what each family is known to do. At `db0d8c6` none differs:
+
+| where the scale was found | builds |
+|---|---|
+| a constant in `drawBlurRegion` | 54 |
+| a constant in a function it calls | 10: the five EvoX 12.4 (`getShaderTransform`), the five Pixel CP4A (`setupBlurPaint`, then `getShaderTransform`) |
+| per axis, no constant | 2: `infinityx_a53x_4.2_20261109`, `infinityx_tokay_4.2_20261119` |
+| not found | 0 |
+
+Every constant is 4 but one. `lunaris_duchamp_3.13_2026111305` loads 4.54545
+from the literal at 0x33c60, a `kInputScale` of 0.22, which Lunaris set for
+every filter on 2026-10-21 (`4482a538`, Lunaris-AOSP/frameworks_native,
+branch 16.2). Infinity-X's `drawBlurRegion` has no constant and three
+`fdiv`. It divides blurRect by the image's size per axis, and its
+`GlassBlurFilter` defaults to a scale of 0.1667 (`persist.sys.sf.gb_scale`).
+By arithmetic, an engine that assumes 4 samples Lunaris's blur 12% shrunk
+toward blurRect's top-left, 288 px off at the bottom of a 2400 px rect, and
+Infinity-X's about a third off once blur is on (top5.md). Neither error has
+been seen on a screen.
+
+### Evolution X materials, read from source
+
+EvoX's and crDroid's code was read, not built or run, with `gh api` in their
+GitHub orgs, including all 1,627 commits EvoX's `frameworks_base` carries
+above LineageOS (evox_materials.md). EvoX force-pushed that repo on
+2026-11-21; its SHAs here are from 15:22 UTC.
+
+EvoX's `cb8fe002693b` gives `BackgroundBlurDrawable` a `setMaterial(int)`,
+0 to 11. The value travels as a 15th float of each region through the hidden
+`SurfaceControl.Transaction#setBlurRegions` into `android::BlurRegion`, and
+`drawLayersInternal` passes it on. Only EvoX's SystemUI sets one:
+
+| material | sent by | needs EvoX's Liquid Glass switch |
+|---|---|---|
+| -1 | Dynamic Island popups, asking for a plain blur; `drawLayersInternal` also passes it for every layer's own blur but the shade window's | yes, for the popups |
+| 0 | every region by default; the shade window's own blur | no |
+| 1 to 4 | the ColorOS Quick Settings panel: tiles off and on, pill bodies, sliders, buttons; dark and light | no |
+| 5, 6 | the shade window behind the ColorOS panel; the glass behind the dual-shade overlays | no for the first, yes for the second |
+| 7, 8 | notification cards in the ColorOS look, lock screen only | yes |
+| 9, 10 | a pinned heads-up with a region, so on current builds the lock screen | yes |
+| 11 | the dock; nothing sends it | |
+
+Materials 1 to 6 appear with the Liquid Glass switch off: the ColorOS panel
+style (`qs_panel_style` 2) is enough, with window blur usable. No material
+carries a colour. Up to `963f45d` the engine left every material above 0 to
+the ROM. From `db0d8c6` glass mode draws materials 1 to 11 as any other
+region, a pane or a backdrop by its geometry, and `romMaterials=1` leaves
+them to the ROM (`glassTakesMaterial()` in `engine/src/glass_draw.cpp`).
+That path has not run: glass17 is AOSP and sends no material.
+
+crDroid never sends a material. It took only the `frameworks_native` commit,
+and its `nativeSetBlurRegions` still reads 14 floats, so every region arrives
+as 0. Since 2026-11-15, notification cards are blur regions only on the lock
+screen in both ROMs (EvoX `9e7599b49ca2`, crDroid `555f219fc42d`). Cards in
+the unlocked shade and heads-ups over apps no longer make regions, and the
+companion's shade-card glass relies on those. `c947909` gives the companion
+an after-hook on `ActivatableNotificationView.usesBlurredBackground()` that,
+off the lock screen, answers as AOSP does: under `app.shade` for a card,
+`app.headsup` for a pinned heads-up.
+
+### Live mode, on the emulator only
+
+`module/live.sh` loads the engine without the module's mount. It puts the
+engine and a copy of the ROM's `surfaceflinger` that names it by absolute
+path in a tmpfs, binds the copy over `/system/bin/surfaceflinger` in init's
+mount namespace, and restarts SurfaceFlinger, which restarts zygote too.
+Every run was on glass17 (the A17 AVD, x86_64 userdebug) with su from
+`adb shell` (rootless.md):
+
+| run | result |
+|---|---|
+| `on`, enforcing, with a test double for `magiskpolicy --live --apply` | 11.84 s; `sys.glass.engine=glass`; glass drawn |
+| `on`, permissive | 11.57 s |
+| `off` | 4.58 to 5.01 s over three runs |
+| `on`, enforcing, no policy tool | refused in 0.17 s, before anything was created |
+| engine and glasscheck from one build | hook installed in 3 ms from the tmpfs cache, against 107 and 114 ms from symbols |
+| engine truncated to 64 KiB | the linker refused it; reverted 12 s after the restart |
+| SurfaceFlinger killed twice within 90 s | the watcher reverted to the ROM's SurfaceFlinger |
+| uid 2000, as Shizuku in ADB mode | refused: needs root |
+
+### The ROM patch, compiled only
+
+`rom/make_patch.sh <branch>` writes a frameworks/native patch. A
+`GlassFilter` wraps whichever blur filter SkiaRenderEngine picked and draws
+with `glass_draw.cpp` and `sk_shared.cpp`, which `db0d8c6` split out of
+`glass_engine.cpp` for the module and the patch to share. It changes three
+existing files and hooks nothing, so it needs no `execmod`, which AOSP's
+policy neverallows (rootless.md). On EvoX and crDroid it passes each
+region's material on and makes `setDisplay` virtual, and `lensReach` on
+EvoX, so their own glass still works in stock mode. Six patches were made
+from `db0d8c6`'s `glass_draw.cpp` (sha256 `035bf4184922`):
+
+| tree | base commit | files, insertions, deletions |
+|---|---|---|
+| AOSP `android17-release` | `ae266dcb706d` | 22, 7320, 1 |
+| AOSP `android16-qpr2-release` | `fcbde2bcff56` | 22, 7320, 1 |
+| LineageOS `lineage-24.0` | `a96adf2c6e62` | 22, 7320, 1 |
+| LineageOS `lineage-23.2` | `26f530caefb3` | 22, 7320, 1 |
+| EvoX `cnb` | `dfe5f014b7b2` | 22, 7325, 3 |
+| crDroid `17.0` | `c5f9e4d3fe25` | 22, 7323, 2 |
+
+With NDK r29 clang++ and renderengine's `-Werror` flags, all six compile
+against AOSP's headers and Skia, define every `glass::` and `GlassFilter`
+symbol they use (`llvm-nm`), pass `git apply --check` and `git am`, and
+carry a byte-identical shader (rom_patch.md). No fork's own Skia was used,
+SkiaRenderEngine.cpp compiled only through a probe, and Soong never saw the
+patch. Only the split ran, in the module on glass17: in five scenes both
+modes drew the same pixels below the status bar as before it, except where
+overlapping regions came in another order, which varies between restarts.
+
+### Not verified
+
+- BTI handling on a CPU that implements BTI. `dropBranchGuard` and frida's
+  way back have never run on one, and alioth and the F1 cannot show it.
+- The material shape at runtime: the hook, glass mode drawing materials 1 to
+  11, and `romMaterials=1`. No EvoX 12.x or crDroid 13.x build has booted
+  with the engine, and no crDroid binary with the int was examined.
+- The companion's card-region hook (`c947909`) on an EvoX or crDroid build
+  from after 2026-11-15.
+- The Graphite canvas check on a Graphite device, and the glass on Ganesh
+  Vulkan, which both Lineage Exynos builds use.
+- The blur scale probe in an arm64 SurfaceFlinger: on glass17 it logs
+  `4 assumed`, as it reads A64 code only. The glass on Lunaris or Infinity-X.
+- Live mode on a phone: a real root manager's policy tool, whose `ksud` and
+  `apd` forms were only read in upstream source; the arm64 build; KernelSU's
+  and Magisk's su namespaces; and `live.sh mount` at post-fs-data.
+- The ROM patch in a full tree: no Soong build, no boot.
+- Firmware not in the corpus: Samsung's and OnePlus's own, from two of the
+  Reddit reports; crDroid beyond the alioth baseline; AxionOS 2.9.

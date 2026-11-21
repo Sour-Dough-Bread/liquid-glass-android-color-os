@@ -145,7 +145,7 @@ bool ElfView::collectFunctions(const char* symtab_name, SymbolOrigin origin,
 
         for (size_t k = 0; k < count; ++k) {
             // Copied out: the symbol table inside MiniDebugInfo is often not
-            // 8-byte aligned (58 of 65 builds surveyed), and a reference to a
+            // 8-byte aligned (in most builds surveyed), and a reference to a
             // misaligned Elf64_Sym is undefined behaviour even where the CPU
             // would not mind.
             Elf64_Sym sym;
