@@ -24,6 +24,7 @@
 // engine is, so what the UI shows is what the compositor will draw.
 
 #include "../src/abi_check.h"
+#include "../src/blur_scale.h"
 #include "../src/elf_syms.h"
 #include "../src/glass_params.h"
 #include "../src/sf_cache.h"
@@ -278,6 +279,9 @@ int main(int argc, char** argv) {
             printf("  hook     %s at 0x%llx, %llu bytes\n", glass::sf::kHookShapes[res.shape].label,
                    static_cast<unsigned long long>(t.value),
                    static_cast<unsigned long long>(t.size));
+            // What the engine will read at boot, before it hooks (blur_scale.h).
+            const glass::BlurScale scale = glass::probeBlurScaleInFile(path, t);
+            printf("  scale    %s\n", scale.how.c_str());
         }
         printf("  lighter backdrop blur: %s\n",
                res.canRegenerateBlur() ? "available" : "not on this build");

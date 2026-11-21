@@ -140,11 +140,16 @@ bool ElfView::collectFunctions(const char* symtab_name, SymbolOrigin origin,
 
         const char* strtab = reinterpret_cast<const char*>(base_ + strs->sh_offset);
         const size_t strtab_size = strs->sh_size;
-        const auto* syms = reinterpret_cast<const Elf64_Sym*>(base_ + s->sh_offset);
+        const uint8_t* sym_bytes = base_ + s->sh_offset;
         const size_t count = s->sh_size / sizeof(Elf64_Sym);
 
         for (size_t k = 0; k < count; ++k) {
-            const Elf64_Sym& sym = syms[k];
+            // Copied out: the symbol table inside MiniDebugInfo is often not
+            // 8-byte aligned (58 of 65 builds surveyed), and a reference to a
+            // misaligned Elf64_Sym is undefined behaviour even where the CPU
+            // would not mind.
+            Elf64_Sym sym;
+            memcpy(&sym, sym_bytes + k * sizeof(Elf64_Sym), sizeof(sym));
             if (ELF64_ST_TYPE(sym.st_info) != STT_FUNC) continue;
             if (sym.st_value == 0) continue;
             if (sym.st_name == 0 || sym.st_name >= strtab_size) continue;
@@ -364,19 +369,14 @@ std::vector<ExecSegment> readExecSegments(const std::string& path) {
     std::vector<ExecSegment> out;
     const int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC);
     if (fd < 0) return out;
-    Elf64_Ehdr eh{};
-    if (pread(fd, &eh, sizeof(eh), 0) == static_cast<ssize_t>(sizeof(eh)) &&
-        memcmp(eh.e_ident, ELFMAG, SELFMAG) == 0 && eh.e_ident[EI_CLASS] == ELFCLASS64 &&
-        eh.e_ident[EI_DATA] == ELFDATA2LSB && eh.e_phentsize == sizeof(Elf64_Phdr) &&
-        eh.e_phnum > 0 && eh.e_phnum <= 64) {
-        std::vector<Elf64_Phdr> ph(eh.e_phnum);
-        const size_t ph_bytes = ph.size() * sizeof(Elf64_Phdr);
-        if (pread(fd, ph.data(), ph_bytes, static_cast<off_t>(eh.e_phoff)) ==
-            static_cast<ssize_t>(ph_bytes)) {
-            for (const Elf64_Phdr& p : ph) {
-                if (p.p_type == PT_LOAD && (p.p_flags & PF_X) != 0 && p.p_filesz > 0) {
-                    out.push_back({p.p_vaddr, p.p_filesz, p.p_offset});
-                }
+    std::vector<Elf64_Phdr> ph;
+    if (readProgramHeaders(fd, &ph)) {
+        for (const Elf64_Phdr& p : ph) {
+            // Readable as well as executable: the engine reads this code in
+            // its own process, where an execute-only segment would fault.
+            if (p.p_type == PT_LOAD && (p.p_flags & PF_X) != 0 && (p.p_flags & PF_R) != 0 &&
+                p.p_filesz > 0) {
+                out.push_back({p.p_vaddr, p.p_filesz, p.p_offset});
             }
         }
     }

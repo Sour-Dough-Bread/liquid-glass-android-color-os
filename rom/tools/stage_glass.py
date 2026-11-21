@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 """Fills libs/renderengine/skia/filters/glass/ for rom/make_patch.sh.
 
-  - the drawing code: engine/src's glass_draw.{h,cpp} and sk_shared.cpp when
-    the engine has been split, else what rom/split/split_engine.py cuts out
-    of glass_engine.cpp and sk_bridge.cpp;
-  - the engine sources it needs as they are (glass_params.cpp,
-    crash_guard.cpp) and every engine header any of it includes, found by
-    following the includes, the generated shader among them;
+  - engine/src's drawing code as it is: glass_draw.{h,cpp}, sk_shared.cpp,
+    glass_params.cpp, crash_guard.cpp, and every engine header any of it
+    includes, found by following the includes, the generated shader among
+    them. The module's own sources (glass_engine.cpp, sk_bridge.cpp, the
+    symbol resolver) stay behind;
   - the glue in rom/glue/glass/ (the native Skia bridge, Android.bp).
 
 Every source the Android.bp builds has to be there, and nothing else.
@@ -17,17 +16,14 @@ usage: stage_glass.py <engine/src> <dest>
 import pathlib
 import re
 import shutil
-import subprocess
 import sys
 
 ROM = pathlib.Path(__file__).resolve().parent.parent
 GLUE = ROM / "glue" / "glass"
-SPLIT = ROM / "split" / "split_engine.py"
 
 # Taken from engine/src as they are.
-VERBATIM = ["glass_params.cpp", "crash_guard.cpp"]
-# The split: engine/src's own once it has them, else split_engine.py's.
-SPLIT_FILES = ["glass_draw.h", "glass_draw.cpp", "sk_shared.cpp"]
+SOURCES = ["glass_draw.h", "glass_draw.cpp", "sk_shared.cpp", "glass_params.cpp",
+           "crash_guard.cpp"]
 
 
 def die(msg):
@@ -41,18 +37,10 @@ def main():
     dest = pathlib.Path(sys.argv[2])
     dest.mkdir(parents=True, exist_ok=True)
 
-    have_split = [f for f in SPLIT_FILES if (src / f).exists()]
-    if len(have_split) == len(SPLIT_FILES):
-        for f in SPLIT_FILES:
-            shutil.copyfile(src / f, dest / f)
-        print("stage_glass: drawing code from engine/src (split)")
-    elif have_split:
-        die(f"engine/src has {have_split} but not all of {SPLIT_FILES}")
-    else:
-        subprocess.run([sys.executable, "-I", str(SPLIT), str(src), str(dest)], check=True)
-        print("stage_glass: drawing code cut out of glass_engine.cpp (transitional)")
-
-    for f in VERBATIM:
+    missing = [f for f in SOURCES if not (src / f).exists()]
+    if missing:
+        die(f"{src} has no {', '.join(missing)}")
+    for f in SOURCES:
         shutil.copyfile(src / f, dest / f)
     for f in GLUE.iterdir():
         shutil.copyfile(f, dest / f.name)

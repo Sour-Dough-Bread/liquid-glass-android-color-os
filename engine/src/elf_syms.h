@@ -125,9 +125,10 @@ constexpr uint32_t kAarch64FeatureBti = 1u << 0;
 constexpr uint32_t kAarch64FeaturePac = 1u << 1;
 bool readAarch64Features(const std::string& path, uint32_t* features);
 
-// The executable PT_LOAD segments of an ELF64 file: where the link-time
-// addresses of code live, and at which file offsets. Headers only, like
-// readGnuBuildId. Empty on any parse failure.
+// The readable, executable PT_LOAD segments of an ELF64 file: where the
+// link-time addresses of code live, and at which file offsets. An
+// execute-only segment is left out, since reading it in process would fault.
+// Headers only, like readGnuBuildId. Empty on any parse failure.
 struct ExecSegment {
     uint64_t vaddr = 0;
     uint64_t filesz = 0;

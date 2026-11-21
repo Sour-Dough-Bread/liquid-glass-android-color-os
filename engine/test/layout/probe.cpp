@@ -60,7 +60,7 @@ E(SkRefCntBase_fRefCnt, offsetof(SkRefCntBase, fRefCnt))
 I(Options_size, sizeof(SkRuntimeEffect::Options))
 I(Options_allowPrivateAccess, offsetof(SkRuntimeEffect::Options, allowPrivateAccess))
 // Never read: the engine calls findUniform and uniformSize, or lays the
-// uniforms out itself (glass_engine.cpp, uniformOffsets). Android 16 added
+// uniforms out itself (glass_draw.cpp, uniformOffsets). Android 16 added
 // SkString fName in front of them, so they move: +0x38/+0x50 on Android 15,
 // +0x40/+0x58 from 16. An inline uniforms() through the pin would read the
 // wrong vector on Android 15.

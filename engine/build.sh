@@ -113,9 +113,13 @@ PYEOF
 # include/config supplies the unqualified SkUserConfigManual.h it pulls in.
 INC=(-I "$HERE/vendor/skia/android" -I "$HERE/vendor/skia" -I "$HERE/vendor/skia/include/config")
 
+# glass_draw.cpp and sk_shared.cpp are the drawing code, which a ROM build
+# (rom/) compiles too; the rest is the module's.
 SRC=("$HERE/src/elf_syms.cpp" "$HERE/src/sf_symbols.cpp" "$HERE/src/sf_resolve.cpp" "$HERE/src/sf_cache.cpp" "$HERE/src/xz_inflate.cpp" \
-     "$HERE/src/sk_bridge.cpp" "$HERE/src/glass_params.cpp" "$HERE/src/glass_engine.cpp" \
-     "$HERE/src/exec_probe.cpp" "$HERE/src/abi_check.cpp" "$HERE/src/crash_guard.cpp")
+     "$HERE/src/sk_bridge.cpp" "$HERE/src/sk_shared.cpp" "$HERE/src/glass_params.cpp" \
+     "$HERE/src/glass_draw.cpp" "$HERE/src/glass_engine.cpp" \
+     "$HERE/src/exec_probe.cpp" "$HERE/src/abi_check.cpp" "$HERE/src/crash_guard.cpp" \
+     "$HERE/src/blur_scale.cpp")
 
 # XZ Embedded is C, not C++: its enum arithmetic does not compile under a C++
 # front end. Built separately and linked in.

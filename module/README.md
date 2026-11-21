@@ -255,6 +255,7 @@ are listed here under the names the engine knows them by. `lazyBlur`,
 | `glassResolution` | `full` | **See-through resolution** (above): `quarter` has glass with nothing blurred under it read a quarter-size, lightly blurred copy of the screen |
 | `softenTaps` | 9 | how many times a pixel of clear glass reads the screen to soften it by `softenDp`. `5` is cheaper on a phone and slightly rougher on sharp edges seen through the glass (ghosted outlines at 2x zoom). Only matters with two layers at full resolution |
 | `debugPane` | 0 | for measuring only: `1` draws every pane flat (its blur in its shape, no glass), `2` draws none, `3` draws a pane that has no softening with the glass shader less its lens (no bend, no rim; needs `leanShader`), so that `harness/phone_ab.sh` can tell what the lens, the rest of the glass shader and a draw each cost |
+| `romMaterials` | 0 | Evolution X 12.x tags some blur regions with a material of its own and draws them as its glass: its ColorOS-style Quick Settings panel (tiles and the panel behind them) and, with its Liquid Glass switch on and the ColorOS look, notification cards and heads-ups on the lock screen and the glass behind the dual shade. In glass mode Stock Glass draws those too, in its own look. `1` leaves them to Evolution X's glass while Stock Glass draws everything else. crDroid 13.x's SurfaceFlinger has the same code, but crDroid's SystemUI never tags a region, so this changes nothing there |
 | `stats` | 0 | `1` logs once a second what was blurred and drawn per frame (below) |
 
 ## Requirements

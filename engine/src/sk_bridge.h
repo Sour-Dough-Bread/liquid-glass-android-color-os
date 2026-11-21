@@ -195,7 +195,7 @@ struct Bridge {
 
     // findUniform and findChild may be absent: some builds inline both away,
     // and the engine then lays the uniforms out from the shader's own
-    // declarations (glass_engine.cpp, uniformOffsets). uniformSize may not:
+    // declarations (glass_draw.cpp, uniformOffsets). uniformSize may not:
     // it is what that layout is checked against.
     bool compileReady() const {
         return (MakeForShader || MakeForShaderOpts) && SkStringCtor && SkStringDtor &&
@@ -210,7 +210,10 @@ struct Bridge {
     }
 };
 
-// Compiles SkSL using SurfaceFlinger's own Skia.
+// Compiles SkSL using SurfaceFlinger's own Skia. The module's is in
+// sk_bridge.cpp; a ROM that builds the glass in has its own
+// (rom/glue/glass/skia_native.cpp). The helpers below are in sk_shared.cpp,
+// which both build.
 //
 // Returns the effect with one owned reference, deliberately never released: it
 // is cached for the process lifetime, so there is nothing to free and no need
@@ -240,20 +243,22 @@ inline void releaseData(const Bridge& b, void** slot) {
     *slot = nullptr;
 }
 
-// Local matrix for the BLURRED child. BlurFilter::kInputScale is 0.25, so it
-// needs a x4 scale, then the blurRect offset (the blurred image covers only
-// blurRect), then the zoom, then the inverse canvas matrix. Reproduces
+// Local matrix for the BLURRED child. BlurFilter::kInputScale is 0.25 on AOSP,
+// so it needs a x4 scale, then the blurRect offset (the blurred image covers
+// only blurRect), then the zoom, then the inverse canvas matrix. Reproduces
 // BlurFilter.cpp's file-static getShaderTransform() exactly, read out of the
 // target's own compiled code and, for the zoom, AOSP android17-release.
 //
 // `zoom` is drawBlurRegion's zoomScale (A16 QPR2 onward); 1 everywhere else.
 //
-// `texel` is how many output pixels one pixel of the image covers: 4 for a blur
-// of the snapshot, 16 for a blur made from such a blur (a pane's, derived from
-// the backdrop's). Every blur filter maps by that scale from blurRect's top
-// left, whatever size its image came out at.
+// `texel_x` and `texel_y` are how many output pixels one pixel of the image
+// covers along each axis: 1 / kInputScale for a blur of the snapshot (4 on
+// AOSP, 4.545 on Lunaris 3.13), its square for a blur made from such a blur (a
+// pane's, derived from the backdrop's), and blurRect over the image's size
+// where drawBlurRegion maps per axis (Infinity-X 4.x). Every blur filter maps
+// by that scale from blurRect's top left, whatever size its image came out at.
 SkMatrix blurredTransform(const Bridge& b, const SkCanvas* canvas, const SkRect& blur_rect,
-                          float zoom, float texel = 4.0f);
+                          float zoom, float texel_x, float texel_y);
 
 // Local matrix for the SHARP child. Not the same recipe with scale 1: the sharp
 // input is a snapshot of the whole surface, already in device space at the

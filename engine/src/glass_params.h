@@ -107,7 +107,7 @@ enum ParamId : size_t {
     // engine
     P_radius,  // != 0 overrides the compositor's blur radius. Debug aid from M0.
     P_bypass,  // != 0 forces stock whatever the mode says. Kept for old scripts.
-    // what the glass costs (glass_engine.cpp, "Blur made to order")
+    // what the glass costs (glass_draw.cpp, "Blur made to order")
     P_lazyBlur,    // 0 = Android blurs every region before the engine sees it
     P_paneBlur,    // a pane's blurred read: 0 own, 1 derive, 2 through; or the names
     P_toneShader,  // 0 = a toned backdrop runs the whole glass shader
@@ -121,6 +121,7 @@ enum ParamId : size_t {
     P_rimFrost,         // 1 = the rim as frosted as the inside; 0 = the frost fades out to it
     P_debugPane,        // measuring aid: 1 draws panes flat (the tone shader), 2 not at
                         // all, 3 with the glass shader less its lens
+    P_romMaterials,     // 1 = regions with an Evolution X material are left to the ROM
     P_stats,       // != 0 logs what the engine made and drew, once a second
     P_count,
 };

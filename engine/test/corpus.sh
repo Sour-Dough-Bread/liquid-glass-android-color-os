@@ -26,4 +26,14 @@ while IFS= read -r sf; do
 done < <(find "$CORPUS" -name surfaceflinger -type f | sort)
 echo
 echo "$pass pass, $fail fail"
-[ "$fail" -eq 0 ]
+
+# The blur scale each build maps Android's blur with (src/blur_scale.h),
+# against what the survey found per family.
+echo
+g++ -std=c++17 -O1 -Wall -Wextra -Wno-unused-parameter -include cstdarg \
+  -o "$WORK/blur_scale_test" "$HERE/blur_scale_test.cpp" "$HERE/../src/blur_scale.cpp" \
+  "$HERE/../src/elf_syms.cpp" "$HERE/../src/sf_symbols.cpp" "$HERE/../src/sf_resolve.cpp" \
+  "$HERE/../src/sf_cache.cpp" "$HERE/../src/abi_check.cpp"
+scale=0
+"$WORK/blur_scale_test" --corpus "$CORPUS" | tail -n 1 || scale=1
+[ "$fail" -eq 0 ] && [ "$scale" -eq 0 ]

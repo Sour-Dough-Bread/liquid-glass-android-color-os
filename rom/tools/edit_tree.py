@@ -2,7 +2,9 @@
 """The three edits rom/make_patch.sh makes to existing frameworks/native files.
 
   libs/renderengine/skia/filters/BlurFilter.h
-      drawBlurRegion becomes virtual, so GlassFilter can take it over.
+      drawBlurRegion becomes virtual, so GlassFilter can take it over; so do
+      setDisplay and lensReach where a fork has them (Evolution X, crDroid),
+      so that they reach the filter GlassFilter wraps.
   libs/renderengine/skia/SkiaRenderEngine.cpp
       includes GlassFilter.h, and wraps the filter right after the constructor
       picks it (the `switch (blurAlgorithm)`).
@@ -48,16 +50,31 @@ def matching_brace(text, open_index):
     die("unbalanced braces")
 
 
+# The members SkiaRenderEngine calls on its filter that GlassFilter takes
+# over: (name, what the declaration starts with, whether every tree has it).
+# rom/tools/blur_api.py checks that SkiaRenderEngine calls nothing else
+# GlassFilter would have to pass on.
+VIRTUAL = [
+    ("drawBlurRegion", r"void\s+drawBlurRegion\(", True),
+    ("setDisplay", r"void\s+setDisplay\(", False),
+    ("lensReach", r"float\s+lensReach\(", False),
+]
+
+
 def edit_blur_filter_h(root, log):
     p = root / RE / "skia/filters/BlurFilter.h"
     t = p.read_text()
-    if re.search(r"^\s*virtual\s+void\s+drawBlurRegion\(", t, re.M):
-        log.append(f"{p.relative_to(root)}: drawBlurRegion is already virtual")
-        return
-    m = once(r"^(\s*)void drawBlurRegion\(", t, "BlurFilter.h")
-    t = t[:m.start()] + m.group(1) + "virtual void drawBlurRegion(" + t[m.end():]
+    for name, decl, required in VIRTUAL:
+        if re.search(rf"^[ \t]*virtual\s+{decl}", t, re.M):
+            log.append(f"{p.relative_to(root)}: {name} is already virtual")
+            continue
+        if not required and not re.search(rf"^[ \t]*{decl}", t, re.M):
+            continue
+        m = once(rf"^([ \t]*){decl}", t, "BlurFilter.h")
+        at = m.start() + len(m.group(1))
+        t = t[:at] + "virtual " + t[at:]
+        log.append(f"{p.relative_to(root)}: {name} made virtual")
     p.write_text(t)
-    log.append(f"{p.relative_to(root)}: drawBlurRegion made virtual")
 
 
 def edit_skia_render_engine(root, log):

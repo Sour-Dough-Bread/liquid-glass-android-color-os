@@ -49,12 +49,19 @@ struct StockDraw {
     float alpha;
     const SkRect* blurRect;
     const sk_sp<SkImage>* input;
+    int material;
 };
 
 void drawStock(void* cookie, void* blurred_slot, uint32_t radius) {
     const auto* d = static_cast<const StockDraw*>(cookie);
+    sk_sp<SkImage> blurred = sk_ref_sp(*static_cast<SkImage**>(blurred_slot));
+#if STOCKGLASS_DRAW_MATERIAL
     d->filter->drawBlurRegion(d->canvas, *d->region, radius, d->zoom, d->alpha, *d->blurRect,
-                              sk_ref_sp(*static_cast<SkImage**>(blurred_slot)), *d->input);
+                              std::move(blurred), *d->input, d->material);
+#else
+    d->filter->drawBlurRegion(d->canvas, *d->region, radius, d->zoom, d->alpha, *d->blurRect,
+                              std::move(blurred), *d->input);
+#endif
 }
 
 } // namespace
@@ -127,18 +134,51 @@ sk_sp<SkImage> GlassFilter::generate(SkiaGpuContext* context, const uint32_t rad
 }
 #endif
 
+#if STOCKGLASS_DRAW_MATERIAL
+void GlassFilter::drawBlurRegion(SkCanvas* canvas, const SkRRect& effectRegion,
+                                 const uint32_t blurRadius, const float zoomScale,
+                                 const float blurAlpha, const SkRect& blurRect,
+                                 sk_sp<SkImage> blurredImage, sk_sp<SkImage> input,
+                                 int32_t material) {
+    draw(canvas, effectRegion, blurRadius, zoomScale, blurAlpha, blurRect, blurredImage, input,
+         material);
+}
+#else
 void GlassFilter::drawBlurRegion(SkCanvas* canvas, const SkRRect& effectRegion,
                                  const uint32_t blurRadius, const float zoomScale,
                                  const float blurAlpha, const SkRect& blurRect,
                                  sk_sp<SkImage> blurredImage, sk_sp<SkImage> input) {
+    draw(canvas, effectRegion, blurRadius, zoomScale, blurAlpha, blurRect, blurredImage, input,
+         glass::draw::kNoMaterial);
+}
+#endif
+
+void GlassFilter::draw(SkCanvas* canvas, const SkRRect& effectRegion, uint32_t blurRadius,
+                       float zoomScale, float blurAlpha, const SkRect& blurRect,
+                       const sk_sp<SkImage>& blurredImage, const sk_sp<SkImage>& input,
+                       int material) {
     // The drawing code reads each image through a slot holding it, as the
-    // module's hook is handed them; these borrow the references held above.
+    // module's hook is handed them; these borrow the references the caller's
+    // sk_sp arguments hold.
     SkImage* blurred = blurredImage.get();
     SkImage* in = input.get();
-    StockDraw stock{mInner, canvas, &effectRegion, zoomScale, blurAlpha, &blurRect, &input};
+    StockDraw stock{mInner, canvas, &effectRegion, zoomScale, blurAlpha, &blurRect, &input,
+                    material};
     glass::draw::blurRegion(canvas, &effectRegion, blurRadius, zoomScale, blurAlpha, &blurRect,
-                            &blurred, &in, &drawStock, &stock);
+                            &blurred, &in, material, &drawStock, &stock);
 }
+
+#if STOCKGLASS_SET_DISPLAY
+void GlassFilter::setDisplay(const std::string& namePlusId) {
+    mInner->setDisplay(namePlusId);
+}
+#endif
+
+#if STOCKGLASS_LENS_REACH
+float GlassFilter::lensReach(const SkRRect& region, int32_t material) const {
+    return mInner->lensReach(region, material);
+}
+#endif
 
 } // namespace skia
 } // namespace renderengine

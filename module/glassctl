@@ -86,7 +86,7 @@ is_switch() {
   case "$1" in
     mode|preset|enabled|follow_theme|variant|fillBlurScale|materialTint) return 0 ;;
     lazyBlur|paneBlur|toneShader|coveredPanes|snapshotCopy|leanShader|stats) return 0 ;;
-    fringe|glassResolution|softenTaps|debugPane) return 0 ;;
+    fringe|glassResolution|softenTaps|debugPane|romMaterials) return 0 ;;
     frostR|frostG|frostB|accentR|accentG|accentB)
       # Owned by glass-theme.sh while it is following the theme.
       [ "$(getprop $P.follow_theme)" != "0" ] && return 0 ;;

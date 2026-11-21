@@ -12,9 +12,9 @@ Generated patches are not kept in git. Make one for the tree you are patching
 
 ## What the patch does
 
-RenderEngine picks one blur filter at start-up (Kawase, Gaussian or the Kawase
-dual filter). The patch wraps that filter in a `GlassFilter`, which takes over
-`drawBlurRegion`:
+RenderEngine picks one blur filter at start-up (Kawase, Gaussian, the Kawase
+dual filter, or a fork's own). The patch wraps that filter in a `GlassFilter`,
+which takes over `drawBlurRegion`:
 
 - With `persist.sys.glass.mode=glass`, each blur region is drawn with the
   Liquid Glass shader: backdrops (the shade, a dialog's blur) and panes
@@ -30,18 +30,22 @@ dual filter). The patch wraps that filter in a `GlassFilter`, which takes over
 - If SurfaceFlinger dies while drawing glass, the next one starts with
   `persist.sys.glass.mode=stock` (the module's crash guard). If RenderEngine
   runs on Graphite, the glass stands down at the first region it would draw.
+- On Evolution X and crDroid, whose `drawBlurRegion` takes each region's
+  material and whose own Liquid Glass comes with it, the material is passed
+  through: below.
 
 The drawing code is the module's, compiled as it is. The patch adds:
 
 | File | What it is |
 | --- | --- |
 | `libs/renderengine/skia/filters/GlassFilter.{h,cpp}` | the wrapper ([glue/](glue/)) |
-| `libs/renderengine/skia/filters/GlassFilterApi.h` | one line: which blur call this tree's `BlurFilter` has |
-| `libs/renderengine/skia/filters/glass/` | `librenderengine_glass`: the engine's drawing code, shader, parameter tables and crash guard from `engine/src`, and a Skia bridge that calls the linked Skia ([glue/glass/](glue/glass/)) |
+| `libs/renderengine/skia/filters/GlassFilterApi.h` | which `BlurFilter` this tree has, found by [tools/blur_api.py](tools/blur_api.py) |
+| `libs/renderengine/skia/filters/glass/` | `librenderengine_glass`: the engine's drawing code (`glass_draw.{h,cpp}`, `sk_shared.cpp`), shader, parameter tables and crash guard from `engine/src`, and a Skia bridge that calls the linked Skia ([glue/glass/](glue/glass/)) |
 
 and changes three existing files:
 
-- `BlurFilter.h`: `drawBlurRegion` becomes `virtual`.
+- `BlurFilter.h`: `drawBlurRegion` becomes `virtual`, and so do `setDisplay`
+  and `lensReach` where the tree has them.
 - `SkiaRenderEngine.cpp`: includes `GlassFilter.h`, and after the
   `switch (blurAlgorithm)` in the constructor wraps the filter with
   `mBlurFilter = GlassFilter::wrap(mBlurFilter, mRuntimeEffectManager);`.
@@ -50,12 +54,43 @@ and changes three existing files:
 
 `BlurFilter.cpp` and the filters themselves are not touched.
 
+### Evolution X and crDroid
+
+Evolution X 12.x (`Evolution-X/frameworks_native`, branch `cnb`) and crDroid
+13.x (`crdroidandroid/android_frameworks_native`, branch `17.0`) carry their
+own Liquid Glass. Their `drawBlurRegion` takes the region's material last:
+-1 for a window's own blur, 0 for the notification shade's, and 1 to 11 for
+the materials a client asks for (11 is the dock). Their filter also has
+`setDisplay`, which picks their glass per display, and Evolution X's has
+`lensReach`, which says how far past a region their glass reads.
+
+- `GlassFilter` overrides `drawBlurRegion` with the material and hands it to
+  the drawing code. Which materials StockGlass draws is decided in one place,
+  `glassTakesMaterial()` in `engine/src/glass_draw.cpp`, the same for the
+  module and the patch. In glass mode StockGlass draws every region,
+  materials 1 to 11 included, unless `persist.sys.glass.romMaterials=1`
+  leaves those to the ROM's own glass. A material above 11 always stays the
+  ROM's. A region StockGlass leaves goes to the wrapped filter with its
+  material and the radius it asked for.
+- In stock mode every region goes to the wrapped filter with its material,
+  so the ROM's own Liquid Glass works as before when its user has it on.
+- `setDisplay` and `lensReach` become `virtual` and `GlassFilter` passes them
+  on to the filter it wraps; without that, they would reach only
+  `GlassFilter`'s own `BlurFilter` part, and the ROM's glass would never be
+  switched on.
+
+`tools/blur_api.py` checks that `SkiaRenderEngine.cpp` calls nothing else on
+its filter that `GlassFilter` would have to pass on. A fork that does stops
+the script with the name of the call.
+
 ## Making the patch
 
 ```sh
 cd /path/to/stock-glass
 rom/make_patch.sh android17-release        # AOSP, fetched from android.googlesource.com
 rom/make_patch.sh lineage-24.0             # LineageOS, fetched from github.com/LineageOS
+rom/make_patch.sh evox-cnb                 # Evolution X, branch cnb
+rom/make_patch.sh crdroid-17.0             # crDroid, branch 17.0
 rom/make_patch.sh mytree --tree /path/to/rom/frameworks/native   # any fork, from your checkout
 ```
 
@@ -77,10 +112,8 @@ Checked so far:
 | AOSP `android16-qpr2-release` | `fcbde2bcff56` | |
 | LineageOS `lineage-24.0` | `a96adf2c6e62` | renderengine identical to AOSP 17; either patch applies |
 | LineageOS `lineage-23.2` | `26f530caefb3` | one backported hunk in `SkiaRenderEngine.cpp`, away from the patch; the AOSP 16 QPR2 patch applies too |
-
-A tree that ships Evolution X's own Liquid Glass (its `drawBlurRegion` takes
-an extra `kind`) needs the patch reworked; the module handles that ROM at
-runtime instead.
+| Evolution X `cnb` | `dfe5f014b7b2` | material, `setDisplay`, `lensReach`; `KawaseDarkmoon` in the switch |
+| crDroid `17.0` | `c5f9e4d3fe25` | material and `setDisplay`; `KawaseDarkmoon` in the switch |
 
 ## Applying it
 
@@ -161,18 +194,16 @@ Everything in it comes from this repository when the script runs:
 parameter tables, and `rom/glue/` for the wrapper. Change the engine, run the
 script again, and the patch carries the change.
 
-Until `engine/src` is split into a drawing half and a hooking half,
-[split/split_engine.py](split/split_engine.py) does the split on a copy: it
-keeps `glass_engine.cpp`'s drawing code verbatim, drops the hook, symbol
-resolution, boot guard and `install()`, and adds the small API in
-[split/glass_draw.h](split/glass_draw.h). Once `engine/src` has
-`glass_draw.{h,cpp}` and `sk_shared.cpp`, the script uses those and
-`rom/split/` goes.
+`engine/src` keeps the drawing half apart from the module's: `glass_draw.cpp`
+and `sk_shared.cpp` are what both build, behind the API in `glass_draw.h`;
+`glass_engine.cpp` (the hooks, symbol resolution, boot guard) and
+`sk_bridge.cpp` (the module's own Skia members and `compile()`) are the
+module's alone and never go into the patch.
 
 ## What has not been checked
 
 Every new and changed source compiles with `-Werror` and Soong's flags
-against the real headers of all four branches, using the NDK's clang
+against the real headers of all six branches, using the NDK's clang
 (`captures/sf-corpus/reports/rom_patch.md` has the details). Not done yet:
 a full ROM build, and running it on a phone. `SkiaRenderEngine.cpp` itself
 was checked through a stand-in that compiles the added lines against its

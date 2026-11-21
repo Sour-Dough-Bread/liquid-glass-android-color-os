@@ -562,12 +562,22 @@ adds an `SkPath` overload. Three pieces keep that manageable:
    dock), which EvoX draws as its glass whatever its Liquid Glass switch says.
    The switch, `persist.sys.evolution.liquid_glass`, is off unless something
    sets it (no build.prop does), so out of the box EvoX 12.x draws Android's
-   blur. The replacement draws StockGlass where AOSP would have drawn a plain
-   blur (material 0 and below), leaves the materials a client chose to EvoX,
-   and passes the `int` through on every call to the original. A replacement
-   for the QPR2 shape would call the original with whatever w7 held by then.
-   This shape is what "Flash failed" on EvoX meant: the installer refused a
-   shape it did not know, whether or not EvoX's glass was on.
+   blur. Only EvoX's SystemUI tags regions, through
+   `BackgroundBlurDrawable.setMaterial` (a 15th float of each region): its
+   ColorOS-style Quick Settings panel sends 1 to 6 with or without the switch;
+   with the switch on and the ColorOS look, lock-screen notification cards and
+   heads-ups send 7 to 10 and the glass behind the dual shade 5 or 6. Nothing
+   sends 11. crDroid took only the SurfaceFlinger commit: its framework sends
+   14 floats, so every region arrives as 0 or -1. No material carries a
+   colour; an active tile paints its own bubble over the glass. In glass mode
+   the replacement draws StockGlass for every region, materials included, and
+   a material region is a pane or a backdrop by its geometry like any other
+   (the ColorOS panel's full-window 5 and 6 are backdrops, its tiles panes).
+   `romMaterials=1` hands the materials 1 to 11 back to EvoX's glass. Every
+   call to the original passes the `int` through. A replacement for the QPR2
+   shape would call the original with whatever w7 held by then. This shape is
+   what "Flash failed" on EvoX meant: the installer refused a shape it did not
+   know, whether or not EvoX's glass was on.
 3. **Resolve at install, verify at boot** (`engine/src/sf_cache.*`). glasscheck
    already reads the whole binary and inflates its MiniDebugInfo at install,
    so it writes down what it found: `libglassengine.symcache` next to the
@@ -636,6 +646,7 @@ in the module, and the engine draws it as a pane.
 | shade scrims | `com.android.systemui` | the `UNLOCKED` and `SHADE_LOCKED` `…statusbar.phone.ScrimState`s' `setShadePanelColor(int)` / `setNotificationScrimColor(int)` | the colour's alpha × `app.scrim`; with `app.scrimcolor` black, white or tint the behind scrim takes that colour and the notifications scrim is cleared, so the shade is one colour; `ScrimController.updateThemeColors()` and `applyAndDispatchState()` re-apply it on a switch |
 | notification cards | `com.android.systemui` | `com.android.internal.graphics.drawable.BackgroundBlurDrawable.setColor(int)` when its callback is a `…notification.row.NotificationBackgroundView` | the card fill's alpha × `app.cards`; the region is the framework's own |
 | heads-up notifications | `com.android.systemui` | after-hook on `…notification.row.ExpandableNotificationRow.usesTransparentBackground()` | true instead of false while a heads-up must stay on screen, when row transparency is on and not on the keyguard; LSPosed only |
+| card regions off the keyguard | `com.android.systemui` | after-hook on `…notification.row.ActivatableNotificationView.usesBlurredBackground()` | off the keyguard, false becomes what `usesTransparentBackground()` says, as on AOSP: crDroid and EvoX builds from 2026-11-15 keep card regions for the lock screen only. `app.shade` for a card, `app.headsup` for a pinned heads-up; LSPosed only |
 | QS brightness slider, crDroid's volume slider | `com.android.systemui` | `androidx.compose.material3.SliderDefaults.Track-mnvyFg4` (an instance method of `SliderDefaults.INSTANCE`) | `colors` (a `SliderColors`) remade with the active track's alpha × `app.accent` and the inactive track's × `app.fill`, thumb and ticks unchanged; a `drawBehind` on `modifier` draws a region at the track's bounds with its outer corner radius (the `cornerDp` argument); only a track in the shade's window (`TYPE_NOTIFICATION_SHADE`), not the volume or brightness dialogs |
 | text selection toolbar (Cut, Copy, Paste) | `com.android.systemui` | `…selectiontoolbar.app.ui.RemoteSelectionToolbar.show(ShowInfo)` | `ViewGlass` on its public `contentContainer` (the framework's `floating_popup_container`), shadow off; every app's toolbar, with no app in scope (below) |
 | text toasts | `com.android.systemui` | `android.widget.ToastPresenter.show(View, IBinder, IBinder, int, int, int, int, float, float, ITransientNotificationCallback, boolean)` (the framework class, in SystemUI's process) | `ViewGlass` on the toast's root (`text_toast`, background `toast_frame`), shadow off; only views holding SystemUI's `R.id.text`; the plate keeps `app.fill`, or `app.contrast` when its tone is not the theme's; every app's text toast, with no app in scope (below) |
@@ -864,6 +875,18 @@ opaque colour over the app below. The after-hook keeps the row's own drawable,
 region and translucent fill instead, and the engine draws it over the app. The
 A17 AVD's SystemUIGoogle has no `setBlurBackgroundEnabled`, so there the
 companion changes the scrims only.
+
+crDroid (`555f219fc42d`, first pushed 2026-11-15) and Evolution X
+(`9e7599b49ca2`) took the cards' regions away off the keyguard:
+`usesBlurredBackground()` gained `mOnKeyguard &&`, since "on the unlocked
+shade the translucent background already shows the window blur". Without a
+region a card in the shade, or a heads-up over an app, has no glass. In glass
+mode an after-hook answers off the keyguard as AOSP does
+(`usesTransparentBackground()`, under `app.shade` for a card and `app.headsup`
+for a pinned heads-up), and on a switch the companion sets each known row's
+region again, since `updateIfNeeded()` only does so when the transparency
+changed. On the keyguard the ROM's answer stands. crDroid's later commits that
+hide the regions of shelved rows and of a hidden stack apply as before.
 
 Framework behaviours the companion changes:
 
@@ -1175,14 +1198,17 @@ which the AVD's SystemUI would refuse (a signature permission), are tested there
   without a metamodule, no restart) is drafted in
   `captures/sf-corpus/reports/rootless.md` but not wired in: it needs
   post-mount.sh to count it as mounted, and a measured real boot.
-- The ROM patch (`rom/`) compiles against AOSP android17-release and
-  android16-qpr2-release and LineageOS 24.0 and 23.2, with each branch's own
-  headers and renderengine's `-Werror` flags, and applies with `git am`. It
-  has not been built in a full tree or booted. It cuts the drawing code out of
-  `glass_engine.cpp` with a script (`rom/split/`) until engine/src is split
-  for it. Evolution X 12.x (and crDroid 13.x) need a reworked patch, because
-  their `drawBlurRegion` takes a material. A ROM that carries it is refused by
-  the module's installer (the resolver looks for `GlassFilter`).
+- The ROM patch (`rom/`) compiles against six trees: AOSP android17-release
+  and android16-qpr2-release, LineageOS 24.0 and 23.2, Evolution X `cnb` and
+  crDroid `17.0` (whose `drawBlurRegion` takes a material, which the patch
+  passes on). It uses each branch's own headers and renderengine's `-Werror`
+  flags, and applies with `git am`. The two forks were compiled over AOSP
+  android17-release's Skia, not their own. It has not been built in a full
+  tree or booted. It takes the drawing code from engine/src as it is
+  (`glass_draw.cpp`, `sk_shared.cpp`); the blur-scale probe stays in the
+  module, so a ROM build maps blurs at 4, which all six trees use. A ROM that
+  carries the patch is refused by the module's installer (the resolver looks
+  for `GlassFilter`).
 - RenderEngine on Vulkan. Lineage 24 for the Galaxy S20 (x1s) sets
   `debug.renderengine.backend=skiavkthreaded` (Ganesh on Vulkan). The engine's
   draw has only run on Ganesh GL.

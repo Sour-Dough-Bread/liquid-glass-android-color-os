@@ -297,6 +297,14 @@ constexpr Spec kSpecs[] = {
     //      itself that is what the lens costs once it is really gone; against
     //      1, what the rest of the glass shader costs. Needs leanShader
     {"debugPane", 0.0f},
+    // Evolution X 12.x draws a blur region a client tagged with one of its
+    // materials (1 to 11: Quick Settings tiles and panel, notification cards
+    // and heads-ups, the dock) as its own glass, and so does crDroid 13.x's
+    // SurfaceFlinger, though crDroid's SystemUI never tags one. 0: in glass
+    // mode StockGlass draws them as it draws every other region. 1: the ROM
+    // draws them its own way in glass mode too. Stock mode leaves every
+    // region to the ROM either way.
+    {"romMaterials", 0.0f},
     {"stats", 0.0f},
 };
 // One entry per ParamId, in the same order: a missing one would shift every
