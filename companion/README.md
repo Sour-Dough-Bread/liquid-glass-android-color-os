@@ -73,7 +73,10 @@ dark wallpaper, light text over anything but a dark one), the widget keeps
 Notification cards and heads-ups get glass only where Android 17's notification
 row transparency is on (`Settings.Secure` `notification_row_transparency`; it is
 on on alioth): that is what makes each card a blur region. Heads-ups need
-LSPosed; the dev loader below cannot do that part. crDroid's own Settings → UI →
+LSPosed; the dev loader below cannot do that part. crDroid and Evolution X
+builds from 2026-11-15 on keep that region for cards on the lock screen only;
+in glass mode the companion gives cards in the shade and heads-ups their region
+back, again under LSPosed only. That part has not run on such a build yet. crDroid's own Settings → UI →
 Shade style → Glass also lightens the shade's scrim, with or without the
 companion.
 

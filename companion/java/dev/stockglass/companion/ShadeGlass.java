@@ -45,7 +45,18 @@ import java.util.WeakHashMap;
  *    opaque colour over the app below. An after-hook returns true instead
  *    while glass is on, so the heads-up keeps the same region and translucent
  *    fill as in the shade, and the engine draws it over the app. LSPosed only:
- *    the dev loader cannot replace a result.
+ *    the dev loader cannot replace a result;
+ *  - cards in the unlocked shade and heads-ups keep a region on ROMs that
+ *    keep card regions for the lock screen. crDroid (555f219fc42d, pushed
+ *    2026-11-15) and Evolution X (9e7599b49ca2) added mOnKeyguard to
+ *    ActivatableNotificationView.usesBlurredBackground(), since "on the
+ *    unlocked shade the translucent background already shows the window
+ *    blur". Under the companion that region is the card's glass, so off the
+ *    keyguard an after-hook answers as AOSP does, usesTransparentBackground()
+ *    (NotificationBackgroundView.setBlurBackgroundEnabled checks the flag
+ *    itself): app.shade for a card, app.headsup for a pinned heads-up. On the
+ *    keyguard the ROM's answer stands, and on AOSP the hook changes nothing.
+ *    LSPosed only, like the heads-up hook.
  *
  * A SystemUI without per-card blur (the A17 AVD's SystemUIGoogle has no
  * setBlurBackgroundEnabled) gets the scrim part only.
@@ -64,6 +75,10 @@ final class ShadeGlass {
     private static Class<?> background;
     private static Method setColor, updateThemeColors, applyState, updateIfNeeded;
     private static Field blurSupported, onKeyguard;
+    /** The card-region hook's reflection (installRegions), or null without it. */
+    private static Method usesBlurred, usesTransparent, setBlurEnabled, isPinned;
+    private static Field backgroundNormal, regionBlurSupported, regionOnKeyguard;
+    private static Class<?> rowClass;
     private static WeakReference<Object> controller;
     /** Each card drawable's colour as SystemUI last set it, before the cut. */
     private static final WeakHashMap<Drawable, Integer> cards = new WeakHashMap<>();
@@ -78,7 +93,10 @@ final class ShadeGlass {
         boolean cardsHooked = installCards(cl);
         boolean scrimHooked = installScrim(cl);
         boolean headsUpHooked = cardsHooked && installHeadsUp(cl);
-        if (cardsHooked || scrimHooked || headsUpHooked) Gate.onChange(ShadeGlass::gateChanged);
+        boolean regionsHooked = cardsHooked && installRegions(cl);
+        if (cardsHooked || scrimHooked || headsUpHooked || regionsHooked) {
+            Gate.onChange(ShadeGlass::gateChanged);
+        }
     }
 
     private static boolean installCards(ClassLoader cl) {
@@ -198,16 +216,67 @@ final class ShadeGlass {
         return true;
     }
 
+    /** See the class comment: a card's region in the unlocked shade, where the ROM drops it. */
+    private static boolean installRegions(ClassLoader cl) {
+        Method uses;
+        try {
+            Class<?> activatable = Class.forName(ACTIVATABLE, false, cl);
+            uses = activatable.getDeclaredMethod("usesBlurredBackground");
+            uses.setAccessible(true);
+            usesBlurred = uses;
+            usesTransparent = activatable.getDeclaredMethod("usesTransparentBackground");
+            usesTransparent.setAccessible(true);
+            backgroundNormal = field(activatable, "mBackgroundNormal");
+            regionBlurSupported = field(activatable, "mIsBlurSupported");
+            regionOnKeyguard = field(activatable, "mOnKeyguard");
+            setBlurEnabled = background.getMethod("setBlurBackgroundEnabled", boolean.class);
+            rowClass = Class.forName(ROW, false, cl);
+            isPinned = rowClass.getMethod("isPinned");
+        } catch (Throwable t) {
+            usesBlurred = null;
+            usesTransparent = null;
+            setBlurEnabled = null;
+            L.i("no ActivatableNotificationView.usesBlurredBackground of the expected shape ("
+                    + t.getClass().getSimpleName() + "); card regions stay as the ROM makes them");
+            return false;
+        }
+        XposedBridge.hookMethod(uses, new XC_MethodHook() {
+            @Override
+            protected void afterHookedMethod(MethodHookParam param) {
+                try {
+                    Object row = param.thisObject;
+                    rows.put(row, Boolean.TRUE);
+                    if (Boolean.TRUE.equals(param.getResult()) || regionOnKeyguard.getBoolean(row)) return;
+                    boolean pinned = rowClass.isInstance(row) && Boolean.TRUE.equals(isPinned.invoke(row));
+                    if (pinned ? !Gate.headsUp() : !Gate.shade()) return;
+                    // Through the subclass's override, and for a pinned
+                    // heads-up through the heads-up hook above.
+                    if (Boolean.TRUE.equals(usesTransparent.invoke(row))) param.setResult(Boolean.TRUE);
+                } catch (Throwable e) {
+                    L.once("card-region", "card region hook failed; cards keep the ROM's regions", e);
+                }
+            }
+        });
+        L.i("card regions hooked: ActivatableNotificationView.usesBlurredBackground"
+                + " (applies under LSPosed; the dev loader cannot replace a result)");
+        return true;
+    }
+
     /**
      * Main thread. Rows re-evaluate their transparency (a heads-up gains or
-     * drops its region), cards get their colour again through the hook, and
-     * the scrim controller re-reads the theme's colours and applies its state,
-     * so an open shade changes at once.
+     * drops its region) and whether they have a region at all (updateIfNeeded
+     * asks only when the transparency changed), cards get their colour again
+     * through the hook, and the scrim controller re-reads the theme's colours
+     * and applies its state, so an open shade changes at once.
      */
     private static void gateChanged() {
         for (Object row : rows.keySet().toArray()) {
             try {
-                updateIfNeeded.invoke(row);
+                if (updateIfNeeded != null) updateIfNeeded.invoke(row);
+                if (setBlurEnabled != null && regionBlurSupported.getBoolean(row)) {
+                    Object bg = backgroundNormal.get(row);
+                    if (bg != null) setBlurEnabled.invoke(bg, usesBlurred.invoke(row));
+                }
             } catch (Throwable e) {
                 L.once("row-update", "cannot refresh a notification row", e);
             }
