@@ -59,6 +59,11 @@ Under System Framework scope the hook loads in system_server on both, with no
 crashes. Vector added that scope by itself when 0.2 replaced 0.1 on the F1,
 but not on the F3.
 
+New in 0.2.2: notification cards keep their glass in the unlocked shade, and
+heads-ups over apps keep theirs, on Evolution X and crDroid builds from
+2026-11-15 on, which give a card a blur region only on the lock screen. It
+has not run on such a build yet; on other ROMs it changes nothing.
+
 App icons get glass only when they are themed: "Themed icons" in a Pixel
 build's wallpaper and style settings, the "Minimal" app icon style in crDroid's
 ThemePicker. Full-colour icons are left as they are. In the app drawer, only

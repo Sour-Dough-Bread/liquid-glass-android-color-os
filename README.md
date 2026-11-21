@@ -58,7 +58,7 @@ From a Poco F3 on crDroid 13.1, Android 17.
 | Build | Where |
 |---|---|
 | Module | [The latest release](https://github.com/capthndsme/liquid-glass-android/releases/latest), with its sha256 |
-| [Companion APK, 0.1](https://bnlg.capthnds.me/X1l-_U6YeApbAXKOM3/stockglass-companion.apk) | sha256 `baa9efa6ba9591560aba6c5be6ef16cdeaa1bad83a582767974823eea9783774` |
+| [Companion APK, 0.2.2](https://github.com/capthndsme/liquid-glass-android/releases/download/v0.4.21/stockglass-companion.apk) | sha256 `4c6474b0c92f8e27d59f2d667f61d105723fc1f60d937f2c2e4a61d2bddc2904`, attached to v0.4.21 |
 
 GitHub Actions builds every push to this repository and publishes it under
 [Releases](https://github.com/capthndsme/liquid-glass-android/releases). The
