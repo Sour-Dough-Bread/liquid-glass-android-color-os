@@ -283,6 +283,11 @@ point the engine needs out of your `surfaceflinger`'s own debug symbols, and
 aborts with a list if any are missing. A ROM it cannot drive costs you an error
 message, not a boot.
 
+v0.4.21 added experimental support for more ROMs, Evolution X 12.x and
+crDroid 13.x among them, from a survey of 66 firmware builds. None of that
+has run on a phone yet; the [main README](../README.md#other-roms-experimental)
+lists what changed.
+
 ## Root that comes after boot: live mode
 
 Some setups never mount the module: root loaded after boot (temporary root),

@@ -21,16 +21,16 @@ There's a write-up of how it works on my site:
 ## See it in action
 
 <p align="center">
-  <a href="https://bnlg.capthnds.me/TMOX7gByb5BebXsyqA/liquid-glass-android-demo.mp4">
-    <img src="docs/images/demo.webp" width="45%" alt="Play the screen recording: a glass timer widget, dock and search bar over a fluid simulation wallpaper" />
+  <a href="https://bnlg.capthnds.me/vclPImkJ3Q7a3FKgli/screen-20261122-013006-1795282158046.mp4">
+    <img src="docs/images/demo.webp" width="45%" alt="Play the screen recording: a glass calendar widget, app icons, dock and search bar over a swirling live wallpaper" />
   </a>
 </p>
 
-The picture opens a half-minute screen recording from my phone, with a
-fluid simulation as the live wallpaper. The wallpaper changes every
-frame, so SurfaceFlinger redraws all the glass above it every frame too.
-At 0:17 the app drawer opens, with about 40 glass icons on screen at
-once.
+The picture opens a 48-second screen recording from my phone, with an
+animated shader as the live wallpaper. The wallpaper changes every frame,
+so SurfaceFlinger redraws all the glass above it every frame too. It goes
+from the home screen's widgets to the app drawer and Gboard, then the
+shade, Quick Settings, the module's WebUI in recents and the volume panel.
 
 ## Screenshots
 
@@ -69,7 +69,8 @@ that name. When a release has a companion APK attached, take that one.
 It's experimental and needs root on Android 14 to 17. The installer checks the
 ROM's SurfaceFlinger first and refuses to install if the engine can't drive it.
 If a boot ever fails with the module installed, it disables itself on the next
-boot.
+boot. Support for ROMs other than the two I run is newer still: see
+[Other ROMs](#other-roms-experimental).
 
 1. Flash the module zip in KernelSU, Magisk or APatch, and reboot. KernelSU 3
    also needs a metamodule such as meta-overlayfs.
@@ -82,6 +83,55 @@ boot.
 [companion/README.md](companion/README.md) cover the settings and each
 surface's requirements. For example, app icons get glass only when they are
 themed.
+
+## Other ROMs (experimental)
+
+I wrote Stock Glass on two phones, a Poco F3 on crDroid and a Poco F1 on
+AxionOS. After I posted it, people on other ROMs reported "Flash failed". So
+for v0.4.21 I collected the SurfaceFlinger from 66 firmware builds and taught
+the engine what they do differently:
+
+- **Evolution X 12.x, and crDroid 13.x builds made after 2026-11-11.** Their
+  SurfaceFlinger has a Liquid Glass of its own, and its blur function takes
+  one more argument, a material. v0.4.20 refused to install there. The engine
+  now hooks that form too, and in glass mode it draws Evolution X's glass
+  regions in its own look; `glassctl set romMaterials 1` leaves them to
+  Evolution X. Both ROMs have blurred notification cards only on the lock
+  screen since 2026-11-15, and the companion brings their glass back in the
+  shade.
+- **Android 15 builds where Skia's uniform lookups were compiled away:**
+  Pixel's AP3A and BP1A, LineageOS 22.2, Nothing OS 3.2 on MediaTek and
+  /e/OS on Android 15. The engine now lays out the shader's uniforms itself.
+- **Builds with branch protection (BTI),** 22 of the 66, among them Pixel 8
+  and later from Android 17 QPR1. The Pixel 8 and 8 Pro render with Graphite
+  from that release on, and there the glass stands down and Android's blur
+  stays.
+- **Lunaris and Infinity-X,** which scale the blurred image differently. The
+  engine reads the scale from each build when it starts.
+
+The installer's check passes on all 66: Pixel (19 builds), LineageOS (16),
+Evolution X and crDroid (9), Nothing OS (8), Motorola (5), and Infinity-X,
+PixelOS, Lunaris, AxionOS, /e/OS and a TrebleDroid GSI (9). That checks the
+binaries on a computer. None of the new code has run on a phone yet, mine
+included, so expect bugs. The safety nets are the ones the module always had: the
+installer refuses a SurfaceFlinger it can't drive, a failed boot disables the
+module, and a SurfaceFlinger crash with glass on brings Android's blur back.
+
+Some builds have nothing to draw on. Where the vendor turns window blur off
+(the moto g 2025, some Nothing OS and LineageOS 22.2 builds), there is no blur
+for the glass to replace. Samsung's and OnePlus's firmware weren't part of the
+survey.
+
+If you try it on one of these ROMs, please
+[open an issue](https://github.com/capthndsme/liquid-glass-android/issues)
+with your ROM, your phone and what the installer printed.
+
+ROM developers can build the glass into SurfaceFlinger instead, with no root
+and no hook: [rom/](rom/README.md) makes a `frameworks/native` patch for AOSP,
+LineageOS, Evolution X and crDroid trees. The patches compile, but no ROM
+with them has booted yet.
+[docs/VERIFIED.md](docs/VERIFIED.md#many-surfaceflingers-the-firmware-survey-2026-11-21-and-22)
+has the survey in full.
 
 ## What's here
 
