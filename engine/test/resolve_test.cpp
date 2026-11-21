@@ -1,19 +1,29 @@
-// Host test for the MiniDebugInfo symbol resolver and the entry-point table.
+// Host test for the resolver, the judging rules and the install-time cache.
 //
-// Runs against real surfaceflinger binaries pulled off devices, on the host,
-// where a parsing bug is an assertion instead of a soft reboot.
+// Runs against real surfaceflinger binaries pulled out of firmware, on the
+// host, where a parsing bug is an assertion instead of a soft reboot. It goes
+// through the same sf::resolve() and sf::judge() as glasscheck and the engine,
+// so a PASS here is the decision the device will make.
 //
 //   ./resolve_test <surfaceflinger-binary> [expected-drawBlurRegion-hex]
+//
+// Besides resolving, it writes the install-time cache for the binary, reads it
+// back the way the engine would (against the file instead of memory), and
+// checks that a tampered cache is refused.
 
 #include "../src/elf_syms.h"
+#include "../src/sf_cache.h"
+#include "../src/sf_resolve.h"
 #include "../src/sf_symbols.h"
 
 #include <unistd.h>
 
-#include <cstdio>
 #include <cstdarg>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -55,108 +65,159 @@ void check(bool cond, const char* fmt, ...) {
     if (!cond) ++failures;
 }
 
+std::string slurp(const std::string& path) {
+    std::ifstream f(path);
+    std::stringstream s;
+    s << f.rdbuf();
+    return s.str();
+}
+
+void spit(const std::string& path, const std::string& body) {
+    std::ofstream f(path, std::ios::trunc);
+    f << body;
+}
+
+bool sameEntries(const glass::sf::Resolution& a, const glass::sf::Resolution& b) {
+    for (size_t i = 0; i < glass::sf::kCount; ++i) {
+        if (a.entry[i].sym.value != b.entry[i].sym.value) return false;
+        if (a.entry[i].sym.size != b.entry[i].sym.size) return false;
+    }
+    return a.shape == b.shape && a.ok == b.ok;
+}
+
 }  // namespace
 
-int main(int argc, char** argv) {
-    if (argc < 2) {
-        fprintf(stderr, "usage: %s <surfaceflinger> [expected-hex-addr]\n", argv[0]);
-        return 2;
-    }
-
+// One line per binary, for engine/test/corpus.sh: the verdict, the shape, what
+// the symbols held, and the first reason when it fails.
+int brief(const std::string& path) {
     glass::SymbolResolver r;
-    printf("== %s\n", argv[1]);
-    if (!r.loadFromFile(argv[1], inflateViaXz, nullptr)) {
-        fprintf(stderr, "  load failed: %s\n", r.error().c_str());
+    if (!r.loadFromFile(path, inflateViaXz, nullptr)) {
+        printf("FAIL  no symbols (%s)\n", r.error().c_str());
         return 1;
     }
-    printf("  %zu function symbols recovered\n", r.count());
+    glass::sf::Resolution res;
+    glass::sf::resolve(r, glass::sf::fileAbiProbe, const_cast<char*>(path.c_str()), &res);
+    std::string drift;
+    for (size_t i = 0; i < glass::sf::kEntryPointCount; ++i) {
+        if (!res.entry[i].drifted) continue;
+        drift += drift.empty() ? "" : ",";
+        drift += glass::sf::kEntryPoints[i].label;
+    }
+    printf("%s  %-36s syms=%zu mdi=%s regen=%s subset=%s%s%s%s%s\n", res.ok ? "PASS" : "FAIL",
+           res.shape >= 0 ? glass::sf::kHookShapes[res.shape].label : "no hook shape",
+           res.symbol_count, res.had_minidebuginfo ? "yes" : "no",
+           res.canRegenerateBlur() ? "yes" : "no", res.canCopySubset() ? "yes" : "no",
+           drift.empty() ? "" : " drift=", drift.c_str(), res.fatal.empty() ? "" : " | ",
+           res.fatal.empty() ? "" : res.fatal[0].c_str());
+    return res.ok ? 0 : 1;
+}
+
+int main(int argc, char** argv) {
+    if (argc == 3 && strcmp(argv[1], "--brief") == 0) return brief(argv[2]);
+    if (argc < 2) {
+        fprintf(stderr, "usage: %s <surfaceflinger> [expected-hex-addr]\n"
+                        "       %s --brief <surfaceflinger>\n", argv[0], argv[0]);
+        return 2;
+    }
+    const std::string path = argv[1];
+
+    glass::SymbolResolver r;
+    printf("== %s\n", path.c_str());
+    const std::string build_id = glass::readGnuBuildId(path);
+    printf("  build id %s\n", build_id.empty() ? "(none)" : build_id.c_str());
+    if (!r.loadFromFile(path, inflateViaXz, nullptr)) {
+        fprintf(stderr, "  load failed: %s\n", r.error().c_str());
+        printf("FAILURES\n\n");
+        return 1;
+    }
+    printf("  %zu function symbols recovered%s\n", r.count(),
+           r.hadMiniDebugInfo() ? " (MiniDebugInfo present)" : " (no MiniDebugInfo)");
     check(r.count() > 10000, "recovered a plausible symbol count (>10000)");
 
-    // Resolve every entry point through its candidate list, exactly as the
-    // engine will at load time, and record which strategies came out whole.
-    bool strategy_ok[glass::sf::kStrategyCount];
-    for (bool& ok : strategy_ok) ok = true;
-    bool resolved[glass::sf::kCount] = {false};
-
+    glass::sf::Resolution res;
+    glass::sf::resolve(r, glass::sf::fileAbiProbe, const_cast<char*>(path.c_str()), &res);
     for (size_t i = 0; i < glass::sf::kEntryPointCount; ++i) {
-        const glass::sf::EntryPoint& ep = glass::sf::kEntryPoints[i];
-
-        glass::Symbol hit;
-        const char* which = nullptr;
-        for (const char* const* m = ep.manglings; *m != nullptr; ++m) {
-            const glass::Symbol s2 = r.find(*m);
-            if (s2.valid()) { hit = s2; which = *m; break; }
-        }
-
-        resolved[i] = hit.valid();
-        if (!hit.valid() && ep.strategy != glass::sf::kDataRelease &&
-            ep.strategy != glass::sf::kHookTarget) {
-            strategy_ok[ep.strategy] = false;
-        }
-
-        if (hit.valid()) {
-            printf("  [ ok ] %-7s %-38s 0x%-8llx %5llu B%s\n",
-                   glass::sf::strategyName(ep.strategy), ep.label,
-                   (unsigned long long)hit.value, (unsigned long long)hit.size,
-                   which == ep.manglings[0] ? "" : "  (fallback mangling)");
-            continue;
-        }
-
-        // Nothing matched. Distinguish "inlined away" from "signature drifted":
-        // the second is dangerous, the first merely rules a strategy out.
-        std::vector<std::string> near;
-        // A hook-target variant that did not resolve is the normal case — the
-        // other shape did. Its prefix necessarily matches the shape that IS
-        // present, so reporting that as drift would fire on every build.
-        // "exactly one shape resolved" is the check that actually matters.
-        if (ep.prefix != nullptr && ep.strategy != glass::sf::kHookTarget) {
-            near = r.findByPrefix(ep.prefix);
-        }
-        if (!near.empty()) {
-            check(false, "%-7s %-38s SIGNATURE DRIFT, %zu unvetted",
-                  glass::sf::strategyName(ep.strategy), ep.label, near.size());
-            for (const auto& n : near) printf("           %s\n", n.c_str());
-        } else {
-            printf("  [ -- ] %-7s %-38s inlined away\n",
-                   glass::sf::strategyName(ep.strategy), ep.label);
-        }
+        printf("%s\n", glass::sf::describe(res, i).c_str());
     }
-
-    check(strategy_ok[glass::sf::kCore], "core entry points all resolved");
-    // kDataRelease is a group of alternatives: one is enough, and which one
-    // survives out-of-line differs per build (A16 has both, A14 only the sk_sp
-    // destructor).
-    check(resolved[glass::sf::kSkSpDataDtor] || resolved[glass::sf::kDataUnref],
-          "a uniform-blob release path is available");
-    // Exactly one shape of the hook target: two would mean we cannot tell which
-    // one the compositor actually calls.
-    const int shapes = (resolved[glass::sf::kDrawBlurRegion] ? 1 : 0) +
-                       (resolved[glass::sf::kDrawBlurRegionScaled] ? 1 : 0);
-    check(shapes == 1, "exactly one drawBlurRegion shape resolved (%d)", shapes);
+    for (const std::string& n : res.notes) printf("  note   %s\n", n.c_str());
+    for (const std::string& f : res.fatal) printf("  FATAL  %s\n", f.c_str());
+    check(res.ok, "the engine can drive this build (judge)");
     printf("  hook target: %s\n",
-           resolved[glass::sf::kDrawBlurRegion] ? "drawBlurRegion(radius, alpha)"
-               : (resolved[glass::sf::kDrawBlurRegionScaled]
-                      ? "drawBlurRegion(radius, scale, alpha)" : "NONE"));
-    printf("  SkRuntimeEffectBuilder surface: %s (unused; the draw goes through\n"
-           "  SkRuntimeEffect::makeShader, which needs no builder layout)\n",
-           strategy_ok[glass::sf::kBuilder] ? "complete" : "partly inlined");
-
-    // The hook target must have a real body; a zero size means we would have an
-    // address with nothing to patch.
-    const size_t which = resolved[glass::sf::kDrawBlurRegion] ? glass::sf::kDrawBlurRegion
-                                                              : glass::sf::kDrawBlurRegionScaled;
-    const glass::Symbol dbr = r.find(glass::sf::kEntryPoints[which].manglings[0]);
-    check(dbr.size > 64, "drawBlurRegion has a real body (not inlined)");
-    check(r.findByPrefix(glass::sf::kEntryPoints[glass::sf::kDrawBlurRegion].prefix).size() == 1,
-          "exactly one drawBlurRegion mangling present");
+           res.shape >= 0 ? glass::sf::kHookShapes[res.shape].label : "NONE");
     check(!r.find("_ZN4this6symbol4doesNotExistEv").valid(), "missing symbol reports invalid");
 
     // run.sh passes an empty string when no address was given; that is "don't
     // check", not "expect 0".
-    if (argc >= 3 && argv[2][0] != '\0') {
+    if (argc >= 3 && argv[2][0] != '\0' && res.shape >= 0) {
         const uint64_t expect = strtoull(argv[2], nullptr, 16);
-        check(dbr.value == expect, "drawBlurRegion at expected 0x%llx",
-              (unsigned long long)expect);
+        const uint64_t got = res.sym(glass::sf::kHookShapes[res.shape].entry).value;
+        check(got == expect, "drawBlurRegion at expected 0x%llx (got 0x%llx)",
+              (unsigned long long)expect, (unsigned long long)got);
+    }
+
+    // ---- the install-time cache, round trip and refusals
+    if (res.ok && !build_id.empty()) {
+        char tmpl[] = "/tmp/glass_cache_XXXXXX";
+        const int fd = mkstemp(tmpl);
+        if (fd >= 0) close(fd);
+        const std::string cache = tmpl;
+        std::string err;
+        check(glass::sf::writeCache(cache, path, res, &err), "cache written%s%s",
+              err.empty() ? "" : ": ", err.c_str());
+
+        glass::sf::Resolution back;
+        std::string why;
+        const bool read_ok = glass::sf::readCacheForFile(cache, path, &back, &why);
+        check(read_ok, "cache read back and verified against the file%s%s",
+              why.empty() ? "" : ": ", why.c_str());
+        if (read_ok) {
+            glass::sf::probeAbi(&back, glass::sf::fileAbiProbe, const_cast<char*>(path.c_str()));
+            glass::sf::judge(&back);
+            check(sameEntries(res, back), "cached resolution equals the resolved one");
+        }
+
+        const std::string body = slurp(cache);
+        // A changed code byte: the first entry's prologue, last hex digit.
+        {
+            std::string t = body;
+            const size_t e = t.find("\ne ");
+            size_t field = e;
+            for (int k = 0; k < 6 && field != std::string::npos; ++k) field = t.find(' ', field + 1);
+            if (field != std::string::npos) {
+                char& c = t[field - 1];
+                c = c == '0' ? '1' : '0';
+                spit(cache, t);
+                glass::sf::Resolution x;
+                std::string w;
+                // Read first: as a sibling argument, w.c_str() could be taken
+                // before the call fills w.
+                const bool read = glass::sf::readCacheForFile(cache, path, &x, &w);
+                check(!read, "a cache with a changed code byte is refused (%s)", w.c_str());
+            }
+        }
+        // Another binary's build id.
+        {
+            std::string t = body;
+            const size_t b = t.find("build-id ");
+            if (b != std::string::npos) {
+                char& c = t[b + 9];
+                c = c == 'a' ? 'b' : 'a';
+                spit(cache, t);
+                glass::sf::Resolution x;
+                std::string w;
+                check(!glass::sf::readCacheForFile(cache, path, &x, &w),
+                      "a cache for another build id is refused");
+            }
+        }
+        // Truncated.
+        {
+            spit(cache, body.substr(0, body.size() / 2));
+            glass::sf::Resolution x;
+            std::string w;
+            check(!glass::sf::readCacheForFile(cache, path, &x, &w),
+                  "a truncated cache is refused");
+        }
+        unlink(cache.c_str());
     }
 
     printf("%s\n\n", failures == 0 ? "PASS" : "FAILURES");

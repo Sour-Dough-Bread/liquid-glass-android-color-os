@@ -2,6 +2,7 @@
 
 #include <cmath>
 #include <cstring>
+#include <type_traits>
 #include <utility>
 
 // ---------------------------------------------------------------------------
@@ -87,7 +88,17 @@ SkRuntimeEffect* compile(const Bridge& b, const char* sksl, std::string* error) 
     // Options{} is what the header's own wrapper passes: every field at its
     // default. Built from the pinned header, so it is the target's layout
     // (alioth's wrapper zeroes 40 bytes and reads allowPrivateAccess at +24).
+    //
+    // Every byte has to be zero, padding included. Android 15's Skia reads its
+    // own 12-byte Options out of these bytes, with allowPrivateAccess at +1 and
+    // fStableKey at +4, both in what is padding here (Nothing OS 3.2 and Pixel
+    // A15, read from their MakeForShader), and zero is every field's default
+    // in every layout. Options is not an aggregate (it has private members),
+    // so Options{} value-initializes: the object is zero-initialized, padding
+    // and all, before the defaults go in. The assert keeps it that way.
     static_assert(sizeof(SkRuntimeEffect::Options) == 40, "Options layout moved; re-check");
+    static_assert(!std::is_aggregate_v<SkRuntimeEffect::Options>,
+                  "Options{} must value-initialize, so its padding is zeroed");
     const SkRuntimeEffect::Options options{};
     // Each return is a prvalue, so the result is built straight into `result`
     // by guaranteed elision; Returned cannot be copied.

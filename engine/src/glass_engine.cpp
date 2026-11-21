@@ -18,12 +18,22 @@
 // no path that draws with anything unverified.
 
 #include <android/log.h>
+#include <dlfcn.h>
 #include <frida-gum.h>
+#include <sys/auxv.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/system_properties.h>
 #include <unistd.h>
+#if defined(__aarch64__)
+#include <asm/hwcap.h>
+#ifndef HWCAP2_BTI
+#define HWCAP2_BTI (1 << 17)
+#endif
+#endif
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -31,6 +41,7 @@
 #include <ctime>
 #include <string>
 #include <thread>
+#include <utility>
 
 #include "abi_check.h"
 #include "composite_memory.h"
@@ -41,6 +52,8 @@
 #include "exec_probe.h"
 #include "generated/glass_shader_src.h"
 #include "glass_params.h"
+#include "sf_cache.h"
+#include "sf_resolve.h"
 #include "sf_symbols.h"
 #include "sharp_bounds.h"
 #include "sk_bridge.h"
@@ -68,6 +81,17 @@ std::string propGet(const char* name, const char* fallback) {
 //   no-glass     installed, but the shader did not validate: stock blur
 //   not-hooked   declined to install (logcat -s StockGlass says why)
 void engineStatus(const char* s) { __system_property_set("sys.glass.engine", s); }
+
+// Where this library was loaded from: /system/lib64 under the module's overlay,
+// a tmpfs directory in live mode, wherever a developer put it. The symbol cache
+// sits next to it, so it is found the same way in all three.
+std::string enginePath() {
+    Dl_info info{};
+    if (dladdr(reinterpret_cast<void*>(&enginePath), &info) != 0 && info.dli_fname != nullptr) {
+        return info.dli_fname;
+    }
+    return "/system/lib64/libglassengine.so";
+}
 
 int propInt(const char* name, int fallback) {
     const std::string v = propGet(name, "");
@@ -116,8 +140,6 @@ Guard guardPaths() {
 }
 
 bool guardShouldRun() {
-    const Guard g = guardPaths();
-
     // When installed as a module, the guard lives in post-fs-data.sh instead,
     // and this one stands down rather than keeping a second marker with the
     // same meaning. The module's version is strictly stronger: it can refuse to
@@ -138,6 +160,9 @@ bool guardShouldRun() {
         return true;
     }
 
+    // Only now: guardPaths() stats /data/adb, which is what the property
+    // above exists to avoid (the module and live mode both set it).
+    const Guard g = guardPaths();
     if (exists(g.disabled)) {
         LOGW("disabled by %s — remove it to re-enable", g.disabled.c_str());
         return false;
@@ -240,9 +265,18 @@ using DrawBlurRegionScaledFn = void (*)(void* self, SkCanvas* canvas,
                                         const SkRect* blur_rect, void* blurred_image_sp,
                                         void* input_sp);
 
+// Evolution X 12.x: the QPR2 shape and one more int, the region's material
+// for EvoX's own glass (sf_symbols.h, kHookTarget).
+using DrawBlurRegionScaledKindFn = void (*)(void* self, SkCanvas* canvas,
+                                            const SkRRect* effect_region, uint32_t blur_radius,
+                                            float blur_scale, float blur_alpha,
+                                            const SkRect* blur_rect, void* blurred_image_sp,
+                                            void* input_sp, int kind);
+
 GumInterceptor* g_interceptor = nullptr;
 DrawBlurRegionFn g_original = nullptr;
 DrawBlurRegionScaledFn g_original_scaled = nullptr;
+DrawBlurRegionScaledKindFn g_original_scaled_kind = nullptr;
 uint64_t g_calls = 0;
 
 // Every resolved entry point, indexed by glass::sf::Index.
@@ -556,8 +590,16 @@ uint32_t chosenViewRadius(uint32_t wanted_radius, bool* single) {
 using GenerateFn = glass::skia::ReturnedSkSp (*)(const void* self, void* context,
                                                  const void* display, uint32_t radius,
                                                  void* input_sp, const SkRect* blur_rect);
-constexpr size_t kFilterCount = 3;
+// One per row of glass::sf::kGenerateFilters, in its order.
+constexpr size_t kFilterCount = glass::sf::kGenerateFilterCount;
 GenerateFn g_generate[kFilterCount] = {};
+
+bool anyGenerateHooked() {
+    for (GenerateFn g : g_generate) {
+        if (g != nullptr) return true;
+    }
+    return false;
+}
 
 struct GenerateCall {
     bool valid = false;
@@ -756,14 +798,53 @@ void releaseStaleBlurs(uint32_t input_id, const void* context) {
 // from then on nothing is put off, until SurfaceFlinger restarts.
 uint32_t g_deferred_unseen = 0;
 bool g_lazy_refused = false;
+// RenderEngine turned out to draw with Graphite (graphiteCanvas): nothing of
+// ours runs from then on.
+bool g_graphite = false;
 
-// Called by the draw hook for every region: the blur it was handed, if it was
-// one that had been put off, has now reached a draw.
-void deferredBlurSeen(void* blurred_sp, void* input_sp) {
-    if (g_deferred_unseen == 0 || blurred_sp == nullptr || input_sp == nullptr) return;
-    if (*static_cast<SkImage**>(blurred_sp) == *static_cast<SkImage**>(input_sp)) {
-        g_deferred_unseen = 0;
+// The snapshots generateHook handed back in a blur's place, by unique ID
+// (Skia never reuses one). A RenderEngine that keeps the filter's results
+// between frames gives such a snapshot to drawBlurRegion again on a later
+// frame, as though it were a blur, next to that frame's own input. Pixel's
+// BlurCache (Android 17 QPR2) and Infinity-X 4.x's deque do; the install-time
+// symbols (kBlurCacheValid) catch those two before anything is put off, and
+// this catches a cache no symbol shows.
+constexpr size_t kHandedBack = 8;
+uint32_t g_handed_back[kHandedBack] = {};
+size_t g_handed_back_next = 0;
+
+bool handedBack(uint32_t id) {
+    if (id == 0) return false;
+    for (uint32_t h : g_handed_back) {
+        if (h == id) return true;
     }
+    return false;
+}
+
+// Called by the draw hook for every region, before anything else, with the
+// slots it was handed. Returns the slot to read the region's blur from:
+// blurred_sp, or input_sp when what came as the blur is a snapshot handed back
+// on an earlier frame. By the key such a cache keeps, nothing under the region
+// has changed since, so this frame's snapshot is the same picture, and the
+// blur is made from it now as for one put off on this frame. From then on
+// nothing is put off.
+void* blurSlotFor(void* blurred_sp, void* input_sp) {
+    if (blurred_sp == nullptr || input_sp == nullptr) return blurred_sp;
+    SkImage* blurred = *static_cast<SkImage**>(blurred_sp);
+    SkImage* input = *static_cast<SkImage**>(input_sp);
+    if (blurred == nullptr || input == nullptr) return blurred_sp;
+    if (blurred == input) {
+        g_deferred_unseen = 0;  // the blur put off on this frame reached its draw
+        return blurred_sp;
+    }
+    if (!handedBack(blurred->uniqueID())) return blurred_sp;
+    if (!g_lazy_refused) {
+        g_lazy_refused = true;
+        LOGW("a snapshot handed back in a blur's place came back on a later frame: this "
+             "RenderEngine keeps blurs between frames. Android makes its own blurs from here "
+             "on (as persist.sys.glass.lazyBlur=0)");
+    }
+    return input_sp;
 }
 
 // Whether Android's blur can wait for the draw: only while glass is being
@@ -771,7 +852,7 @@ void deferredBlurSeen(void* blurred_sp, void* input_sp) {
 // first. Not before the shader has validated (the first glass frame keeps
 // Android's blur), and not while the crash guard holds glass off.
 bool deferGeneration() {
-    if (!g_shader_ok || g_lazy_refused) return false;
+    if (!g_shader_ok || g_lazy_refused || g_graphite) return false;
     if (g_deferred_unseen != 0) {
         g_lazy_refused = true;
         g_deferred_unseen = 0;
@@ -798,6 +879,8 @@ glass::skia::ReturnedSkSp generateHook(const void* self, void* context, const vo
             // drawGlassCore tells it from a blur by its being the input.
             ++g_stats.deferred;
             g_deferred_unseen = input->uniqueID();
+            g_handed_back[g_handed_back_next] = input->uniqueID();
+            g_handed_back_next = (g_handed_back_next + 1) % kHandedBack;
             SkSafeRef(input);
             return glass::skia::ReturnedSkSp(input);
         }
@@ -808,6 +891,128 @@ glass::skia::ReturnedSkSp generateHook(const void* self, void* context, const vo
     // The result is a prvalue of the same type, so C++17 constructs it straight
     // into the caller's return slot: nothing is copied or destroyed here.
     return g_generate[K](self, context, display, radius, input_sp, blur_rect);
+}
+
+// ------------------------------------------------------- uniform layout
+//
+// Where an effect keeps each uniform in its blob, and which index each child
+// has. findUniform and findChild say, when the build has them out of line.
+// Pixel's BP1A and Nothing OS 3.2 inline both away, and there the answer comes
+// from the shader's own declarations: SkRuntimeEffect lays the uniforms out in
+// declaration order, each straight after the one before
+// (SkRuntimeEffectPriv::VarAsUniform), numbers the children in declaration
+// order, and SkSL never drops a uniform as unused (ProgramUsage::isDead).
+// engine/build.sh packs the offsets from the same source that is embedded.
+// What vouches for that layout on a build is uniformSize(): the packed total
+// has to come out exactly, which it would not if a uniform had been dropped or
+// sized differently. Where findUniform does exist, the packed layout is
+// checked against it, so every build that does not need the rule tests it.
+
+struct Declared {
+    const char* const* names;     // the shader's uniforms, in declaration order
+    const unsigned* packed;       // where SkRuntimeEffect puts each of them
+    int count;
+    unsigned packed_size;
+    const char* const* children;  // the shader's children, in declaration order
+    int child_count;
+};
+
+// The lean builds declare exactly what these do (engine/build.sh asserts it).
+constexpr Declared kGlassDeclared = {
+    glass::kGlassUniformNames,     glass::kGlassUniformPacked,
+    glass::kGlassUniformNames_count, glass::kGlassUniformPackedSize,
+    glass::kGlassChildNames,       glass::kGlassChildNames_count,
+};
+constexpr Declared kToneDeclared = {
+    glass::kGlassToneUniformNames,     glass::kGlassToneUniformPacked,
+    glass::kGlassToneUniformNames_count, glass::kGlassToneUniformPackedSize,
+    glass::kGlassToneChildNames,       glass::kGlassToneChildNames_count,
+};
+
+// How uniformOffsets placed an effect's uniforms, for the log.
+const char* g_layout_how = "";
+
+// Fills `out` with `effect`'s blob offsets for `names` (the engine's ids, in
+// the engine's order) and *size with its blob size. False, with the reason
+// logged, when any uniform cannot be placed.
+bool uniformOffsets(const SkRuntimeEffect* effect, const char* what, const Declared& d,
+                    const char* const* names, size_t count, size_t* out, size_t* size) {
+    *size = g_sk.uniformSize(effect);
+    const bool asked = g_sk.findUniform != nullptr;
+    bool agrees = *size == d.packed_size;
+    int missing = 0;
+    for (size_t i = 0; i < count; ++i) {
+        long packed = -1;
+        for (int j = 0; j < d.count && packed < 0; ++j) {
+            if (strcmp(d.names[j], names[i]) == 0) packed = static_cast<long>(d.packed[j]);
+        }
+        if (packed < 0) {
+            LOGE("%s: the engine fills uniform %s, which the shader does not declare", what,
+                 names[i]);
+            ++missing;
+            continue;
+        }
+        if (!asked) {
+            out[i] = static_cast<size_t>(packed);
+            continue;
+        }
+        const SkRuntimeEffect::Uniform* u = g_sk.findUniform(effect, names[i]);
+        if (u == nullptr) {
+            LOGE("%s: uniform NOT FOUND: %s", what, names[i]);
+            ++missing;
+            continue;
+        }
+        out[i] = u->offset;
+        agrees = agrees && u->offset == static_cast<size_t>(packed);
+    }
+    if (missing != 0) return false;
+    for (size_t i = 0; i < count; ++i) {
+        if (out[i] + sizeof(float) > *size) {
+            LOGE("%s: uniform %s at %zu lies outside the %zu-byte blob", what, names[i], out[i],
+                 *size);
+            return false;
+        }
+    }
+    if (!asked && !agrees) {
+        LOGE("%s: uniformSize() is %zu bytes where the declarations pack to %u: this Skia lays "
+             "uniforms out some other way, and without findUniform there is no asking it",
+             what, *size, d.packed_size);
+        return false;
+    }
+    if (asked && !agrees) {
+        LOGW("%s: findUniform's layout is not the packed one (blob %zu bytes, packed %u); a "
+             "build without findUniform would be refused if its Skia did the same",
+             what, *size, d.packed_size);
+    }
+    g_layout_how = !asked ? "packed from the declarations (no findUniform)"
+                   : agrees ? "from findUniform, which agrees with the packed layout"
+                            : "from findUniform, which does NOT agree with the packed layout";
+    return true;
+}
+
+// The index of child `name`: findChild's answer, or its place among the
+// declared children. -1 when neither knows it. A findChild answer that is not
+// the declaration order is logged, for the same reason as above.
+int childIndex(const SkRuntimeEffect* effect, const char* what, const Declared& d,
+               const char* name) {
+    int declared = -1;
+    for (int j = 0; j < d.child_count && declared < 0; ++j) {
+        if (strcmp(d.children[j], name) == 0) declared = j;
+    }
+    if (g_sk.findChild == nullptr) return declared;
+    const SkRuntimeEffect::Child* c = g_sk.findChild(effect, name);
+    if (c == nullptr) return -1;
+    if (c->index != declared) {
+        LOGW("%s: findChild puts %s at %d, declaration order at %d", what, name, c->index,
+             declared);
+    }
+    return c->index;
+}
+
+// generateHook<K> for every row of glass::sf::kGenerateFilters.
+template <size_t... K>
+std::array<void*, sizeof...(K)> generateHooks(std::index_sequence<K...>) {
+    return {{reinterpret_cast<void*>(&generateHook<K>)...}};
 }
 
 // The tone shader (shader/gen_glass_sksl.py): what a toned backdrop is drawn
@@ -827,29 +1032,25 @@ void compileToneShader() {
         LOGW("tone shader did not compile (%s); backdrops keep the glass shader", err.c_str());
         return;
     }
-    const size_t size = g_sk.uniformSize(effect);
+    size_t size = 0;
+    if (!uniformOffsets(effect, "tone shader", kToneDeclared, kToneUniformNames, T_count,
+                        g_tone_uniform_offset, &size)) {
+        LOGW("tone shader: uniforms unresolved; not used");
+        return;
+    }
     if (size == 0 || size > (1u << 16)) {
         LOGW("tone shader: implausible uniform blob size %zu; not used", size);
         return;
     }
-    for (size_t i = 0; i < T_count; ++i) {
-        const SkRuntimeEffect::Uniform* u = g_sk.findUniform(effect, kToneUniformNames[i]);
-        if (u == nullptr || u->offset >= size) {
-            LOGW("tone shader: uniform %s unresolved; not used", kToneUniformNames[i]);
-            return;
-        }
-        g_tone_uniform_offset[i] = u->offset;
-    }
-    const SkRuntimeEffect::Child* c = g_sk.findChild(effect, "blurredContent");
-    if (c == nullptr || c->index != 0) {
+    if (childIndex(effect, "tone shader", kToneDeclared, "blurredContent") != 0) {
         LOGW("tone shader: child unresolved; not used");
         return;
     }
     g_tone_effect = effect;
     g_tone_uniform_size = size;
     g_tone_ok = true;
-    LOGI("tone shader validated (%zu chars, %zu uniforms, blob %zu bytes)",
-         sizeof(glass::kGlassShaderTone) - 1, T_count, size);
+    LOGI("tone shader validated (%zu chars, %zu uniforms, blob %zu bytes, %s)",
+         sizeof(glass::kGlassShaderTone) - 1, T_count, size, g_layout_how);
 }
 
 // The lean builds. Each declares the glass shader's uniforms and children as
@@ -873,15 +1074,17 @@ void compileLeanShaders() {
                  kBuilds[b].name, err.c_str());
             continue;
         }
-        bool same = g_sk.uniformSize(effect) == g_uniform_size;
-        for (size_t i = 0; same && i < U_count; ++i) {
-            const SkRuntimeEffect::Uniform* u = g_sk.findUniform(effect, kUniformNames[i]);
-            same = u != nullptr && u->offset == g_uniform_offset[i];
-        }
-        const SkRuntimeEffect::Child* blurred = g_sk.findChild(effect, "blurredContent");
-        const SkRuntimeEffect::Child* sharp = g_sk.findChild(effect, "sharpContent");
-        same = same && blurred != nullptr && sharp != nullptr &&
-               blurred->index == g_child_blurred && sharp->index == g_child_sharp;
+        size_t offsets[U_count] = {0};
+        size_t size = 0;
+        bool same = uniformOffsets(effect, kBuilds[b].name, kGlassDeclared, kUniformNames,
+                                   U_count, offsets, &size) &&
+                    size == g_uniform_size &&
+                    memcmp(offsets, g_uniform_offset, sizeof(offsets)) == 0;
+        same = same &&
+               childIndex(effect, kBuilds[b].name, kGlassDeclared, "blurredContent") ==
+                   g_child_blurred &&
+               childIndex(effect, kBuilds[b].name, kGlassDeclared, "sharpContent") ==
+                   g_child_sharp;
         if (!same) {
             LOGW("%s shader lays out its uniforms or children differently; not used",
                  kBuilds[b].name);
@@ -900,13 +1103,13 @@ void compileLeanShaders() {
              err.c_str());
         return;
     }
-    bool same = g_sk.uniformSize(tone) == g_tone_uniform_size;
-    for (size_t i = 0; same && i < T_count; ++i) {
-        const SkRuntimeEffect::Uniform* u = g_sk.findUniform(tone, kToneUniformNames[i]);
-        same = u != nullptr && u->offset == g_tone_uniform_offset[i];
-    }
-    const SkRuntimeEffect::Child* child = g_sk.findChild(tone, "blurredContent");
-    if (!same || child == nullptr || child->index != 0) {
+    size_t offsets[T_count] = {0};
+    size_t size = 0;
+    const bool same = uniformOffsets(tone, "lean tone shader", kToneDeclared, kToneUniformNames,
+                                     T_count, offsets, &size) &&
+                      size == g_tone_uniform_size &&
+                      memcmp(offsets, g_tone_uniform_offset, sizeof(offsets)) == 0;
+    if (!same || childIndex(tone, "lean tone shader", kToneDeclared, "blurredContent") != 0) {
         LOGW("lean tone shader lays out its uniforms or child differently; not used");
         return;
     }
@@ -921,9 +1124,10 @@ void compileLeanShaders() {
 // The proof is findUniform/findChild: those are out-of-line calls into the
 // target, and every name they return has to match a name we declared. If the
 // header layout were wrong, or the effect had compiled differently, the lookups
-// would come back null. Passing all 34 is strong evidence the ABI is right —
-// and it is checked before anything is drawn, so a mismatch costs a log line
-// instead of a soft reboot.
+// would come back null. Passing all of them is strong evidence the ABI is
+// right — and it is checked before anything is drawn, so a mismatch costs a
+// log line instead of a soft reboot. A build without them (see uniformOffsets)
+// has the weaker proof of uniformSize() coming out at the packed total.
 void tryCompileShader() {
     g_shader_tried = true;
 
@@ -949,29 +1153,28 @@ void tryCompileShader() {
     LOGI("SkSL compiled by SurfaceFlinger's Skia (%zu chars)",
          sizeof(glass::kGlassShaderHigh) - 1);
 
-    int missing = 0;
-    for (size_t i = 0; i < U_count; ++i) {
-        const SkRuntimeEffect::Uniform* u = g_sk.findUniform(g_effect, kUniformNames[i]);
-        if (u == nullptr) {
-            LOGE("uniform NOT FOUND: %s", kUniformNames[i]);
-            ++missing;
-            continue;
-        }
-        g_uniform_offset[i] = u->offset;
+    if (!uniformOffsets(g_effect, "glass shader", kGlassDeclared, kUniformNames, U_count,
+                        g_uniform_offset, &g_uniform_size)) {
+        LOGE("uniforms unresolved — header/target mismatch, refusing to draw");
+        g_effect = nullptr;
+        return;
     }
+    const char* const uniforms_how = g_layout_how;
 
+    int missing = 0;
     for (int i = 0; i < glass::kGlassChildNames_count; ++i) {
         const char* n = glass::kGlassChildNames[i];
-        const SkRuntimeEffect::Child* c = g_sk.findChild(g_effect, n);
-        if (c == nullptr) { LOGE("child NOT FOUND: %s", n); ++missing; continue; }
-        if (strcmp(n, "blurredContent") == 0) g_child_blurred = c->index;
-        if (strcmp(n, "sharpContent") == 0) g_child_sharp = c->index;
-        LOGI("  child   %-16s index=%d type=%d", n, c->index, static_cast<int>(c->type));
+        const int index = childIndex(g_effect, "glass shader", kGlassDeclared, n);
+        if (index < 0) { LOGE("child NOT FOUND: %s", n); ++missing; continue; }
+        if (strcmp(n, "blurredContent") == 0) g_child_blurred = index;
+        if (strcmp(n, "sharpContent") == 0) g_child_sharp = index;
+        LOGI("  child   %-16s index=%d%s", n, index,
+             g_sk.findChild != nullptr ? "" : " (declaration order: no findChild)");
     }
 
     if (missing != 0) {
-        LOGE("%d of %zu uniforms/children unresolved — header/target mismatch, refusing to draw",
-             missing, U_count + glass::kGlassChildNames_count);
+        LOGE("%d of %d children unresolved — header/target mismatch, refusing to draw",
+             missing, glass::kGlassChildNames_count);
         g_effect = nullptr;
         return;
     }
@@ -981,7 +1184,6 @@ void tryCompileShader() {
         return;
     }
 
-    g_uniform_size = g_sk.uniformSize(g_effect);
     if (g_uniform_size == 0 || g_uniform_size > (1u << 16)) {
         LOGE("implausible uniform blob size %zu", g_uniform_size);
         g_effect = nullptr;
@@ -993,6 +1195,7 @@ void tryCompileShader() {
          "density %.3f px/dp, %d properties overridden",
          U_count, glass::kGlassChildNames_count, g_uniform_size, glass::paramsUnitScale(),
          glass::paramsOverriddenCount());
+    LOGI("uniform layout %s", uniforms_how);
     compileToneShader();
     compileLeanShaders();
 }
@@ -1600,6 +1803,26 @@ bool coversWhole(const SkMatrix& ctm, const SkRect& rect, float w, float h) {
     return d.fLeft <= 0.5f && d.fTop <= 0.5f && d.fRight >= w - 0.5f && d.fBottom >= h - 0.5f;
 }
 
+// Whether RenderEngine draws with Graphite, asked of the canvas rather than of
+// a property. install() stands down on Graphite's properties, but they are not
+// the only way there: Lineage 24's Pixel 8 build opts in to a server-side
+// rollout (debug.renderengine.graphite_preview_optin=true from the vendor
+// partition), and one aconfig flag flipped then moves RenderEngine to Graphite
+// with no property for install() to see. Only a Graphite device has a
+// Recorder, so a non-null SkCanvas::recorder() settles it; a canvas that
+// wraps another (a Skia capture) answers null, which can only cost the check,
+// never the glass. Once yes, yes for the life of the process: RenderEngine
+// does not change backends while SurfaceFlinger runs (g_graphite).
+bool graphiteCanvas(const SkCanvas* canvas) {
+    if (g_graphite) return true;
+    if (g_sk.CanvasRecorder == nullptr || g_sk.CanvasRecorder(canvas) == nullptr) return false;
+    g_graphite = true;
+    LOGW("RenderEngine draws with Graphite (the canvas has a Recorder); the glass is only "
+         "verified on Ganesh. standing down: Android's blur from here on");
+    __system_property_set("sys.glass.graphite", "1");
+    return true;
+}
+
 // Draws the region. Returns false when it declined — stock mode, a backdrop
 // left to Android, or anything unverified — in which case the caller, which is
 // the only place that knows this build's exact signature, hands the call back
@@ -1627,6 +1850,9 @@ bool drawGlassCore(SkCanvas* canvas, const SkRRect* region, uint32_t requested_r
         blurred_sp == nullptr || input_sp == nullptr) {
         return false;
     }
+    // Before the shader is compiled, so Graphite never gets as far as a
+    // validated shader, and so never a blur put off (deferGeneration).
+    if (graphiteCanvas(canvas)) return false;
     // A zoom of zero or less would collapse or mirror the content; stock never
     // sends one, so if it ever appears it is not a shape to guess at.
     if (!(zoom > 0.0f) || !std::isfinite(zoom)) return false;
@@ -1945,9 +2171,8 @@ bool drawGlassCore(SkCanvas* canvas, const SkRRect* region, uint32_t requested_r
              paneness, effectiveLensBlur(radius));
         if (source == Source::kAndroid && wanted_radius != requested_radius) {
             LOGW("no blur at %.2fx for this region (%s); using the requested radius", wanted,
-                 g_generate[0] || g_generate[1] || g_generate[2]
-                     ? "generate call did not match this layer"
-                     : "generateTemporaryImage not hooked on this build");
+                 anyGenerateHooked() ? "generate call did not match this layer"
+                                     : "generateTemporaryImage not hooked on this build");
         }
     }
 
@@ -2118,7 +2343,7 @@ void drawWithAndroidsBlur(void* blurred_sp, void* input_sp, const SkRect* blur_r
 void drawGlass(void* self, SkCanvas* canvas, const SkRRect* region, uint32_t radius, float alpha,
                const SkRect* blur_rect, void* blurred_sp, void* input_sp) {
     const int64_t t0 = glass::param(glass::P_stats) != 0.0f ? monotonicNs() : 0;
-    deferredBlurSeen(blurred_sp, input_sp);
+    blurred_sp = blurSlotFor(blurred_sp, input_sp);
     if (!drawGlassCore(canvas, region, radius, 1.0f, alpha, blur_rect, blurred_sp, input_sp) &&
         g_original != nullptr) {
         drawWithAndroidsBlur(blurred_sp, input_sp, blur_rect, radius, [&](void* blurred) {
@@ -2139,7 +2364,7 @@ void drawGlassScaled(void* self, SkCanvas* canvas, const SkRRect* region, uint32
     // used to be handed back to stock whenever it was not 1; it is honoured now,
     // and the draw log reports it whenever it moves off or back to 1.
     const int64_t t0 = glass::param(glass::P_stats) != 0.0f ? monotonicNs() : 0;
-    deferredBlurSeen(blurred_sp, input_sp);
+    blurred_sp = blurSlotFor(blurred_sp, input_sp);
     if (!drawGlassCore(canvas, region, radius, scale, alpha, blur_rect, blurred_sp, input_sp) &&
         g_original_scaled != nullptr) {
         drawWithAndroidsBlur(blurred_sp, input_sp, blur_rect, radius, [&](void* blurred) {
@@ -2151,7 +2376,107 @@ void drawGlassScaled(void* self, SkCanvas* canvas, const SkRRect* region, uint32
     statsFlush();
 }
 
+// Evolution X 12.x (Evolution-X/frameworks_native, branch cnb, "renderengine:
+// Draw blur regions as Liquid Glass", written 2026-10-05, in EvoX from 11-05),
+// and crDroid 13.x, which took the same commit on 11-11. `kind` is the region's
+// material: -1 for a layer's own blur, 0 for the notification shade's, and 1
+// to 11 for the ColorOS-style materials a client can ask for in a blur region
+// (11 is the dock), which EvoX draws as its glass whatever its Liquid Glass
+// switch says. That switch (persist.sys.evolution.liquid_glass, off unless
+// set) is what would make glass of the 0 and -1 regions. StockGlass draws
+// where AOSP would have drawn a plain blur, material 0 and below, and leaves
+// the materials a client chose to EvoX. Every call to the original carries
+// kind as it came.
+void drawGlassScaledKind(void* self, SkCanvas* canvas, const SkRRect* region, uint32_t radius,
+                         float scale, float alpha, const SkRect* blur_rect, void* blurred_sp,
+                         void* input_sp, int kind) {
+    const int64_t t0 = glass::param(glass::P_stats) != 0.0f ? monotonicNs() : 0;
+    blurred_sp = blurSlotFor(blurred_sp, input_sp);
+    if (kind > 0) {
+        static bool s_said = false;
+        if (!s_said) {
+            s_said = true;
+            LOGI("a region with an Evolution X material (%d): left to the ROM's glass", kind);
+        }
+        if (g_original_scaled_kind != nullptr) {
+            drawWithAndroidsBlur(blurred_sp, input_sp, blur_rect, radius, [&](void* blurred) {
+                g_original_scaled_kind(self, canvas, region, radius, scale, alpha, blur_rect,
+                                       blurred, input_sp, kind);
+            });
+        }
+    } else if (!drawGlassCore(canvas, region, radius, scale, alpha, blur_rect, blurred_sp,
+                              input_sp) &&
+               g_original_scaled_kind != nullptr) {
+        drawWithAndroidsBlur(blurred_sp, input_sp, blur_rect, radius, [&](void* blurred) {
+            g_original_scaled_kind(self, canvas, region, effectiveRadius(radius), scale, alpha,
+                                   blur_rect, blurred, input_sp, kind);
+        });
+    }
+    if (t0 != 0) g_stats.hook_ns += monotonicNs() - t0;
+    statsFlush();
+}
+
 // -------------------------------------------------------------- install
+
+// Branch protection. Some ROMs build SurfaceFlinger with BTI (Pixel from
+// Android 17 QPR1, Lineage 24 for garnet, Nothing's Qualcomm builds), and on
+// an ARMv9 core its code pages are then guarded: an indirect branch may land
+// only on a `bti` or `paciasp`. frida's way back from the trampoline into the
+// hooked function is such a branch, to an ordinary instruction. The page
+// frida patches loses its guard when frida re-protects it (mprotect keeps
+// PROT_BTI only when asked to), but the way back lands on the next page when
+// the patch ends at a page boundary, and that page would still be guarded:
+// SIGILL in SurfaceFlinger, about one function start in 256. So the pages
+// from the target to just past the longest patch are made plain read-and-
+// execute first, before anything is patched, so that no frame can ever run
+// through a half-made hook. Nothing else changes for them, and where BTI is
+// not enforced nothing changes at all. Not yet run on a phone that enforces
+// it: alioth and the F1 are ARMv8.x.
+//
+// The engine's own calls into SurfaceFlinger are indirect too (BLR through
+// the resolved pointers), so each must land on a `bti c`, `bti jc` or
+// `paciasp`/`pacibsp`. On all 21 BTI-built surfaceflingers in the corpus every
+// function the engine calls starts with one: the compiler keeps a landing pad
+// on anything whose address can escape. landsOnPad() checks that again on the
+// running build. libglassengine.so is not BTI-built, so its own pages are never
+// guarded, and frida's trampolines live in pages of its own.
+bool cpuHasBti() {
+#if defined(__aarch64__)
+    return (getauxval(AT_HWCAP2) & HWCAP2_BTI) != 0;
+#else
+    return false;
+#endif
+}
+
+void dropBranchGuard(const void* target, const char* label) {
+#if defined(__aarch64__)
+    // How far past a hook target frida's patch can reach: its longest
+    // redirect is four instructions (LDR, BR and an 8-byte literal), and the
+    // way back into the function lands right after what it overwrote.
+    constexpr uintptr_t kPatchReach = 32;
+    const uintptr_t page = static_cast<uintptr_t>(sysconf(_SC_PAGESIZE));
+    const uintptr_t at = reinterpret_cast<uintptr_t>(target);
+    const uintptr_t start = at & ~(page - 1);
+    const uintptr_t end = (at + kPatchReach + page - 1) & ~(page - 1);
+    if (mprotect(reinterpret_cast<void*>(start), end - start, PROT_READ | PROT_EXEC) != 0) {
+        LOGW("could not clear branch-target guarding around %s (%s)%s", label, strerror(errno),
+             cpuHasBti() ? "; this CPU implements BTI" : "");
+    }
+#else
+    (void)target;
+    (void)label;
+#endif
+}
+
+// Whether a BLR may land on the first instruction of fn in a guarded page.
+bool landsOnPad(const void* fn) {
+    uint32_t w;
+    memcpy(&w, fn, sizeof(w));
+    return w == 0xd503245f     // bti c
+           || w == 0xd50324df  // bti jc
+           || w == 0xd503233f  // paciasp
+           || w == 0xd503237f;  // pacibsp
+}
 
 bool install() {
     const std::string exe = glass::selfExePath();
@@ -2178,127 +2503,143 @@ bool install() {
 
     const auto t0 = std::chrono::steady_clock::now();
 
-    glass::SymbolResolver resolver;
-    if (!resolver.loadFromFile(exe, glass::inflateXzAdapter, nullptr)) {
-        LOGE("symbol load failed: %s", resolver.error().c_str());
-        return false;
-    }
-
-    // Resolve every entry point now, including the builder ones the draw does
-    // not use, so the log shows exactly what a new target has to work with.
-    bool strategy_ok[glass::sf::kStrategyCount];
-    for (bool& ok : strategy_ok) ok = true;
-    glass::Symbol draw{};
-    for (size_t i = 0; i < glass::sf::kEntryPointCount; ++i) {
-        const glass::sf::EntryPoint& ep = glass::sf::kEntryPoints[i];
-        glass::Symbol hit{};
-        for (const char* const* m = ep.manglings; *m != nullptr; ++m) {
-            hit = resolver.find(*m);
-            if (hit.valid()) break;
-        }
-        if (!hit.valid()) {
-            // kHookTarget and kDataRelease are groups of alternatives; a missing
-            // member is expected, so it must not condemn the group.
-            if (ep.strategy != glass::sf::kHookTarget &&
-                ep.strategy != glass::sf::kDataRelease) {
-                strategy_ok[ep.strategy] = false;
-            }
-            // A prefix hit with no exact hit means the signature drifted into a
-            // form we have not vetted — that is an ABI change, not an absence.
-            // Drift is only fatal where the draw actually depends on the
-            // symbol. On an optional or informational entry we have a fallback
-            // or no use at all, and refusing to install would be theatre.
-            // A hook-target variant is expected to be absent whenever the other
-            // shape is present, and its prefix matches that shape, so it is not
-            // drift. The "exactly one shape" test below is the real check.
-            if (ep.prefix != nullptr && ep.strategy != glass::sf::kHookTarget &&
-                !resolver.findByPrefix(ep.prefix).empty()) {
-                const bool fatal = ep.strategy == glass::sf::kCore ||
-                                   ep.strategy == glass::sf::kDataRelease;
-                LOGE("SIGNATURE DRIFT on %s%s", ep.label,
-                     fatal ? " — refusing to install" : " (have a fallback; continuing)");
-                if (fatal) return false;
-            }
-            if (ep.strategy == glass::sf::kCore) LOGE("missing core entry point: %s", ep.label);
-            continue;
-        }
-        g_syms[i] = hit;
-    }
-
-    // Exactly one shape of drawBlurRegion, and which one decides the
-    // replacement installed.
-    const bool plain = g_syms[glass::sf::kDrawBlurRegion].valid();
-    const bool scaled = g_syms[glass::sf::kDrawBlurRegionScaled].valid();
-    void* replacement = nullptr;
-    if (plain && !scaled) {
-        draw = g_syms[glass::sf::kDrawBlurRegion];
-        replacement = reinterpret_cast<void*>(&drawGlass);
-    } else if (scaled && !plain) {
-        draw = g_syms[glass::sf::kDrawBlurRegionScaled];
-        replacement = reinterpret_cast<void*>(&drawGlassScaled);
-    } else if (plain && scaled) {
-        LOGE("both drawBlurRegion shapes present; cannot tell which one runs");
-        return false;
-    } else {
-        LOGE("no known drawBlurRegion shape; refusing to install");
-        return false;
-    }
-    LOGI("hook target: %s", plain ? "drawBlurRegion(radius, alpha)"
-                                  : "drawBlurRegion(radius, scale, alpha)");
-
-    if (!strategy_ok[glass::sf::kCore] || !draw.valid()) {
-        LOGE("core entry points missing; refusing to install");
-        return false;
-    }
-    // kDataRelease is a group of alternatives, so strategy_ok is the wrong test
-    // for it: what matters is that the bridge ends up with one of them.
-    // kDataRelease is a group of alternatives and kOptional is never required,
-    // so strategy_ok is the wrong test for both; what matters is what the bridge
-    // ended up with. Report it, because "which path did this target take" is the
-    // first question worth asking when a new build misbehaves.
-    LOGI("%zu symbols; builder %s; blob release via %s; getTotalMatrix %s; setShader %s",
-         resolver.count(), strategy_ok[glass::sf::kBuilder] ? "complete" : "partial (unused)",
-         g_syms[glass::sf::kSkSpDataDtor].valid() ? "sk_sp dtor"
-             : (g_syms[glass::sf::kDataUnref].valid() ? "SkNVRefCnt::unref" : "NOTHING"),
-         g_syms[glass::sf::kCanvasGetTotalMatrix].valid() ? "resolved" : "OUR DEFINITION",
-         g_syms[glass::sf::kPaintSetShader].valid() ? "resolved" : "OUR DEFINITION");
-
-    if (draw.size <= 64) {
-        LOGE("drawBlurRegion is only %llu bytes — inlined, nothing to hook",
-             static_cast<unsigned long long>(draw.size));
-        return false;
-    }
-
     bool found = false;
     const uintptr_t bias = glass::moduleLoadBias(exe.c_str(), &found);
     if (!found) {
         LOGE("no load mapping for %s", exe.c_str());
         return false;
     }
-
     g_bias = bias;
+
+    // Branch protection: a BTI-built SurfaceFlinger on a CPU that implements
+    // BTI runs with its code guarded (bionic maps it so), which is when
+    // dropBranchGuard and landsOnPad matter. The file is the patched copy
+    // that is running; patchelf moves the property note but keeps it.
+    uint32_t features = 0;
+    const bool bti_built = glass::readAarch64Features(exe, &features) &&
+                           (features & glass::kAarch64FeatureBti) != 0;
+    const bool bti_guarded = bti_built && cpuHasBti();
+    __system_property_set("sys.glass.bti", bti_guarded ? "guarded"
+                                           : bti_built ? "built"
+                                           : cpuHasBti() ? "cpu"
+                                                         : "none");
+    if (bti_guarded) {
+        LOGI("surfaceflinger is BTI-built and this CPU enforces BTI: its code is guarded, and "
+             "the pages at each hook lose their guard");
+    } else if (bti_built) {
+        LOGI("surfaceflinger is BTI-built; this CPU does not implement BTI, so nothing is guarded");
+    }
 
     // A function that returns an object by value is only called if it takes the
     // result address the standard way (x8 on AArch64). The compiler is free to
     // change that for a function it can see every caller of, and on the arm64
     // A17 builds measured it did for MakeForShader(SkString): called the
-    // standard way it crashed SurfaceFlinger on the first glass frame. One that
-    // fails is treated as absent: an optional one falls back, a core one makes
-    // the bridge incomplete and the engine stays out of the way.
+    // standard way it crashed SurfaceFlinger on the first glass frame. Asked of
+    // the code in memory; one that fails is treated as absent (sf_resolve.h).
+    // Calls the scan follows stay inside the binary's own code segments.
+    struct ProbeContext {
+        uintptr_t bias;
+        std::vector<glass::ExecSegment> segs;
+    };
+    auto probe = [](const glass::Symbol& s, std::string* detail,
+                    void* user) -> glass::ResultRegister {
+        const auto* c = static_cast<const ProbeContext*>(user);
+        return glass::resultRegisterInProcess(s.value, c->bias, &c->segs, detail);
+    };
+    ProbeContext probe_ctx{bias, glass::readExecSegments(exe)};
+    void* const probe_bias = &probe_ctx;
+
+    // The install-time cache first (sf_cache.h): glasscheck resolved this very
+    // binary and recorded the addresses with their first code bytes. Checking
+    // them reads a few kilobytes; resolving reads the whole binary and inflates
+    // its MiniDebugInfo. Anything wrong with the cache means resolving as
+    // before, so it can cost time and never correctness.
+    glass::sf::Resolution res;
+    std::string why;
+    const std::string cache = glass::sf::cachePathFor(enginePath());
+    bool from_cache = glass::sf::readCacheForProcess(cache, exe, bias, &res, &why);
+    if (from_cache) {
+        glass::sf::probeAbi(&res, probe, probe_bias);
+        glass::sf::judge(&res);
+        if (!res.ok) {
+            LOGW("the symbol cache does not add up (%s); resolving from symbols",
+                 res.fatal.empty() ? "?" : res.fatal[0].c_str());
+            from_cache = false;
+        }
+    } else {
+        LOGI("symbol cache not used: %s", why.c_str());
+    }
+    if (!from_cache) {
+        glass::SymbolResolver resolver;
+        if (!resolver.loadFromFile(exe, glass::inflateXzAdapter, nullptr)) {
+            LOGE("symbol load failed: %s", resolver.error().c_str());
+            return false;
+        }
+        glass::sf::resolve(resolver, probe, probe_bias, &res);
+    }
     for (size_t i = 0; i < glass::sf::kEntryPointCount; ++i) {
-        const glass::sf::EntryPoint& ep = glass::sf::kEntryPoints[i];
-        if (!ep.result_in_memory || !g_syms[i].valid()) continue;
-        std::string detail;
-        const glass::ResultRegister rr = glass::resultRegisterInMemory(
-            reinterpret_cast<const void*>(bias + g_syms[i].value), g_syms[i].size, &detail);
-        if (rr == glass::ResultRegister::kX8) continue;
-        LOGW("%s does not take its result address in x8 (%s: %s); not calling it", ep.label,
-             glass::resultRegisterName(rr), detail.c_str());
-        g_syms[i] = glass::Symbol{};
+        if (res.entry[i].abi_rejected) {
+            LOGW("%s does not take its result address in x8 (%s); not calling it",
+                 glass::sf::kEntryPoints[i].label, res.entry[i].abi_detail.c_str());
+        }
+    }
+    for (const std::string& n : res.notes) LOGI("note: %s", n.c_str());
+    if (!res.ok) {
+        for (const std::string& f : res.fatal) LOGE("cannot drive this build: %s", f.c_str());
+        LOGE("refusing to install; Android's blur is untouched");
+        return false;
+    }
+    for (size_t i = 0; i < glass::sf::kCount; ++i) g_syms[i] = res.entry[i].sym;
+
+    // A RenderEngine that keeps a layer's blur from one frame to the next
+    // (sf_symbols.cpp, kBlurCacheValid) would keep a snapshot handed back in
+    // a blur's place as that layer's blur, and draw it on the frames after,
+    // where nothing tells it from a blur any more. Nothing is put off there.
+    if (g_syms[glass::sf::kBlurCacheValid].valid()) {
+        g_lazy_refused = true;
+        LOGI("this RenderEngine can keep blurs between frames; Android's blur is never put "
+             "off here");
     }
 
+    // Exactly one shape of drawBlurRegion (judge() made sure), and which one
+    // decides the replacement installed.
+    static_assert(glass::sf::kHookShapeCount == 3,
+                  "a hook shape without a replacement function: add one below");
+    void* const replacements[glass::sf::kHookShapeCount] = {
+        reinterpret_cast<void*>(&drawGlass), reinterpret_cast<void*>(&drawGlassScaled),
+        reinterpret_cast<void*>(&drawGlassScaledKind)};
+    void** const original_slots[glass::sf::kHookShapeCount] = {
+        reinterpret_cast<void**>(&g_original), reinterpret_cast<void**>(&g_original_scaled),
+        reinterpret_cast<void**>(&g_original_scaled_kind)};
+    const glass::sf::HookShape& shape = glass::sf::kHookShapes[res.shape];
+    const glass::Symbol draw = res.sym(shape.entry);
+    void* const replacement = replacements[res.shape];
+    LOGI("hook target: %s, resolved from %s", shape.label,
+         from_cache ? "the install-time cache" : "symbols");
+
+    // Report which path through the bridge this target takes, because that is
+    // the first question worth asking when a new build misbehaves.
+    LOGI("%s; blob release via %s; getTotalMatrix %s; setShader %s",
+         from_cache ? "symbols: cached" : (std::to_string(res.symbol_count) + " symbols").c_str(),
+         g_syms[glass::sf::kSkSpDataDtor].valid() ? "sk_sp dtor"
+             : (g_syms[glass::sf::kDataUnref].valid() ? "SkNVRefCnt::unref" : "NOTHING"),
+         g_syms[glass::sf::kCanvasGetTotalMatrix].valid() ? "resolved" : "OUR DEFINITION",
+         g_syms[glass::sf::kPaintSetShader].valid() ? "resolved" : "OUR DEFINITION");
+
+    // Everything bound here is called through a pointer. On a guarded build, a
+    // function that does not start on a landing pad (none in the corpus) loses
+    // the guard on its first page instead of faulting at the first draw.
+    int unpadded = 0;
     auto addr = [&](size_t i) -> void* {
-        return g_syms[i].valid() ? reinterpret_cast<void*>(bias + g_syms[i].value) : nullptr;
+        if (!g_syms[i].valid()) return nullptr;
+        void* fn = reinterpret_cast<void*>(bias + g_syms[i].value);
+        if (bti_guarded && !landsOnPad(fn)) {
+            LOGW("%s starts without a landing pad; its page loses the guard",
+                 glass::sf::kEntryPoints[i].label);
+            dropBranchGuard(fn, glass::sf::kEntryPoints[i].label);
+            ++unpadded;
+        }
+        return fn;
     };
 #define BIND(field, index) \
     g_sk.field = reinterpret_cast<decltype(g_sk.field)>(addr(glass::sf::index))
@@ -2309,6 +2650,13 @@ bool install() {
     BIND(findUniform, kFindUniform);
     BIND(findChild, kFindChild);
     BIND(uniformSize, kEffectUniformSize);
+    // For trying, on a build that has them, the layout a build without them
+    // gets (uniformOffsets): set before SurfaceFlinger starts.
+    if (propGet("debug.glass.noFindUniform", "") == "1") {
+        g_sk.findUniform = nullptr;
+        g_sk.findChild = nullptr;
+        LOGW("debug.glass.noFindUniform=1: uniforms laid out as on a build without findUniform");
+    }
     BIND(ImageMakeShader, kImageMakeShader);
     BIND(DataMakeZeroInit, kDataMakeZeroInit);
     BIND(SkSpDataDtor, kSkSpDataDtor);
@@ -2323,7 +2671,11 @@ bool install() {
     BIND(PaintSetShader, kPaintSetShader);
     BIND(ImageMakeSubset, kImageMakeSubset);
     BIND(CanvasBaseRecorder, kCanvasBaseRecorder);
+    BIND(CanvasRecorder, kCanvasRecorder);
 #undef BIND
+    if (bti_guarded && unpadded == 0) {
+        LOGI("every function the engine calls starts on a landing pad");
+    }
     if (!g_sk.drawReady()) {
         LOGE("skia bridge incomplete after binding; refusing to install");
         return false;
@@ -2348,11 +2700,11 @@ bool install() {
     // alioth the denied allocation became a null dereference in this
     // constructor, before SurfaceFlinger's main(), on every start. Ask first,
     // on throwaway mappings, and stand down if the answer is no.
-    std::string why;
-    if (!glass::canPatchCode(&why)) {
+    std::string denied;
+    if (!glass::canPatchCode(&denied)) {
         LOGE("SELinux will not let surfaceflinger patch code (%s). The module's sepolicy.rule "
              "grants execmem and execmod; it did not apply here. Not hooking: Android's blur is "
-             "untouched", why.c_str());
+             "untouched", denied.c_str());
         return false;
     }
 
@@ -2363,9 +2715,9 @@ bool install() {
         return false;
     }
 
+    dropBranchGuard(target, "drawBlurRegion");
     gum_interceptor_begin_transaction(g_interceptor);
-    void** original_slot = plain ? reinterpret_cast<void**>(&g_original)
-                                 : reinterpret_cast<void**>(&g_original_scaled);
+    void** original_slot = original_slots[res.shape];
     const GumReplaceReturn r = gum_interceptor_replace(
         g_interceptor, target, replacement, reinterpret_cast<gpointer*>(original_slot), nullptr);
     gum_interceptor_end_transaction(g_interceptor);
@@ -2385,24 +2737,21 @@ bool install() {
     // radius it asked for, and the draw hook above is unaffected either way.
     // Installed after the draw hook, in a transaction of its own, so a failure
     // here can never leave the draw half-hooked.
-    const size_t gen_index[kFilterCount] = {glass::sf::kGenerateKawase,
-                                            glass::sf::kGenerateGaussian,
-                                            glass::sf::kGenerateKawaseDualV2};
-    void* const gen_hook[kFilterCount] = {reinterpret_cast<void*>(&generateHook<0>),
-                                          reinterpret_cast<void*>(&generateHook<1>),
-                                          reinterpret_cast<void*>(&generateHook<2>)};
+    const auto gen_hook = generateHooks(std::make_index_sequence<kFilterCount>{});
     int generate_hooked = 0;
     gum_interceptor_begin_transaction(g_interceptor);
     for (size_t k = 0; k < kFilterCount; ++k) {
-        const glass::Symbol& sym = g_syms[gen_index[k]];
+        const size_t index = glass::sf::kGenerateFilters[k];
+        const glass::Symbol& sym = g_syms[index];
         if (!sym.valid()) continue;
-        const char* label = glass::sf::kEntryPoints[gen_index[k]].label;
+        const char* label = glass::sf::kEntryPoints[index].label;
         if (sym.size <= 64) {
             LOGW("%s is only %llu bytes; not hooking it", label,
                  static_cast<unsigned long long>(sym.size));
             continue;
         }
         void* gen_target = reinterpret_cast<void*>(bias + sym.value);
+        dropBranchGuard(gen_target, label);
         const GumReplaceReturn gr =
             gum_interceptor_replace(g_interceptor, gen_target, gen_hook[k],
                                     reinterpret_cast<gpointer*>(&g_generate[k]), nullptr);

@@ -64,5 +64,27 @@ adb shell 'chmod 755 /system/bin/surfaceflinger.new &&
            chcon u:object_r:surfaceflinger_exec:s0 /system/bin/surfaceflinger.new &&
            mv /system/bin/surfaceflinger.new /system/bin/surfaceflinger'
 
+# The symbol cache the engine checks at start (src/sf_cache.h), written by the
+# device's own glasscheck against the binary just installed, exactly as the
+# module's build-overlay.sh does. Optional: without glasscheck built, or if it
+# fails, the engine resolves symbols at start as before.
+CHECK="$HERE/tools/out/$abi/glasscheck"
+CACHE=/system/lib64/libglassengine.symcache
+adb shell "rm -f $CACHE"
+if [ -f "$CHECK" ]; then
+  adb push "$CHECK" /data/local/tmp/glasscheck >/dev/null
+  if adb shell "chmod 755 /data/local/tmp/glasscheck &&
+                /data/local/tmp/glasscheck --cache-out /data/local/tmp/glass.symcache /system/bin/surfaceflinger >/dev/null &&
+                cp /data/local/tmp/glass.symcache $CACHE && chmod 644 $CACHE &&
+                chcon u:object_r:system_lib_file:s0 $CACHE"; then
+    echo "symbol cache written -> $CACHE"
+  else
+    adb shell "rm -f $CACHE"
+    echo "no symbol cache (glasscheck failed); the engine resolves at start"
+  fi
+else
+  echo "glasscheck not built (engine/tools/build.sh); no symbol cache"
+fi
+
 echo "installed for $abi"
-adb shell 'ls -Z /system/bin/surfaceflinger /system/lib64/libglassengine.so'
+adb shell "ls -Z /system/bin/surfaceflinger /system/lib64/libglassengine.so $CACHE 2>/dev/null"

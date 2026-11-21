@@ -1,6 +1,8 @@
 #include "elf_syms.h"
 
 #include <elf.h>
+#include <fcntl.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <cstdio>
@@ -21,16 +23,33 @@ inline bool inRange(size_t base, size_t off, size_t len, size_t total) {
 }
 
 bool readWholeFile(const std::string& path, std::vector<uint8_t>* out) {
+    // A regular file of a believable size only. An ifstream opens a directory
+    // too, and its tellg is then a size no allocation survives: bad_alloc,
+    // which inside SurfaceFlinger would be an abort.
+    struct stat st {};
+    if (stat(path.c_str(), &st) != 0 || !S_ISREG(st.st_mode) || st.st_size <= 0 ||
+        st.st_size > (512LL << 20)) {
+        return false;
+    }
     std::ifstream f(path, std::ios::binary | std::ios::ate);
     if (!f) return false;
     const std::streamsize n = f.tellg();
-    if (n <= 0) return false;
+    if (n <= 0 || n != static_cast<std::streamsize>(st.st_size)) return false;
     out->resize(static_cast<size_t>(n));
     f.seekg(0);
     return static_cast<bool>(f.read(reinterpret_cast<char*>(out->data()), n));
 }
 
 }  // namespace
+
+const char* symbolOriginName(SymbolOrigin o) {
+    switch (o) {
+        case SymbolOrigin::kSymtab: return ".symtab";
+        case SymbolOrigin::kDynsym: return ".dynsym";
+        case SymbolOrigin::kMiniDebugInfo: return "MiniDebugInfo";
+        default: return "?";
+    }
+}
 
 // ---------------------------------------------------------------------- ElfView
 
@@ -99,7 +118,7 @@ const uint8_t* ElfView::section(const char* name, size_t* out_size) const {
     return nullptr;
 }
 
-bool ElfView::collectFunctions(const char* symtab_name,
+bool ElfView::collectFunctions(const char* symtab_name, SymbolOrigin origin,
                                std::unordered_map<std::string, Symbol>* out) const {
     if (!ok() || out == nullptr) return false;
 
@@ -136,7 +155,7 @@ bool ElfView::collectFunctions(const char* symtab_name,
             const size_t len = strnlen(nm, max_len);
             if (len == 0 || len == max_len) continue;
 
-            out->emplace(std::string(nm, len), Symbol{sym.st_value, sym.st_size});
+            out->emplace(std::string(nm, len), Symbol{sym.st_value, sym.st_size, origin});
         }
         return true;
     }
@@ -162,11 +181,12 @@ bool SymbolResolver::loadFromFile(const std::string& path, InflateFn inflate, vo
     }
 
     // An unstripped or partially stripped build resolves without MiniDebugInfo.
-    outer.collectFunctions(".symtab", &syms_);
-    outer.collectFunctions(".dynsym", &syms_);
+    outer.collectFunctions(".symtab", SymbolOrigin::kSymtab, &syms_);
+    outer.collectFunctions(".dynsym", SymbolOrigin::kDynsym, &syms_);
 
     size_t mdi_size = 0;
     const uint8_t* mdi = outer.section(".gnu_debugdata", &mdi_size);
+    had_mdi_ = mdi != nullptr && mdi_size > 0;
     if (mdi != nullptr && mdi_size > 0 && inflate != nullptr) {
         std::vector<uint8_t> inner_bytes;
         if (inflate(mdi, mdi_size, &inner_bytes, user)) {
@@ -174,7 +194,7 @@ bool SymbolResolver::loadFromFile(const std::string& path, InflateFn inflate, vo
             if (inner.parse(inner_bytes.data(), inner_bytes.size())) {
                 // MiniDebugInfo keeps exactly the symbols the outer .dynsym
                 // lacks, which is precisely the set we need.
-                inner.collectFunctions(".symtab", &syms_);
+                inner.collectFunctions(".symtab", SymbolOrigin::kMiniDebugInfo, &syms_);
             } else {
                 error_ = "decompressed .gnu_debugdata is not ELF64";
             }
@@ -202,6 +222,187 @@ std::vector<std::string> SymbolResolver::findByPrefix(const std::string& prefix)
         }
     }
     return hits;
+}
+
+// ------------------------------------------------------- build id, properties
+
+namespace {
+
+// Spelled out rather than taken from <elf.h>: older glibc and NDK headers lack
+// some of them, and the values are fixed by the ABI.
+constexpr uint32_t kPtGnuProperty = 0x6474e553;            // PT_GNU_PROPERTY
+constexpr uint32_t kNtGnuPropertyType0 = 5;                // NT_GNU_PROPERTY_TYPE_0
+constexpr uint32_t kAarch64Feature1And = 0xc0000000;       // GNU_PROPERTY_AARCH64_FEATURE_1_AND
+
+// The program header table of an ELF64 little-endian file. Every read here is
+// bounded: the table and a note segment are a few hundred bytes on every
+// Android build, so anything larger is refused rather than allocated.
+bool readProgramHeaders(int fd, std::vector<Elf64_Phdr>* ph) {
+    Elf64_Ehdr eh{};
+    if (pread(fd, &eh, sizeof(eh), 0) != static_cast<ssize_t>(sizeof(eh)) ||
+        memcmp(eh.e_ident, ELFMAG, SELFMAG) != 0 || eh.e_ident[EI_CLASS] != ELFCLASS64 ||
+        eh.e_ident[EI_DATA] != ELFDATA2LSB || eh.e_phentsize != sizeof(Elf64_Phdr) ||
+        eh.e_phnum == 0 || eh.e_phnum > 64) {
+        return false;
+    }
+    ph->resize(eh.e_phnum);
+    const size_t bytes = ph->size() * sizeof(Elf64_Phdr);
+    return pread(fd, ph->data(), bytes, static_cast<off_t>(eh.e_phoff)) ==
+           static_cast<ssize_t>(bytes);
+}
+
+bool readSegment(int fd, const Elf64_Phdr& p, size_t limit, std::vector<uint8_t>* out) {
+    if (p.p_filesz == 0 || p.p_filesz > limit) return false;
+    out->resize(p.p_filesz);
+    return pread(fd, out->data(), out->size(), static_cast<off_t>(p.p_offset)) ==
+           static_cast<ssize_t>(out->size());
+}
+
+struct Note {
+    uint32_t type;
+    bool gnu;  // named "GNU"
+    const uint8_t* desc;
+    uint32_t descsz;
+};
+
+// Each note of a note segment, until fn returns true. An Elf64_Nhdr (namesz,
+// descsz, type) is followed by the name and then the descriptor, each starting
+// on the segment's alignment: 4 for most notes, 8 for an ELF64
+// .note.gnu.property. For a "GNU" name both put the descriptor at +16.
+template <typename Fn>
+void forEachNote(const std::vector<uint8_t>& seg, size_t align, Fn fn) {
+    const auto up = [align](size_t n) { return (n + align - 1) & ~(align - 1); };
+    size_t at = 0;
+    while (at <= seg.size() && seg.size() - at >= 12) {
+        uint32_t namesz, descsz, type;
+        memcpy(&namesz, &seg[at], 4);
+        memcpy(&descsz, &seg[at + 4], 4);
+        memcpy(&type, &seg[at + 8], 4);
+        const size_t name = at + 12;
+        if (namesz > seg.size() - name) return;
+        const size_t desc = up(name + namesz);
+        if (desc > seg.size() || descsz > seg.size() - desc) return;
+        const Note n{type, namesz == 4 && memcmp(&seg[name], "GNU", 4) == 0, seg.data() + desc,
+                     descsz};
+        if (fn(n)) return;
+        at = up(desc + descsz);
+    }
+}
+
+}  // namespace
+
+std::string readGnuBuildId(const std::string& path) {
+    const int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return {};
+    std::string hex;
+    std::vector<Elf64_Phdr> ph;
+    if (readProgramHeaders(fd, &ph)) {
+        for (const Elf64_Phdr& p : ph) {
+            std::vector<uint8_t> seg;
+            if (p.p_type != PT_NOTE || !readSegment(fd, p, 65536, &seg)) continue;
+            forEachNote(seg, p.p_align == 8 ? 8 : 4, [&hex](const Note& n) {
+                if (!n.gnu || n.type != NT_GNU_BUILD_ID || n.descsz == 0 || n.descsz > 64) {
+                    return false;
+                }
+                static const char kHex[] = "0123456789abcdef";
+                for (uint32_t i = 0; i < n.descsz; ++i) {
+                    hex.push_back(kHex[n.desc[i] >> 4]);
+                    hex.push_back(kHex[n.desc[i] & 15]);
+                }
+                return true;
+            });
+            if (!hex.empty()) break;
+        }
+    }
+    close(fd);
+    return hex;
+}
+
+bool readAarch64Features(const std::string& path, uint32_t* features) {
+    *features = 0;
+    const int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return false;
+    bool found = false;
+    std::vector<Elf64_Phdr> ph;
+    if (readProgramHeaders(fd, &ph)) {
+        for (const Elf64_Phdr& p : ph) {
+            // Only where the kernel and bionic look: PT_GNU_PROPERTY, never a
+            // property note sitting in a PT_NOTE alone. 1 KiB is the kernel's
+            // own limit for it.
+            std::vector<uint8_t> seg;
+            if (p.p_type != kPtGnuProperty) continue;
+            if (!readSegment(fd, p, 1024, &seg)) break;
+            forEachNote(seg, 8, [&](const Note& n) {
+                if (!n.gnu || n.type != kNtGnuPropertyType0) return false;
+                // Properties: pr_type, pr_datasz, then pr_data padded to 8.
+                size_t at = 0;
+                while (n.descsz - at >= 8) {
+                    uint32_t type, datasz;
+                    memcpy(&type, n.desc + at, 4);
+                    memcpy(&datasz, n.desc + at + 4, 4);
+                    at += 8;
+                    if (datasz > n.descsz - at) break;
+                    if (type == kAarch64Feature1And && datasz == 4) {
+                        memcpy(features, n.desc + at, 4);
+                        found = true;
+                        break;
+                    }
+                    const size_t step = (static_cast<size_t>(datasz) + 7) & ~size_t{7};
+                    if (step > n.descsz - at) break;
+                    at += step;
+                }
+                return true;
+            });
+            break;
+        }
+    }
+    close(fd);
+    return found;
+}
+
+std::vector<ExecSegment> readExecSegments(const std::string& path) {
+    std::vector<ExecSegment> out;
+    const int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return out;
+    Elf64_Ehdr eh{};
+    if (pread(fd, &eh, sizeof(eh), 0) == static_cast<ssize_t>(sizeof(eh)) &&
+        memcmp(eh.e_ident, ELFMAG, SELFMAG) == 0 && eh.e_ident[EI_CLASS] == ELFCLASS64 &&
+        eh.e_ident[EI_DATA] == ELFDATA2LSB && eh.e_phentsize == sizeof(Elf64_Phdr) &&
+        eh.e_phnum > 0 && eh.e_phnum <= 64) {
+        std::vector<Elf64_Phdr> ph(eh.e_phnum);
+        const size_t ph_bytes = ph.size() * sizeof(Elf64_Phdr);
+        if (pread(fd, ph.data(), ph_bytes, static_cast<off_t>(eh.e_phoff)) ==
+            static_cast<ssize_t>(ph_bytes)) {
+            for (const Elf64_Phdr& p : ph) {
+                if (p.p_type == PT_LOAD && (p.p_flags & PF_X) != 0 && p.p_filesz > 0) {
+                    out.push_back({p.p_vaddr, p.p_filesz, p.p_offset});
+                }
+            }
+        }
+    }
+    close(fd);
+    return out;
+}
+
+bool inExecSegment(const std::vector<ExecSegment>& segs, uint64_t vaddr, size_t n) {
+    for (const ExecSegment& s : segs) {
+        if (vaddr >= s.vaddr && n <= s.filesz && vaddr - s.vaddr <= s.filesz - n) return true;
+    }
+    return false;
+}
+
+bool readCodeAt(const std::string& path, const std::vector<ExecSegment>& segs, uint64_t vaddr,
+                size_t n, uint8_t* out) {
+    for (const ExecSegment& s : segs) {
+        if (!(vaddr >= s.vaddr && n <= s.filesz && vaddr - s.vaddr <= s.filesz - n)) continue;
+        const int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC);
+        if (fd < 0) return false;
+        const off_t off = static_cast<off_t>(s.offset + (vaddr - s.vaddr));
+        const bool ok = pread(fd, out, n, off) == static_cast<ssize_t>(n);
+        close(fd);
+        return ok;
+    }
+    return false;
 }
 
 // ----------------------------------------------------------------- process info

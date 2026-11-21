@@ -26,15 +26,38 @@
 #include "../src/abi_check.h"
 #include "../src/elf_syms.h"
 #include "../src/glass_params.h"
+#include "../src/sf_cache.h"
+#include "../src/sf_resolve.h"
 #include "../src/sf_symbols.h"
 #include "../src/xz_inflate.h"
+
+#ifdef __ANDROID__
+#include <sys/system_properties.h>
+#endif
 
 #include <cstdio>
 #include <cstring>
 #include <string>
 #include <vector>
 
+#if defined(__aarch64__)
+#include <sys/auxv.h>
+#ifndef HWCAP2_BTI
+#define HWCAP2_BTI (1 << 17)
+#endif
+#endif
+
 namespace {
+
+// The same question the engine asks before it hooks (glass_engine.cpp,
+// cpuHasBti): whether this CPU enforces BTI on guarded pages.
+bool cpuHasBti() {
+#if defined(__aarch64__)
+    return (getauxval(AT_HWCAP2) & HWCAP2_BTI) != 0;
+#else
+    return false;
+#endif
+}
 
 // Parameter names and summaries are compile-time constants with no quotes or
 // backslashes in them, so they need no escaping; a %g float is valid JSON as
@@ -92,118 +115,199 @@ int listPresets() {
 
 }  // namespace
 
+namespace {
+
+// Strings in the JSON report are mangled names, labels and fixed messages; the
+// escaping covers what could still appear in them.
+void jsonString(const std::string& s) {
+    putchar('"');
+    for (const char c : s) {
+        if (c == '"' || c == '\\') {
+            printf("\\%c", c);
+        } else if (static_cast<unsigned char>(c) < 0x20) {
+            printf("\\u%04x", c);
+        } else {
+            putchar(c);
+        }
+    }
+    putchar('"');
+}
+
+std::string prop(const char* name) {
+#ifdef __ANDROID__
+    char buf[PROP_VALUE_MAX] = {0};
+    return __system_property_get(name, buf) > 0 ? std::string(buf) : std::string();
+#else
+    (void)name;
+    return {};
+#endif
+}
+
+void printJson(const char* path, const glass::sf::Resolution& res, const std::string& build_id) {
+    printf("{\"path\":");
+    jsonString(path);
+    printf(",\"build_id\":");
+    jsonString(build_id);
+    printf(",\"symbols\":%zu,\"minidebuginfo\":%s,\"ok\":%s,\"shape\":", res.symbol_count,
+           res.had_minidebuginfo ? "true" : "false", res.ok ? "true" : "false");
+    if (res.shape >= 0) {
+        jsonString(glass::sf::kHookShapes[res.shape].label);
+    } else {
+        printf("null");
+    }
+    printf(",\"fatal\":[");
+    for (size_t i = 0; i < res.fatal.size(); ++i) {
+        if (i) putchar(',');
+        jsonString(res.fatal[i]);
+    }
+    printf("],\"notes\":[");
+    for (size_t i = 0; i < res.notes.size(); ++i) {
+        if (i) putchar(',');
+        jsonString(res.notes[i]);
+    }
+    printf("],\"entries\":[");
+    for (size_t i = 0; i < glass::sf::kEntryPointCount; ++i) {
+        const glass::sf::EntryPoint& ep = glass::sf::kEntryPoints[i];
+        const glass::sf::Resolved& e = res.entry[i];
+        printf("%s{\"label\":", i ? "," : "");
+        jsonString(ep.label);
+        printf(",\"strategy\":\"%s\",\"resolved\":%s", glass::sf::strategyName(ep.strategy),
+               e.sym.valid() ? "true" : "false");
+        if (e.sym.valid()) {
+            printf(",\"value\":\"0x%llx\",\"size\":%llu,\"source\":\"%s\"",
+                   static_cast<unsigned long long>(e.sym.value),
+                   static_cast<unsigned long long>(e.sym.size), glass::sf::sourceName(e.source));
+        }
+        if (e.drifted) {
+            printf(",\"drift\":");
+            jsonString(e.drift_name);
+        }
+        if (e.abi_rejected) {
+            printf(",\"abi\":");
+            jsonString(e.abi_detail);
+        }
+        putchar('}');
+    }
+    printf("]}\n");
+}
+
+int usage(const char* argv0) {
+    fprintf(stderr,
+            "usage: %s [--json] [--cache-out FILE] [surfaceflinger]\n"
+            "       %s --verify-cache FILE [surfaceflinger]\n"
+            "       %s --params | --presets\n",
+            argv0, argv0, argv0);
+    return 2;
+}
+
+}  // namespace
+
 int main(int argc, char** argv) {
     if (argc == 2 && strcmp(argv[1], "--params") == 0) return dumpParams();
     if (argc == 2 && strcmp(argv[1], "--presets") == 0) return listPresets();
 
-    const char* path = argc >= 2 ? argv[1] : "/system/bin/surfaceflinger";
-    if (argc > 2) {
-        fprintf(stderr, "usage: %s [surfaceflinger] | --params | --presets\n", argv[0]);
-        return 2;
+    const char* path = "/system/bin/surfaceflinger";
+    const char* cache_out = nullptr;
+    const char* verify_cache = nullptr;
+    bool json = false;
+    bool have_path = false;
+    for (int i = 1; i < argc; ++i) {
+        if (strcmp(argv[i], "--json") == 0) {
+            json = true;
+        } else if (strcmp(argv[i], "--cache-out") == 0 && i + 1 < argc) {
+            cache_out = argv[++i];
+        } else if (strcmp(argv[i], "--verify-cache") == 0 && i + 1 < argc) {
+            verify_cache = argv[++i];
+        } else if (argv[i][0] != '-' && !have_path) {
+            path = argv[i];
+            have_path = true;
+        } else {
+            return usage(argv[0]);
+        }
+    }
+
+    const std::string build_id = glass::readGnuBuildId(path);
+
+    // Checking a cache against the file is what the engine does against
+    // memory at every start; this lets the installer and the tests see the
+    // same verdict.
+    if (verify_cache != nullptr) {
+        glass::sf::Resolution res;
+        std::string why;
+        if (!glass::sf::readCacheForFile(verify_cache, path, &res, &why)) {
+            printf("FAIL  cache not usable: %s\n", why.c_str());
+            return 1;
+        }
+        glass::sf::probeAbi(&res, glass::sf::fileAbiProbe, const_cast<char*>(path));
+        glass::sf::judge(&res);
+        printf("%s  cache %s for %s (build id %s)\n", res.ok ? "OK  " : "FAIL",
+               res.ok ? "verified" : "does not add up", path, build_id.c_str());
+        return res.ok ? 0 : 1;
     }
 
     glass::SymbolResolver r;
     if (!r.loadFromFile(path, glass::inflateXzAdapter, nullptr)) {
-        printf("FAIL  cannot read symbols from %s\n      %s\n", path, r.error().c_str());
+        if (json) {
+            printf("{\"path\":");
+            jsonString(path);
+            printf(",\"build_id\":");
+            jsonString(build_id);
+            printf(",\"ok\":false,\"fatal\":[");
+            jsonString("cannot read symbols: " + r.error());
+            printf("]}\n");
+        } else {
+            printf("FAIL  cannot read symbols from %s\n      %s\n", path, r.error().c_str());
+            printf("      This build carries no symbol table the engine can use.\n");
+        }
         return 2;
     }
-    printf("%s\n  %zu function symbols recovered\n", path, r.count());
 
-    bool core_ok = true;
-    bool release_ok = false;
-    int shapes = 0;
-    int drift = 0;
-    int generators = 0;
-    bool make_wrapper_bad = false;  // MakeForShader(SkString) fails the x8 check
-    bool make_opts_ok = false;      // MakeForShader(SkString, const Options&) usable
+    glass::sf::Resolution res;
+    glass::sf::resolve(r, glass::sf::fileAbiProbe, const_cast<char*>(path), &res);
 
-    for (size_t i = 0; i < glass::sf::kEntryPointCount; ++i) {
-        const glass::sf::EntryPoint& ep = glass::sf::kEntryPoints[i];
-        glass::Symbol hit{};
-        for (const char* const* m = ep.manglings; *m != nullptr; ++m) {
-            hit = r.find(*m);
-            if (hit.valid()) break;
+    if (json) {
+        printJson(path, res, build_id);
+    } else {
+        const std::string fp = prop("ro.build.fingerprint");
+        if (!fp.empty()) printf("%s\n", fp.c_str());
+        printf("%s\n  build id %s\n  %zu function symbols recovered%s\n", path,
+               build_id.empty() ? "(none)" : build_id.c_str(), r.count(),
+               res.had_minidebuginfo ? " from MiniDebugInfo" : " (no MiniDebugInfo)");
+        if (res.shape >= 0) {
+            const glass::Symbol& t = res.sym(glass::sf::kHookShapes[res.shape].entry);
+            printf("  hook     %s at 0x%llx, %llu bytes\n", glass::sf::kHookShapes[res.shape].label,
+                   static_cast<unsigned long long>(t.value),
+                   static_cast<unsigned long long>(t.size));
         }
-
-        if (hit.valid() && ep.result_in_memory) {
-            // On arm64, a by-value result must come back the standard way (x8)
-            // or the engine will not call the function: same test, same answer
-            // as inside SurfaceFlinger. Not applicable on x86-64.
-            glass::ResultRegister rr{};
-            std::string detail;
-            int machine = 0;
-            if (glass::aarch64ResultRegisterInFile(path, hit.value, hit.size, &rr, &detail,
-                                                   &machine) &&
-                rr != glass::ResultRegister::kX8) {
-                if (i == glass::sf::kMakeForShader) {
-                    make_wrapper_bad = true;
-                    printf("  note     %s: result not taken in x8 (%s); "
-                           "the engine compiles through the Options form\n", ep.label,
-                           detail.c_str());
-                } else if (ep.strategy == glass::sf::kCore) {
-                    core_ok = false;
-                    printf("  ABI      %-38s result not taken in x8 (%s)\n", ep.label,
-                           detail.c_str());
-                } else {
-                    printf("  note     %s: result not taken in x8 (%s); not used\n", ep.label,
-                           detail.c_str());
-                }
-                continue;
-            }
+        printf("  lighter backdrop blur: %s\n",
+               res.canRegenerateBlur() ? "available" : "not on this build");
+        uint32_t features = 0;
+        if (glass::readAarch64Features(path, &features) &&
+            (features & glass::kAarch64FeatureBti) != 0) {
+            printf("  branch protection: BTI-built%s\n",
+                   cpuHasBti() ? ", and this CPU enforces it" : "; this CPU does not enforce it");
         }
+        for (const std::string& n : res.notes) printf("  note     %s\n", n.c_str());
+        for (const std::string& f : res.fatal) printf("  MISSING  %s\n", f.c_str());
+    }
 
-        if (hit.valid()) {
-            if (i == glass::sf::kMakeForShaderOpts) make_opts_ok = true;
-            if (ep.strategy == glass::sf::kDataRelease) release_ok = true;
-            if (ep.strategy == glass::sf::kHookTarget) {
-                ++shapes;
-                printf("  hook     %s\n", ep.label);
-            }
-            if (ep.strategy == glass::sf::kBlurGenerate) {
-                ++generators;
-                printf("  hook     %s (optional)\n", ep.label);
-            }
-            continue;
+    if (!res.ok) {
+        if (!json) {
+            printf("FAIL  this build's Skia is not one the engine can drive.\n"
+                   "      Nothing was installed; the device is untouched.\n");
         }
-
-        // A prefix hit with no exact hit means the signature changed shape.
-        // That is only dangerous where the draw depends on it.
-        const bool present_but_changed =
-            ep.prefix != nullptr && !r.findByPrefix(ep.prefix).empty();
-        const bool required = ep.strategy == glass::sf::kCore;
-
-        if (required) {
-            core_ok = false;
-            printf("  MISSING  %-38s %s\n", ep.label,
-                   present_but_changed ? "(signature drifted)" : "(inlined away)");
-        } else if (present_but_changed && ep.strategy == glass::sf::kDataRelease) {
-            ++drift;
-            printf("  DRIFT    %-38s\n", ep.label);
-        }
-    }
-
-    if (shapes != 1) {
-        core_ok = false;
-        printf("  %s  drawBlurRegion: expected exactly one known shape, found %d\n",
-               shapes == 0 ? "MISSING " : "AMBIGUOUS", shapes);
-    }
-    if (generators == 0) {
-        printf("  note     no generateTemporaryImage: a toned backdrop keeps the radius it asked for\n");
-    }
-    if (make_wrapper_bad && !make_opts_ok) {
-        core_ok = false;
-        printf("  ABI      no SkRuntimeEffect::MakeForShader the engine can call safely\n");
-    }
-    if (!release_ok) {
-        core_ok = false;
-        printf("  MISSING  no way to release the uniform blob\n");
-    }
-
-    if (!core_ok || drift != 0) {
-        printf("FAIL  this build's Skia is not one the engine can drive.\n"
-               "      Nothing was installed; the device is untouched.\n");
         return 1;
     }
-    printf("OK    every required entry point resolved\n");
+
+    if (cache_out != nullptr) {
+        std::string err;
+        if (!glass::sf::writeCache(cache_out, path, res, &err)) {
+            // Not fatal: the engine resolves from symbols without a cache.
+            if (!json) printf("  note     no symbol cache written: %s\n", err.c_str());
+        } else if (!json) {
+            printf("  symbol cache written: %s\n", cache_out);
+        }
+    }
+    if (!json) printf("OK    every required entry point resolved\n");
     return 0;
 }

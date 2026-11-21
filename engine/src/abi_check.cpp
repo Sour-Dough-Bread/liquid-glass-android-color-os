@@ -6,7 +6,10 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstring>
 #include <vector>
+
+#include "elf_syms.h"
 
 namespace glass {
 namespace {
@@ -85,9 +88,22 @@ bool mayWriteX8(uint32_t i) {
         }
         if (isLoadLiteral(i)) return !isVectorLoadStore(i) && rd(i) == kX8;
         if (isIntegerStore(i)) return false;  // Rt is read, not written
-        // Loads, pair loads, exclusives, atomics: any of Rt, Rt2 or Rs may be
-        // written.
-        return rd(i) == kX8 || rt2(i) == kX8 || ((i >> 16) & 31) == kX8;
+        // Which fields a load writes depends on its class, and bits 10-20 are
+        // an immediate in the common single-register forms: reading them as
+        // registers called `ldr x10, [x0, #0x2310]` a write of x8 (Android
+        // 15's getTotalMatrix). Pairs write Rt and Rt2; exclusives and
+        // compare-and-swap may write Rt, Rt2 and Rs (a store-exclusive's
+        // status); atomics write Rt and, for the swaps, Rs; every other load
+        // writes Rt alone (a writeback base is a read of it first, caught
+        // above).
+        const bool pair = (i & 0x3A000000) == 0x28000000;
+        const bool exclusive = (i & 0x3F000000) == 0x08000000;
+        const bool atomic = (i & 0x3B200C00) == 0x38200000;
+        const uint32_t rs = (i >> 16) & 31;
+        if (pair) return rd(i) == kX8 || rt2(i) == kX8;
+        if (exclusive) return rd(i) == kX8 || rt2(i) == kX8 || rs == kX8;
+        if (atomic) return rd(i) == kX8 || rs == kX8;
+        return rd(i) == kX8;
     }
     // Everything else: the destination field is bits 4:0. Compares write XZR
     // (31) there, so they pass; an FP/SIMD op writing v8 is a false alarm,
@@ -100,6 +116,44 @@ std::string hex(uint32_t v) {
     snprintf(b, sizeof(b), "%08x", v);
     return b;
 }
+
+// How many instructions a scan looks at, as before calls were followed.
+constexpr size_t kScanCount = 32;
+// How many calls deep a passed-through x8 is followed.
+constexpr int kFollowDepth = 2;
+
+bool isBl(uint32_t i) { return (i & 0xFC000000) == 0x94000000; }
+bool isB(uint32_t i) { return (i & 0xFC000000) == 0x14000000; }
+
+int64_t branchOffset(uint32_t i) {
+    int64_t imm = i & 0x03FFFFFF;
+    if (imm & 0x02000000) imm -= 0x04000000;
+    return imm * 4;
+}
+
+struct FileReader {
+    const std::string* path;
+    std::vector<ExecSegment> segs;
+};
+
+bool readFromFile(uint64_t vaddr, uint32_t* out, size_t count, void* user) {
+    const auto* r = static_cast<const FileReader*>(user);
+    return readCodeAt(*r->path, r->segs, vaddr, count * 4, reinterpret_cast<uint8_t*>(out));
+}
+
+#if defined(__aarch64__)
+struct ProcessReader {
+    uintptr_t bias;
+    const std::vector<ExecSegment>* segs;
+};
+
+bool readFromProcess(uint64_t vaddr, uint32_t* out, size_t count, void* user) {
+    const auto* r = static_cast<const ProcessReader*>(user);
+    if (!inExecSegment(*r->segs, vaddr, count * 4)) return false;
+    memcpy(out, reinterpret_cast<const void*>(r->bias + vaddr), count * 4);
+    return true;
+}
+#endif
 
 }  // namespace
 
@@ -134,53 +188,164 @@ ResultRegister aarch64ResultRegister(const uint32_t* code, size_t count, std::st
     return ResultRegister::kUndetermined;
 }
 
+namespace {
+
+bool isConditionalBranch(uint32_t i) {
+    return (i & 0xFF000010) == 0x54000000 ||  // B.cond
+           (i & 0x7E000000) == 0x34000000 ||  // CBZ, CBNZ
+           (i & 0x7E000000) == 0x36000000;    // TBZ, TBNZ
+}
+
+int64_t conditionalOffset(uint32_t i) {
+    if ((i & 0x7E000000) == 0x36000000) {  // TBZ/TBNZ: imm14 at bits 18:5
+        int64_t imm = (i >> 5) & 0x3FFF;
+        if (imm & 0x2000) imm -= 0x4000;
+        return imm * 4;
+    }
+    int64_t imm = (i >> 5) & 0x7FFFF;  // B.cond, CBZ/CBNZ: imm19 at bits 23:5
+    if (imm & 0x40000) imm -= 0x80000;
+    return imm * 4;
+}
+
+// How far a scan may go: instructions in all, conditional branches explored,
+// calls followed. Bounded so that loops and branchy code end in "undetermined",
+// never in a long walk.
+struct Budget {
+    int instructions = 256;
+    int branches = 6;
+};
+
+std::string at(uint64_t v) {
+    char b[24];
+    snprintf(b, sizeof(b), "%llx", static_cast<unsigned long long>(v));
+    return b;
+}
+
+// Walks the code from `vaddr` along every path the budget allows, with x8
+// untouched so far. Reading x8 before writing it on ANY path proves the
+// standard convention: a function given its result address in x0 holds
+// garbage in x8 on every path, and the compiler never reads garbage. So one
+// path that reads x8 is an answer; "NOT x8" needs every path explored to
+// write it first.
+ResultRegister walk(uint64_t vaddr, CodeReader read, void* user, int calls, Budget& budget,
+                    std::string* detail) {
+    uint64_t pc = vaddr;
+    while (budget.instructions > 0) {
+        // Read a block at a time; near the end of a segment, what there is.
+        uint32_t code[kScanCount];
+        size_t n = kScanCount;
+        while (n > 0 && !read(pc, code, n, user)) n /= 2;
+        if (n == 0) {
+            if (detail) *detail = "no code to read at " + at(pc);
+            return ResultRegister::kUndetermined;
+        }
+        for (size_t k = 0; k < n && budget.instructions > 0; ++k, pc += 4) {
+            --budget.instructions;
+            const uint32_t i = code[k];
+            if (readsX8(i)) {
+                if (detail) *detail = "x8 read at " + at(pc) + " (" + hex(i) + ")";
+                return ResultRegister::kX8;
+            }
+            if (isB(i)) {
+                // A jump, or a tail call: either way the code at the target
+                // runs next with x8 as it is. Keep walking there.
+                pc = pc + static_cast<uint64_t>(branchOffset(i)) - 4;
+                k = n;  // re-read from the new pc (the loop adds 4 back)
+                continue;
+            }
+            if (isBl(i)) {
+                // x8 is caller-saved: it cannot outlive the call, so only the
+                // callee can use what the caller put there.
+                if (calls <= 0) {
+                    if (detail) *detail = "call at " + at(pc) + ", not followed deeper";
+                    return ResultRegister::kUndetermined;
+                }
+                const uint64_t target = pc + static_cast<uint64_t>(branchOffset(i));
+                std::string inner;
+                const ResultRegister r = walk(target, read, user, calls - 1, budget, &inner);
+                if (detail) {
+                    *detail = "x8 handed on by the call at " + at(pc) + ", whose answer is " +
+                              resultRegisterName(r) + " (" + inner + ")";
+                }
+                return r == ResultRegister::kX8 ? ResultRegister::kX8
+                                                : ResultRegister::kUndetermined;
+            }
+            if (isConditionalBranch(i)) {
+                if (budget.branches <= 0) {
+                    if (detail) *detail = "too many branches before x8 was read (at " + at(pc) + ")";
+                    return ResultRegister::kUndetermined;
+                }
+                --budget.branches;
+                const uint64_t taken = pc + static_cast<uint64_t>(conditionalOffset(i));
+                std::string d_fall, d_taken;
+                const ResultRegister fall = walk(pc + 4, read, user, calls, budget, &d_fall);
+                if (fall == ResultRegister::kX8) {
+                    if (detail) *detail = d_fall + ", past the branch at " + at(pc);
+                    return fall;
+                }
+                const ResultRegister jump = walk(taken, read, user, calls, budget, &d_taken);
+                if (jump == ResultRegister::kX8) {
+                    if (detail) *detail = d_taken + ", where the branch at " + at(pc) + " goes";
+                    return jump;
+                }
+                if (fall == ResultRegister::kNotX8 && jump == ResultRegister::kNotX8) {
+                    if (detail) *detail = "both ways from " + at(pc) + ": " + d_fall + "; " + d_taken;
+                    return ResultRegister::kNotX8;
+                }
+                if (detail) *detail = "neither way from " + at(pc) + " settles it: " + d_fall + "; " + d_taken;
+                return ResultRegister::kUndetermined;
+            }
+            if (isBranchOrStop(i)) {
+                if (detail) *detail = "branch or return at " + at(pc) + " before x8 was read";
+                return ResultRegister::kUndetermined;
+            }
+            if (mayWriteX8(i)) {
+                if (detail) *detail = "x8 overwritten at " + at(pc) + " (" + hex(i) + ") before any read";
+                return ResultRegister::kNotX8;
+            }
+        }
+    }
+    if (detail) *detail = "x8 not read within the scan budget";
+    return ResultRegister::kUndetermined;
+}
+
+}  // namespace
+
+ResultRegister aarch64ResultRegisterAt(uint64_t vaddr, CodeReader read, void* user, int depth,
+                                       std::string* detail) {
+    Budget budget;
+    return walk(vaddr, read, user, depth, budget, detail);
+}
+
 bool aarch64ResultRegisterInFile(const std::string& path, uint64_t vaddr, uint64_t size,
                                  ResultRegister* out, std::string* detail, int* machine) {
+    (void)size;  // the scan stops at the first branch or return, inside the function
     if (machine) *machine = 0;
     const int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC);
     if (fd < 0) return false;
     Elf64_Ehdr eh{};
-    bool ok = pread(fd, &eh, sizeof(eh), 0) == static_cast<ssize_t>(sizeof(eh)) &&
-              eh.e_ident[EI_CLASS] == ELFCLASS64;
-    if (ok && machine) *machine = eh.e_machine;
-    ok = ok && eh.e_machine == EM_AARCH64 && eh.e_phentsize == sizeof(Elf64_Phdr);
-
-    uint64_t file_off = 0;
-    bool mapped = false;
-    for (uint16_t p = 0; ok && p < eh.e_phnum && !mapped; ++p) {
-        Elf64_Phdr ph{};
-        if (pread(fd, &ph, sizeof(ph), static_cast<off_t>(eh.e_phoff + p * sizeof(ph))) !=
-            static_cast<ssize_t>(sizeof(ph))) {
-            ok = false;
-            break;
-        }
-        if (ph.p_type != PT_LOAD || (ph.p_flags & PF_X) == 0) continue;
-        if (vaddr >= ph.p_vaddr && vaddr + 4 <= ph.p_vaddr + ph.p_filesz) {
-            file_off = ph.p_offset + (vaddr - ph.p_vaddr);
-            mapped = true;
-        }
-    }
-
-    std::vector<uint32_t> code;
-    if (ok && mapped) {
-        const size_t n = static_cast<size_t>(std::min<uint64_t>(32, size / 4 ? size / 4 : 32));
-        code.resize(n);
-        const ssize_t want = static_cast<ssize_t>(n * 4);
-        ok = pread(fd, code.data(), n * 4, static_cast<off_t>(file_off)) == want;
-    }
+    const bool header = pread(fd, &eh, sizeof(eh), 0) == static_cast<ssize_t>(sizeof(eh)) &&
+                        eh.e_ident[EI_CLASS] == ELFCLASS64;
     close(fd);
-    if (!ok || !mapped) return false;
-    *out = aarch64ResultRegister(code.data(), code.size(), detail);
+    if (!header) return false;
+    if (machine) *machine = eh.e_machine;
+    if (eh.e_machine != EM_AARCH64) return false;
+
+    FileReader reader{&path, readExecSegments(path)};
+    if (!inExecSegment(reader.segs, vaddr, 4)) return false;
+    *out = aarch64ResultRegisterAt(vaddr, readFromFile, &reader, kFollowDepth, detail);
     return true;
 }
 
-ResultRegister resultRegisterInMemory(const void* fn, uint64_t size, std::string* detail) {
+ResultRegister resultRegisterInProcess(uint64_t vaddr, uintptr_t bias, const void* segs,
+                                       std::string* detail) {
 #if defined(__aarch64__)
-    const size_t n = static_cast<size_t>(std::min<uint64_t>(32, size / 4 ? size / 4 : 32));
-    return aarch64ResultRegister(static_cast<const uint32_t*>(fn), n, detail);
+    ProcessReader reader{bias, static_cast<const std::vector<ExecSegment>*>(segs)};
+    return aarch64ResultRegisterAt(vaddr, readFromProcess, &reader, kFollowDepth, detail);
 #else
-    (void)fn;
-    (void)size;
+    (void)vaddr;
+    (void)bias;
+    (void)segs;
     if (detail) *detail = "not AArch64: the result address is the first argument either way";
     return ResultRegister::kX8;
 #endif

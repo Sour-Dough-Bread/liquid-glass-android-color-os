@@ -484,6 +484,9 @@ function render() {
   } else if (eng === 'loaded' && state.engineStatus === 'not-hooked') {
     banner('The engine is loaded but declined to hook this ROM\'s blur, so nothing changes. ' +
            '<code>logcat -s StockGlass</code> right after a reboot says why.');
+  } else if (eng === 'loaded' && state.blurOff) {
+    banner('Android is drawing no window blur right now: ' + escapeHtml(state.blurOff) + '. ' +
+           'Stock Glass restyles Android\'s blur, so nothing changes until it is on.');
   } else if (eng !== 'loaded') {
     banner('The engine is not running in SurfaceFlinger yet. Reboot after installing; if it is ' +
            'still not running, see <code>/data/adb/glass/last_boot.log</code>. Settings made now ' +

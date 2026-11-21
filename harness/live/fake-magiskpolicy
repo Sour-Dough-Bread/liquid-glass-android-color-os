@@ -1,0 +1,26 @@
+#!/system/bin/sh
+# TEST DOUBLE, emulator only: stands in for `magiskpolicy --live --apply FILE`
+# on an AVD, which has no root manager and so no live policy tool.
+#
+# The real tool edits the loaded policy on the device. This one loads a policy
+# that harness/live/stage.sh built on the host (harness/live/sepatch, libsepol)
+# from this device's own /sys/fs/selinux/policy plus the module's
+# sepolicy.rule, and refuses a rules file other than the one it was built from.
+# live.sh finds it through PATH, as it would find Magisk's.
+H=/data/local/tmp/glass-live-test
+if [ "$1" != --live ] || [ "$2" != --apply ] || [ ! -f "$3" ]; then
+  echo "fake-magiskpolicy: only --live --apply FILE is implemented" >&2
+  exit 2
+fi
+[ "$(getprop ro.kernel.qemu)" = 1 ] || { echo "fake-magiskpolicy: emulator only" >&2; exit 1; }
+want=$(cat "$H/rules.sha256" 2>/dev/null)
+have=$(sha256sum < "$3" | cut -d' ' -f1)
+if [ "$want" != "$have" ]; then
+  echo "fake-magiskpolicy: $3 is not the rules file the test policy was built from" >&2
+  exit 1
+fi
+# selinuxfs takes a policy only as one write(): cat's chunks arrive as a
+# truncated policy ("ebitmap: truncated map"). dd with a block larger than the
+# file reads it whole and writes it once.
+dd if="$H/policy.patched" of=/sys/fs/selinux/load bs=8M 2>/dev/null || exit 1
+echo "fake-magiskpolicy: loaded $H/policy.patched"

@@ -24,6 +24,12 @@ const char* kDrawBlurRegionScaledM[] = {
     "5sk_spI7SkImageESD_",
     nullptr,
 };
+// Evolution X 12.x (Android 17): the shape above and `int kind`.
+const char* kDrawBlurRegionScaledKindM[] = {
+    "_ZN7android12renderengine4skia10BlurFilter14drawBlurRegionEP8SkCanvasRK7SkRRectjffRK6SkRect"
+    "5sk_spI7SkImageESD_i",
+    nullptr,
+};
 
 // ---- SkRuntimeEffect -----------------------------------------------------
 const char* kMakeForShaderM[] = {
@@ -177,6 +183,36 @@ const char* kCanvasBaseRecorderM[] = {
     "_ZNK8SkCanvas12baseRecorderEv",
     nullptr,
 };
+// skgpu::graphite::Recorder* SkCanvas::recorder() const: the top device's
+// recorder, which only a Graphite device has. Out of line from Android 15 to
+// 17 on every build surveyed.
+const char* kCanvasRecorderM[] = {
+    "_ZNK8SkCanvas8recorderEv",
+    nullptr,
+};
+// A RenderEngine that can keep a layer's blur from one frame to the next and
+// skip generateTemporaryImage on the frames after. Never called: a snapshot
+// handed back in a blur's place would be kept as that layer's blur, so where
+// one of these exists nothing is put off. Any one of them marks it:
+// - bool SkiaRenderEngine::isBlurCacheValid(BlurCacheKey const&, SkRect const&,
+//   long, long) const: Pixel CP3A on, switched on by lower_blur_fps from CP4A.
+// - Infinity-X 4.x (Android 17; AxionOS's ax-dragonite-dev) keeps the last four
+//   generateTemporaryImage results in a std::deque<BlurCacheEntry>, looked up
+//   and stored by lambdas inside drawLayersInternal: no method of its own, but
+//   the deque's members are out of line on tokay and a53x.
+// The draw hook also notices a handed-back snapshot coming back (blurSlotFor),
+// for a cache none of these shows.
+const char* kBlurCacheValidM[] = {
+    "_ZNK7android12renderengine4skia16SkiaRenderEngine16isBlurCacheValidERKNS1_12BlurCacheKeyE"
+    "RK6SkRectll",
+    "_ZNSt3__15dequeIN7android12renderengine4skia16SkiaRenderEngine14BlurCacheEntryE"
+    "NS_9allocatorIS5_EEE10push_frontEOS5_",
+    "_ZNSt3__15dequeIN7android12renderengine4skia16SkiaRenderEngine14BlurCacheEntryE"
+    "NS_9allocatorIS5_EEE5clearEv",
+    "_ZNSt3__15dequeIN7android12renderengine4skia16SkiaRenderEngine14BlurCacheEntryE"
+    "NS_9allocatorIS5_EEE8pop_backEv",
+    nullptr,
+};
 
 // ---- kBlurGenerate -------------------------------------------------------
 // The virtual that produces a blur, one implementation per filter. Hooked only
@@ -198,6 +234,23 @@ const char* kGenerateGaussianM[] = {
 };
 const char* kGenerateKawaseDualV2M[] = {
     "_ZNK7android12renderengine4skia22KawaseBlurDualFilterV222generateTemporaryImageEPNS1_"
+    "14SkiaGpuContextERKNS0_15DisplaySettingsEj5sk_spI7SkImageERK6SkRect",
+    nullptr,
+};
+// Project Infinity-X 4.x (Android 17) removed AOSP's Kawase filters for this
+// one ("adding glass blur filter v2"; its header credits AxionOS). Same
+// signature as AOSP's.
+const char* kGenerateGlassM[] = {
+    "_ZNK7android12renderengine4skia15GlassBlurFilter22generateTemporaryImageEPNS1_"
+    "14SkiaGpuContextERKNS0_15DisplaySettingsEj5sk_spI7SkImageERK6SkRect",
+    nullptr,
+};
+// Evolution X 12.x (Android 17) and Lunaris 3.13 (Android 16 QPR2) ship a blur
+// algorithm beside AOSP's ("Kawase Darkmoon",
+// debug.renderengine.blur_algorithm=kawase_darkmoon; EvoX picks it by default
+// on low-RAM devices). Same signature as AOSP's.
+const char* kGenerateDarkmoonM[] = {
+    "_ZNK7android12renderengine4skia14KawaseDarkmoon22generateTemporaryImageEPNS1_"
     "14SkiaGpuContextERKNS0_15DisplaySettingsEj5sk_spI7SkImageERK6SkRect",
     nullptr,
 };
@@ -242,6 +295,8 @@ const EntryPoint kEntryPoints[] = {
     {"BlurFilter::drawBlurRegion", kDrawBlurRegionM,
      "_ZN7android12renderengine4skia10BlurFilter14drawBlurRegion", kHookTarget},
     {"BlurFilter::drawBlurRegion (scaled)", kDrawBlurRegionScaledM, nullptr, kHookTarget},
+    {"BlurFilter::drawBlurRegion (scaled, material)", kDrawBlurRegionScaledKindM, nullptr,
+     kHookTarget},
 
     // ---- compiling the shader --------------------------------------------
     {"SkRuntimeEffect::MakeForShader", kMakeForShaderM,
@@ -249,8 +304,9 @@ const EntryPoint kEntryPoints[] = {
     {"SkRuntimeEffect::MakeForShader(Options)", kMakeForShaderOptsM, nullptr, kOptional, true},
     {"SkString::SkString(const char*)", kSkStringCtorM, "_ZN8SkStringC", kCore},
     {"SkString::~SkString", kSkStringDtorM, "_ZN8SkStringD", kCore},
-    {"SkRuntimeEffect::findUniform", kFindUniformM, "_ZNK15SkRuntimeEffect11findUniform", kCore},
-    {"SkRuntimeEffect::findChild", kFindChildM, "_ZNK15SkRuntimeEffect9findChild", kCore},
+    {"SkRuntimeEffect::findUniform", kFindUniformM, "_ZNK15SkRuntimeEffect11findUniform",
+     kOptional},
+    {"SkRuntimeEffect::findChild", kFindChildM, "_ZNK15SkRuntimeEffect9findChild", kOptional},
     {"SkRuntimeEffect::uniformSize", kEffectUniformSizeM,
      "_ZNK15SkRuntimeEffect11uniformSize", kCore},
 
@@ -280,6 +336,8 @@ const EntryPoint kEntryPoints[] = {
     {"SkPaint::setShader", kPaintSetShaderM, "_ZN7SkPaint9setShader", kOptional},
     {"SkImage_Base::makeSubset(SkRecorder*)", kImageMakeSubsetM, nullptr, kOptional, true},
     {"SkCanvas::baseRecorder", kCanvasBaseRecorderM, nullptr, kOptional},
+    {"SkCanvas::recorder", kCanvasRecorderM, nullptr, kOptional},
+    {"RenderEngine blur cache (marker)", kBlurCacheValidM, nullptr, kOptional},
 
     // ---- kBlurGenerate (any one enables backdropBlur) ---------------------
     {"KawaseBlurFilter::generateTemporaryImage", kGenerateKawaseM, nullptr, kBlurGenerate, true},
@@ -287,6 +345,8 @@ const EntryPoint kEntryPoints[] = {
      true},
     {"KawaseBlurDualFilterV2::generateTemporaryImage", kGenerateKawaseDualV2M, nullptr,
      kBlurGenerate, true},
+    {"GlassBlurFilter::generateTemporaryImage", kGenerateGlassM, nullptr, kBlurGenerate, true},
+    {"KawaseDarkmoon::generateTemporaryImage", kGenerateDarkmoonM, nullptr, kBlurGenerate, true},
 
     // ---- kBuilder (informational) ----------------------------------------
     {"SkRuntimeEffectBuilder::ctor", kBuilderCtorM, "_ZN22SkRuntimeEffectBuilderC", kBuilder},

@@ -50,6 +50,13 @@
 //             register file. The canvas, rect and image pointers stay put. What
 //             would break is subtler — reading blurAlpha from the wrong float,
 //             and calling the original with one float where it expects two.
+//             A third shape is a ROM's own: Evolution X 12.x (and crDroid 13.x,
+//             which took the same commit) appends an int to the QPR2 shape, the
+//             region's material for its own glass (-1 a layer's blur, 0 the
+//             shade's, 1 to 11 ColorOS-style materials a client chose). It
+//             comes after everything else (w7 on AArch64, the stack on x86-64),
+//             so nothing else moves, but a replacement that does not take it
+//             would call the original with whatever is left in that slot.
 //   kOptional
 //             Members the engine can implement itself from the pinned headers,
 //             but would much rather call. Measured: Android 16 inlined
@@ -65,6 +72,11 @@
 //             always works as a fallback, but this one is preferred, because
 //             the one-argument form is a header-inline wrapper whose calling
 //             convention a compiler may change (it did, on alioth).
+//             So are SkRuntimeEffect::findUniform and findChild. Pixel's
+//             BP1A and Nothing OS 3.2 inline both away; without them the
+//             engine lays the uniforms out from the shader's own declarations,
+//             as SkRuntimeEffect does, and trusts that only when uniformSize()
+//             (core) comes out at the packed total. With them, it asks.
 //
 // Separately from the strategy, an entry is marked `result_in_memory` when it
 // returns a C++ object by value. On AArch64 the engine reads such a function's
@@ -106,6 +118,7 @@ enum Index : size_t {
     // ---- kHookTarget: which shape of drawBlurRegion this build has
     kDrawBlurRegion = 0,
     kDrawBlurRegionScaled,
+    kDrawBlurRegionScaledKind,  // EvoX 12.x, crDroid 13.x: one more int, the region's material
 
     // ---- compiling the shader
     kMakeForShader,
@@ -141,10 +154,19 @@ enum Index : size_t {
     kImageMakeSubset,
     kCanvasBaseRecorder,
 
+    // ---- kOptional: whether the canvas is Graphite's (non-null only there)
+    kCanvasRecorder,
+
+    // ---- kOptional, never called: a build that caches blurs across frames
+    // (BlurCache, Android 17 QPR1 on), where no blur may be put off
+    kBlurCacheValid,
+
     // ---- kBlurGenerate: BlurFilter::generateTemporaryImage per filter (A17)
     kGenerateKawase,
     kGenerateGaussian,
     kGenerateKawaseDualV2,
+    kGenerateGlass,  // Infinity-X / AxionOS GlassBlurFilter, in place of the Kawase ones
+    kGenerateDarkmoon,  // Evolution X 12.x and Lunaris 3.13: KawaseDarkmoon
 
     // ---- kBuilder
     kBuilderCtor,

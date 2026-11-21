@@ -188,9 +188,17 @@ struct Bridge {
     // SkRecorder* SkCanvas::baseRecorder() const
     void* (*CanvasBaseRecorder)(const void* canvas) = nullptr;
 
+    // ---- optional: is this canvas Graphite's? -------------------------------
+    // skgpu::graphite::Recorder* SkCanvas::recorder() const asks the top
+    // device, and only a Graphite device answers with anything but null.
+    void* (*CanvasRecorder)(const void* canvas) = nullptr;
+
+    // findUniform and findChild may be absent: some builds inline both away,
+    // and the engine then lays the uniforms out from the shader's own
+    // declarations (glass_engine.cpp, uniformOffsets). uniformSize may not:
+    // it is what that layout is checked against.
     bool compileReady() const {
         return (MakeForShader || MakeForShaderOpts) && SkStringCtor && SkStringDtor &&
-               findUniform && findChild &&
                uniformSize;
     }
     bool drawReady() const {

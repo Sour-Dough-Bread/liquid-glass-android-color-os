@@ -77,6 +77,26 @@ chown 0:0  "$MODDIR/system/bin/surfaceflinger" "$MODDIR/system/lib64/libglasseng
 chcon u:object_r:surfaceflinger_exec:s0 "$MODDIR/system/bin/surfaceflinger" 2>/dev/null
 chcon u:object_r:system_lib_file:s0     "$MODDIR/system/lib64/libglassengine.so" 2>/dev/null
 
+# The install-time symbol cache (engine/src/sf_cache.h). glasscheck resolves the
+# patched compositor once, here, and writes what it found next to the engine;
+# at every start the engine checks those addresses against the code instead of
+# reading the whole binary and inflating its MiniDebugInfo (about 0.3 s before
+# SurfaceFlinger's main on the Poco F1). It is optional: with no cache, or one
+# that does not match, the engine resolves symbols as it always has. Same
+# directory and label as the engine, because SurfaceFlinger may read those.
+CHECK="$MODDIR/bin/$ABI/glasscheck"
+CACHE="$MODDIR/system/lib64/libglassengine.symcache"
+rm -f "$CACHE"
+if [ -x "$CHECK" ] && "$CHECK" --cache-out "$CACHE" "$MODDIR/system/bin/surfaceflinger" \
+     >>"$LOG" 2>&1 && [ -f "$CACHE" ]; then
+  chmod 0644 "$CACHE"
+  chown 0:0 "$CACHE"
+  chcon u:object_r:system_lib_file:s0 "$CACHE" 2>/dev/null
+else
+  rm -f "$CACHE"
+  log "no symbol cache; the engine resolves symbols when SurfaceFlinger starts"
+fi
+
 echo "$WANT" > "$STAMP"
 log "overlay built for $SF"
 exit 0

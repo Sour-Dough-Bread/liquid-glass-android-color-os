@@ -22,7 +22,7 @@ echo "==> preflight checker"
 rm -rf "$STAGE"; mkdir -p "$STAGE"
 cp "$HERE"/module.prop "$HERE"/customize.sh "$HERE"/post-fs-data.sh \
    "$HERE"/service.sh "$HERE"/post-mount.sh "$HERE"/meta.sh "$HERE"/glass-theme.sh "$HERE"/build-overlay.sh \
-   "$HERE"/uninstall.sh "$HERE"/glassctl "$HERE"/action.sh "$HERE"/sepolicy.rule "$STAGE/"
+   "$HERE"/uninstall.sh "$HERE"/glassctl "$HERE"/live.sh "$HERE"/action.sh "$HERE"/sepolicy.rule "$STAGE/"
 [ -f "$HERE/README.md" ] && cp "$HERE/README.md" "$STAGE/"
 # The WebUI (KernelSU, KernelSU-Next, APatch). Magisk ignores it and has the
 # Action button instead.

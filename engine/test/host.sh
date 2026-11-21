@@ -16,3 +16,15 @@ for t in composite sharp_bounds merge tint; do
   g++ -std=c++17 -O2 -Wall -Wextra -I "$HERE/../src" "$HERE/${t}_test.cpp" -o "$OUT/${t}_test"
   "$OUT/${t}_test"
 done
+
+# The x8 walk on hand-assembled code: the patterns the firmware survey found.
+echo "==> abi_walk_test"
+g++ -std=c++17 -O2 -Wall -Wextra -I "$HERE/../src" "$HERE/abi_walk_test.cpp" \
+  "$HERE/../src/abi_check.cpp" "$HERE/../src/elf_syms.cpp" -o "$OUT/abi_walk_test"
+"$OUT/abi_walk_test"
+
+# The note readers on hand-made ELF files, malformed ones included.
+echo "==> elf_note_test"
+g++ -std=c++17 -O2 -Wall -Wextra -I "$HERE/../src" "$HERE/elf_note_test.cpp" \
+  "$HERE/../src/elf_syms.cpp" -o "$OUT/elf_note_test"
+"$OUT/elf_note_test"

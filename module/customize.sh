@@ -28,9 +28,21 @@ chmod 755 "$CHECK" 2>/dev/null
 ui_print "- Checking this ROM's Skia..."
 if ! "$CHECK" "$SF" >"$MODPATH/glasscheck.log" 2>&1; then
   while IFS= read -r line; do ui_print "  $line"; done < "$MODPATH/glasscheck.log"
+  # Kept where a rooted user can still reach it after the abort removes the
+  # module: it is what a report needs (fingerprint, build id, what is missing).
+  {
+    echo "Stock Glass $(sed -n 's/^version=//p' "$MODPATH/module.prop") preflight"
+    echo "fingerprint: $(getprop ro.build.fingerprint)"
+    echo "device: $(getprop ro.product.manufacturer) $(getprop ro.product.model) ($(getprop ro.product.device)), $(getprop ro.board.platform)"
+    echo "android: $(getprop ro.build.version.release) sdk $(getprop ro.build.version.sdk), $(getprop ro.build.type)"
+    cat "$MODPATH/glasscheck.log"
+  } > /data/local/tmp/stockglass-check.txt 2>/dev/null
   ui_print ""
   ui_print "! This ROM's SurfaceFlinger does not expose what the engine needs."
   ui_print "! Nothing has been installed and the device is untouched."
+  ui_print "! To ask for support, open an issue on"
+  ui_print "!   github.com/capthndsme/liquid-glass-android"
+  ui_print "! with this screen or /data/local/tmp/stockglass-check.txt"
   abort   "! aborting"
 fi
 while IFS= read -r line; do ui_print "  $line"; done < "$MODPATH/glasscheck.log"
@@ -86,6 +98,7 @@ set_perm "$MODPATH/bin/$ABI/patchelf"   0 0 0755
 set_perm "$MODPATH/bin/$ABI/glasscheck" 0 0 0755
 set_perm "$MODPATH/glassctl"            0 0 0755
 set_perm "$MODPATH/action.sh"           0 0 0755
+set_perm "$MODPATH/live.sh"             0 0 0755
 # set_perm_recursive above flattened these; the mount preserves them verbatim.
 [ -f "$MODPATH/system/bin/surfaceflinger" ] && {
   set_perm "$MODPATH/system/bin/surfaceflinger" 0 0 0755
@@ -174,4 +187,28 @@ ui_print "    sh /data/adb/modules/stockglass/glassctl backdrop stock|tone|glass
 case "$(getprop persist.sys.glass.mode)" in
   glass|on) ui_print "- Liquid Glass was already switched on here; keeping it." ;;
 esac
+# A ROM that draws no window blur at all installs fine and then shows nothing,
+# which reads as a broken module. Say so now; glassctl status repeats it.
+if [ "$(getprop ro.surface_flinger.supports_background_blur)" != 1 ]; then
+  ui_print ""
+  ui_print "! This device does not declare window blur support"
+  ui_print "! (ro.surface_flinger.supports_background_blur is not 1)."
+  ui_print "! Stock Glass restyles the blurs Android draws, so until the"
+  ui_print "! ROM enables blur there is nothing for it to change."
+elif [ "$(getprop persist.sys.sf.disable_blurs)" = 1 ]; then
+  ui_print ""
+  ui_print "! persist.sys.sf.disable_blurs is 1 here; if Android draws no"
+  ui_print "! blur, Stock Glass has nothing to change until it does."
+fi
+# RenderEngine on Graphite: the engine stands down there (only Ganesh is
+# verified). Pixel 8 and 8 Pro run it from Android 17 QPR1, asked for by
+# their vendor partition; a running engine says so in sys.glass.graphite.
+if [ "$(getprop sys.glass.graphite)" = 1 ] \
+   || [ "$(getprop ro.surface_flinger.renderengine_graphite_vulkan)" = true ] \
+   || [ "$(getprop debug.renderengine.graphite)" = true ]; then
+  ui_print ""
+  ui_print "! RenderEngine draws with Graphite on this device (or is asked"
+  ui_print "! to). The glass is only verified on Ganesh, so the engine"
+  ui_print "! stands down there and Android's blur stays as it is."
+fi
 ui_print ""

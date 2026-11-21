@@ -46,6 +46,13 @@
 #   glassctl app scrimcolor <c>  the shade's background: stock (two tones) or
 #                                one colour, black, white or tint (the accent)
 #   glassctl json                machine-readable state, for the WebUI
+#   glassctl live [on|off|status|check] [--force]
+#                                load the engine for this boot only, without
+#                                the module's mount (temporary root, KernelSU 3
+#                                without a metamodule). Restarts SurfaceFlinger:
+#                                the screen goes black and apps restart. A
+#                                reboot undoes it. `check` changes nothing
+#   glassctl unlive              take it out again (glassctl live off)
 #
 # A backdrop is a blur that covers the display: the notification shade, a
 # dialog's blur-behind. A pane is anything smaller: a notification card, the
@@ -56,6 +63,8 @@
 # The Action button and the WebUI both call this script, so there is exactly
 # one place that knows which properties mean what.
 MODDIR=${0%/*}
+# `sh glassctl` from inside the directory leaves no directory in $0.
+[ "$MODDIR" = "$0" ] && MODDIR=.
 P=persist.sys.glass
 STATE=/data/adb/glass
 
@@ -196,13 +205,17 @@ fi
 # module down), no-metamodule, metamodule-broken or metamodule-off (KernelSU 3+
 # will not mount anything; MOUNT_WHY says why), not-mounted (post-mount.sh saw
 # no overlay this boot), or absent.
+#
+# Loaded is asked first: live mode (live.sh) loads the engine without the
+# module's mount, so it can be loaded while the boot guard's verdict or the
+# metamodule's state still says the overlay is not.
 engine_state() {
-  if [ -f "$STATE/disabled" ]; then echo disabled; return; fi
   pid=$(pidof surfaceflinger 2>/dev/null)
   if [ -n "$pid" ] && grep -q libglassengine.so "/proc/$pid/maps" 2>/dev/null; then
     echo loaded
     return
   fi
+  if [ -f "$STATE/disabled" ]; then echo disabled; return; fi
   case "$(mount_state)" in
     none)   echo no-metamodule ;;
     broken) echo metamodule-broken ;;
@@ -227,6 +240,36 @@ retry_hint() {
 # the time it did, in seconds since the epoch). Both are cleared by a reboot.
 engine_status() { getprop sys.glass.engine; }
 tripped() { getprop sys.glass.tripped; }
+
+# Why Android itself draws no window blur right now, or nothing when it does.
+# Stock Glass only restyles the blurs Android draws, so with blur off there is
+# nothing for it to act on, which looks exactly like a module that does not
+# work. The rules are WindowManager's own (BlurController): the device must
+# declare support, the user must not have switched blurs off, and on a device
+# that marks blurs expensive, power saver switches them off. Graphite is the
+# one case where blur is on but the engine stands down by itself.
+blur_off_reason() {
+  [ "$(getprop ro.surface_flinger.supports_background_blur)" = 1 ] \
+    || { echo "this device does not declare window blur support (ro.surface_flinger.supports_background_blur is not 1)"; return; }
+  [ "$(getprop persist.sys.sf.disable_blurs)" = 1 ] \
+    && { echo "persist.sys.sf.disable_blurs is 1"; return; }
+  [ "$(settings get global disable_window_blurs 2>/dev/null)" = 1 ] \
+    && { echo "window blurs are switched off (Developer options > Disable window blurs)"; return; }
+  if [ "$(getprop ro.sf.blurs_are_expensive)" = 1 ] \
+     && [ "$(settings get global low_power 2>/dev/null)" = 1 ]; then
+    echo "battery saver is on, and this device switches blur off with it"; return
+  fi
+  # The engine's own test (glass_engine.cpp install()), word for word.
+  case "$(getprop debug.renderengine.backend)" in
+    *graphite*) echo "RenderEngine runs on Graphite, where the engine stands down (only Ganesh is verified)"; return ;;
+  esac
+  [ "$(getprop debug.renderengine.graphite)" = true ] \
+    && { echo "RenderEngine runs on Graphite, where the engine stands down (only Ganesh is verified)"; return; }
+  # Graphite reached without either property (a server-side rollout flag):
+  # the engine finds out from the canvas at the first blur and says so here.
+  [ "$(getprop sys.glass.graphite)" = 1 ] \
+    && echo "RenderEngine turned out to draw with Graphite, so the engine stood down (only Ganesh is verified)"
+}
 
 clear_overrides() {
   overrides | while IFS= read -r kv; do setprop "$P.${kv%%=*}" ""; done
@@ -261,7 +304,16 @@ status() {
                 no-glass)   echo "Engine:  loaded, but the glass shader did not validate on"
                             echo "         this ROM: Android's blur is drawn instead" ;;
                 *)          echo "Engine:  loaded in SurfaceFlinger" ;;
-              esac ;;
+              esac
+              # Worth knowing in a crash report: the hooks run on pages
+              # whose branch-target guard the engine had to lift.
+              if [ "$(getprop sys.glass.bti)" = guarded ]; then
+                echo "         (this SurfaceFlinger runs with BTI branch protection)"
+              fi
+              # Live mode's engine sits in its tmpfs, never in /system/lib64.
+              if grep -q /dev/stockglass/ "/proc/$(pidof surfaceflinger)/maps" 2>/dev/null; then
+                echo "         (live mode: until the next reboot; glassctl unlive takes it out)"
+              fi ;;
     disabled) echo "Engine:  DISABLED after a boot that did not complete"
               echo "         $(retry_hint)" ;;
     no-metamodule)
@@ -283,6 +335,18 @@ status() {
     *)        echo "Engine:  not loaded. Last boot said:"
               sed 's/^/         /' "$STATE/last_boot.log" 2>/dev/null | tail -3 ;;
   esac
+  # Whatever kept the overlay out, live mode can load the engine for this boot.
+  if [ "$(engine_state)" != loaded ] && [ -f "$MODDIR/live.sh" ]; then
+    case "$(getprop sys.glass.live)" in
+      failed|idle) echo "Live:    $(sh "$MODDIR/live.sh" status | head -n 1 | sed 's/^Live mode: //')" ;;
+      *)           echo "         Or load it for this boot only, without the mount: glassctl live" ;;
+    esac
+  fi
+  b=$(blur_off_reason)
+  if [ -n "$b" ]; then
+    echo "Blur:    OFF in Android: $b."
+    echo "         Stock Glass restyles Android's blur, so nothing changes until it is on."
+  fi
   t=$(tripped)
   if [ -n "$t" ]; then
     echo "Crash:   SurfaceFlinger restarted at $(date -d "@$t" +%H:%M:%S 2>/dev/null || echo "$t")"
@@ -321,10 +385,12 @@ json() {
   mount_state >/dev/null   # again in this shell, for MOUNT_WHY and META_NAME
   mw=$(printf '%s' "$MOUNT_WHY" | tr -d '"\\')
   mn=$(printf '%s' "$META_NAME" | tr -d '"\\')
-  printf '{"engine":"%s","engineStatus":"%s","mount":"%s","mountWhy":"%s","metaName":"%s","tripped":"%s","regen":"%s","followTheme":%s,"app":{%s},"clockTint":"%s","tileTint":"%s","tileColor":"%s","scrim":"%s","scrimColor":"%s","state":%s}\n' \
-    "$(engine_state)" "$(engine_status)" "$ms" "$mw" "$mn" "$(tripped)" "$(getprop sys.glass.regen)" "$ft" "$app" \
+  bo=$(blur_off_reason | tr -d '"\\')
+  printf '{"engine":"%s","engineStatus":"%s","mount":"%s","mountWhy":"%s","metaName":"%s","blurOff":"%s","tripped":"%s","regen":"%s","followTheme":%s,"app":{%s},"clockTint":"%s","tileTint":"%s","tileColor":"%s","scrim":"%s","scrimColor":"%s","live":"%s","liveWhy":"%s","state":%s}\n' \
+    "$(engine_state)" "$(engine_status)" "$ms" "$mw" "$mn" "$bo" "$(tripped)" "$(getprop sys.glass.regen)" "$ft" "$app" \
     "$(getprop $P.app.clocktint)" "$(getprop $P.app.tint)" "$(getprop $P.app.tilecolor)" \
-    "$(getprop $P.app.scrim)" "$(getprop $P.app.scrimcolor)" "$st"
+    "$(getprop $P.app.scrim)" "$(getprop $P.app.scrimcolor)" \
+    "$(getprop sys.glass.live)" "$(getprop sys.glass.live.why | tr -d '"\\')" "$st"
 }
 
 number() {
@@ -462,6 +528,14 @@ case "$cmd" in
     echo "$1: $2"
     ;;
   json) json ;;
-  -h|--help|help) sed -n '2,54p' "$0" | sed 's/^# \{0,1\}//' ;;
+  live|unlive)
+    [ -f "$MODDIR/live.sh" ] || die "this copy of the module has no live.sh"
+    if [ "$cmd" = unlive ]; then sub=off; else sub=${1:-on}; [ $# -gt 0 ] && shift; fi
+    case "$sub" in
+      on|off|status|check) exec sh "$MODDIR/live.sh" "$sub" "$@" ;;
+      *) die "usage: glassctl live [on|off|status|check] [--force]" ;;
+    esac
+    ;;
+  -h|--help|help) sed -n '2,61p' "$0" | sed 's/^# \{0,1\}//' ;;
   *) die "unknown command '$cmd' (glassctl help)" ;;
 esac

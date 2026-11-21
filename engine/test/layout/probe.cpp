@@ -15,6 +15,9 @@
 #include "include/effects/SkRuntimeEffect.h"
 #include <cstddef>
 #define E(name, expr) extern "C" const long name = (long)(expr);
+// Informational: shown and flagged when it differs, but not a reason to refuse
+// a tree, because the engine depends on it only in a way that holds anyway.
+#define I(name, expr) extern "C" const long info_##name = (long)(expr);
 E(SkPaint_size, sizeof(SkPaint))
 E(SkPaint_align, alignof(SkPaint))
 E(SkPaint_fShader, offsetof(SkPaint, fShader))
@@ -49,3 +52,17 @@ E(SkImage_fInfo, offsetof(SkImage, fInfo))
 E(SkImageInfo_fDimensions, offsetof(SkImageInfo, fDimensions))
 E(SkImage_fUniqueID, offsetof(SkImage, fUniqueID))
 E(SkRefCntBase_fRefCnt, offsetof(SkRefCntBase, fRefCnt))
+// MakeForShader(SkString, const Options&) is handed an all-zero Options{}
+// (sk_bridge.cpp), and every field's default is zero in every release, so a
+// release that lays Options out differently reads the same defaults. Android
+// 15's is 12 bytes with allowPrivateAccess at +1; the pin's is 40 with it at
+// +24. It would matter the day the engine set a field.
+I(Options_size, sizeof(SkRuntimeEffect::Options))
+I(Options_allowPrivateAccess, offsetof(SkRuntimeEffect::Options, allowPrivateAccess))
+// Never read: the engine calls findUniform and uniformSize, or lays the
+// uniforms out itself (glass_engine.cpp, uniformOffsets). Android 16 added
+// SkString fName in front of them, so they move: +0x38/+0x50 on Android 15,
+// +0x40/+0x58 from 16. An inline uniforms() through the pin would read the
+// wrong vector on Android 15.
+I(SkRuntimeEffect_fUniforms, offsetof(SkRuntimeEffect, fUniforms))
+I(SkRuntimeEffect_fChildren, offsetof(SkRuntimeEffect, fChildren))

@@ -282,6 +282,33 @@ point the engine needs out of your `surfaceflinger`'s own debug symbols, and
 aborts with a list if any are missing. A ROM it cannot drive costs you an error
 message, not a boot.
 
+## Root that comes after boot: live mode
+
+Some setups never mount the module: root loaded after boot (temporary root),
+KernelSU 3 without a metamodule, or a metamodule that broke. Live mode loads
+the engine anyway, for this boot only:
+
+```sh
+sh /data/adb/modules/stockglass/glassctl live check   # what it needs; changes nothing
+sh /data/adb/modules/stockglass/glassctl live         # load it now
+sh /data/adb/modules/stockglass/glassctl unlive       # take it out again
+```
+
+It puts a copy of your `surfaceflinger` that loads the engine in a RAM disk,
+mounts it over the real one, and restarts SurfaceFlinger. That restart is a
+soft reboot: the screen goes black for about ten seconds and every app starts
+again, including the terminal or manager you ran it from (the switch finishes
+by itself). A reboot undoes everything; nothing is written to your system.
+
+- It needs root, and on an enforcing device a root manager that can add SELinux
+  rules while running (KernelSU, KernelSU-Next, APatch and Magisk all can). It
+  never switches SELinux to permissive.
+- If SurfaceFlinger does not come up with the engine, or dies twice within 90
+  seconds, live mode takes itself out and the ROM's own SurfaceFlinger comes
+  back.
+- So far it has only run on the Android emulator. Run `glassctl live check`
+  first on a phone.
+
 ## Light and dark, and the palette
 
 The frost colour follows the system theme, and Liquid Material follows the

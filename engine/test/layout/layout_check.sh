@@ -41,11 +41,22 @@ tables = [dict(l.split() for l in open(c)) for c in cols]
 names = [os.path.basename(c)[:-4] for c in cols]
 print(f"{'':20s}" + "".join(f"{n[-24:]:>26s}" for n in names))
 bad = 0
+info = 0
 for k in tables[0]:
     vals = [t.get(k, "?") for t in tables]
     same = len(set(vals)) == 1
-    bad += not same
-    print(f"{k:20s}" + "".join(f"{v:>26s}" for v in vals) + ("" if same else "   <-- DIFFERS"))
+    # info_ rows (probe.cpp, I()) are facts worth seeing that the engine does
+    # not depend on; they never fail the check.
+    informational = k.startswith("info_")
+    if not same:
+        if informational:
+            info += 1
+        else:
+            bad += 1
+    flag = "" if same else ("   (differs; informational)" if informational else "   <-- DIFFERS")
+    print(f"{k:20s}" + "".join(f"{v:>26s}" for v in vals) + flag)
+if info:
+    print(f"\n{info} informational row(s) differ: the engine does not depend on them (probe.cpp says why)")
 print("\nall layouts identical" if not bad else f"\n{bad} layout(s) differ: do not drive this tree with the current pin")
 sys.exit(1 if bad else 0)
 PY

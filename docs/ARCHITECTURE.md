@@ -8,9 +8,17 @@ uncomfortable part below applies to only one of them.
 
 ### Track A — source patch (Lineage, crDroid, any build-from-source ROM)
 
-A patch to `frameworks/native/libs/renderengine/skia/filters/BlurFilter.cpp`
-that replaces the body of `drawBlurRegion`. It compiles against whatever
-`external/skia` is already in the tree.
+A patch to `frameworks/native/libs/renderengine` that compiles the engine's
+drawing into RenderEngine, against whatever `external/skia` is already in the
+tree. `rom/make_patch.sh <branch>` writes it, ready for `git am`: a
+`GlassFilter` that wraps whichever blur filter SkiaRenderEngine picks and takes
+its `drawBlurRegion` (made `virtual` for it) and `generateTemporaryImage`.
+Besides the new files, it changes one word in `BlurFilter.h`, one statement and
+an include in `SkiaRenderEngine.cpp`, and two lines of `Android.bp`;
+`BlurFilter.cpp` and the filters stay AOSP's, so stock mode draws AOSP's own
+pixels. The drawing code is the module's, unchanged: it calls Skia through the
+same table of function pointers, which the ROM build fills with direct calls.
+`rom/README.md` is for maintainers.
 
 - No symbol resolution, no inline hooking, no ABI guessing, no injection.
 - Nothing can drift, because the compiler sees the same Skia the rest of the
@@ -113,6 +121,23 @@ Using `findUniform` for the offsets has a second benefit: the engine never
 reimplements Skia's uniform packing rules, and a shader whose uniforms move is
 detected at load time rather than rendering wrong.
 
+**Without `findUniform`.** Pixel's BP1A (Android 15, March and May 2025, five
+devices) and Nothing OS 3.2 for the Phone (2) inline `findUniform` and
+`findChild` away entirely, while `uniformSize()` survives. On those builds the
+engine does reimplement the packing rule, because it is short and stable:
+`SkRuntimeEffectPriv::VarAsUniform` lays the uniforms out in declaration order,
+each straight after the one before, at 4 bytes a component whatever the
+precision, and the children are numbered in declaration order. SkSL never drops
+a uniform as unused (`ProgramUsage::isDead` says uniforms are never dead).
+`engine/build.sh` packs the offsets from the same SkSL that is embedded
+(`kGlassUniformPacked`), and the engine trusts them on a build only if the
+effect's `uniformSize()` comes out at the packed total (268 bytes for the glass
+shader, 92 for the tone shader), which it would not if a uniform had been
+dropped or sized differently. Where `findUniform` exists the engine checks the
+packed layout against it and logs the result, so every build that does not
+need the rule tests it; `debug.glass.noFindUniform=1` forces the fallback on
+such a build for trying it.
+
 ## Layout dependencies, in full
 
 Everything the engine touches by layout rather than by call, so the list can be
@@ -189,7 +214,7 @@ Anything other than an explicit `glass` (or `on`) is stock, so a typo, an empty
 value or a name from a later version can only ever produce Android's blur. The
 old `bypass=1` still forces stock.
 
-Why a live mode rather than "install = on":
+Why a runtime switch rather than "install = on":
 
 - **It is the honest framing of what the module is.** The compositor already
   decided where to blur and how much; glass is a way of drawing that decision,
@@ -498,6 +523,94 @@ Three decisions worth keeping:
    0.4.8). `customize.sh` first gives each live path a new file by rename, so
    the running copy stays intact until the reboot. See VERIFIED.md, "Updating
    over a running copy".
+
+## Many SurfaceFlingers: one resolver, a cache, and hook shapes
+
+The module meets a different `surfaceflinger` on every ROM: AOSP and Pixel
+releases with their QPRs, LineageOS and the ROMs built on it, and OEM builds.
+What changes between them is known from the builds measured: the hook target
+gains a parameter (`zoomScale` at A16 QPR2), helpers get inlined or not
+(`getTotalMatrix`, `invertNonIdentity`), a compiler re-conventions a function
+it can see every caller of (`MakeForShader` on alioth), and Pixel's A17 QPR
+line splits `drawBlurRegion` into thin wrappers around `setupBlurPaint` and
+adds an `SkPath` overload. Three pieces keep that manageable:
+
+1. **One resolver** (`engine/src/sf_resolve.*`). glasscheck at install, the
+   engine at start-up and the host tests used to carry a resolution loop each,
+   and the loops had drifted apart (one refused a build the other accepted).
+   Now there is one pipeline: match every entry point of `sf_symbols.cpp` by
+   exact mangled name, record drift (a prefix hit whose name no entry knows,
+   so the other `drawBlurRegion` shape is not drift and a new one is), ask the
+   caller's ABI probe about every by-value return, then `judge()` the result
+   with the group rules: exactly one hook shape big enough to hook, a way to
+   release the uniform blob, and everything `SkBridge::drawReady()` needs.
+   The engine and the installer therefore make the same decision by
+   construction, and the host test (`engine/test/run.sh`) makes it too.
+2. **Hook shapes as a table** (`kHookShapes`). A new shape of the hook target
+   is one row there, one entry in `sf_symbols.cpp` and one replacement
+   function in the engine; exactly-one, the size test and the cache follow
+   from the table, and a `static_assert` keeps the replacements in step.
+   There are three: `(radius, alpha)` up to A16 QPR0, `(radius, scale, alpha)`
+   from QPR2, and Evolution X 12.x's `(radius, scale, alpha, material)`. EvoX added
+   a glass of its own to RenderEngine on its Android 17 branch
+   (`Evolution-X/frameworks_native`, `cnb`, "renderengine: Draw blur regions as
+   Liquid Glass", written 2026-10-05, merged 2026-11-05), and crDroid took the
+   same commit into its `17.0` branch on 2026-11-11, so crDroid 13.x builds
+   from then on have this shape too. The extra `int` is the region's material: -1
+   for a layer's own blur, 0 for the notification shade's, and 1 to 11 for
+   ColorOS-style materials a client can ask for in a blur region (11 is the
+   dock), which EvoX draws as its glass whatever its Liquid Glass switch says.
+   The switch, `persist.sys.evolution.liquid_glass`, is off unless something
+   sets it (no build.prop does), so out of the box EvoX 12.x draws Android's
+   blur. The replacement draws StockGlass where AOSP would have drawn a plain
+   blur (material 0 and below), leaves the materials a client chose to EvoX,
+   and passes the `int` through on every call to the original. A replacement
+   for the QPR2 shape would call the original with whatever w7 held by then.
+   This shape is what "Flash failed" on EvoX meant: the installer refused a
+   shape it did not know, whether or not EvoX's glass was on.
+3. **Resolve at install, verify at boot** (`engine/src/sf_cache.*`). glasscheck
+   already reads the whole binary and inflates its MiniDebugInfo at install,
+   so it writes down what it found: `libglassengine.symcache` next to the
+   engine in the overlay, keyed by the binary's GNU build ID and the
+   entry-point table's hash, with the first 16 code bytes of every entry. At
+   start the engine reads a few kilobytes and compares those bytes with the
+   code in memory instead of resolving (0.3 s before SurfaceFlinger's main on
+   the F1). Anything wrong with the cache (another build ID, another table, a
+   byte that differs, truncation) means resolving as before: a cache can cost
+   time, never correctness. It is also the way in for builds without symbols:
+   an address found at install by other means is handed over the same way,
+   marked `scan`, so the clever part runs where a mistake costs a declined
+   install and can be tested on the host, and the engine only ever runs the
+   cheap, strict check.
+
+Two smaller tables follow the same pattern. The blur filters whose
+`generateTemporaryImage` the engine hooks for `backdropBlur` are rows of
+`kGenerateFilters`: AOSP's three, and Project Infinity-X's `GlassBlurFilter`,
+which replaces all of AOSP's Kawase filters on that ROM (Infinity-X 4.x, A17;
+its source credits AxionOS). The engine instantiates one `generateHook<K>` per
+row, so a ROM's own filter with AOSP's signature is one mangling and one row.
+And the uniform layout has a fallback for builds that inline `findUniform`
+away (see "Shader construction" above).
+
+**Graphite, asked of the canvas.** `install()` stands down when
+`debug.renderengine.backend` or `debug.renderengine.graphite` says Graphite,
+but those properties are not the only way there. Lineage 24's Pixel 8 build
+sets `debug.renderengine.graphite_preview_optin=true` from the vendor
+partition, and RenderEngine then follows a server-side aconfig rollout flag
+(`graphite_renderengine_preview_rollout`): one flag flip moves it to Graphite
+with nothing for `install()` to see. So the draw hook also asks the canvas, at
+every blur until the answer is yes: `SkCanvas::recorder()` returns the top
+device's Graphite `Recorder`, which only a Graphite device has. Yes means
+standing down for the life of the process (`sys.glass.graphite=1`, shown by
+`glassctl status`), before the shader is ever compiled, so no blur is ever put
+off there either. A canvas that wraps another (a Skia capture) answers null,
+which can cost the check but never the glass.
+
+`glasscheck --json` prints the whole resolution for tooling,
+`--cache-out FILE` writes the cache and `--verify-cache FILE` runs the
+engine's check against the file. The firmware survey that drove this lives
+in `captures/sf-corpus/` (not in git: ROM binaries); its reports are
+summarised in VERIFIED.md.
 
 ## The companion: regions for what Android never blurs (M3)
 
@@ -1020,10 +1133,10 @@ which the AVD's SystemUI would refuse (a signature permission), are tested there
   adds to alioth's Quick Settings) still run the whole shader, less the
   fringe and the softening since v0.4.17. Under a heavy backdrop they could
   be drawn flat; under the toned one alioth uses (27 px) they still show.
-- The engine takes about 0.3 s to find its symbols and hook when
+- The engine took about 0.3 s to find its symbols and hook when
   SurfaceFlinger starts (318 ms on the Poco F1), before SurfaceFlinger's own
-  start-up. The installer resolves the same symbols from the same binary and
-  could hand the engine the addresses.
+  start-up. The install-time symbol cache ("Many SurfaceFlingers" above) hands
+  it the addresses instead; what it saves on a phone is not measured yet.
 - The companion has only run under its dev loader on the A17 AVD. LSPosed on
   A17, crDroid's Launcher3QuickStep at run time (folders, widgets, and icons in
   the "Minimal" style), crDroid's notification cards and heads-ups (LSPosed only),
@@ -1035,13 +1148,50 @@ which the AVD's SystemUI would refuse (a signature permission), are tested there
   convention on `MakeForShader(SkString)` that crashed the first glass frame
   (fixed by compiling through the Options form, checking every by-value
   callee's result register, and a crash guard). VERIFIED.md has both.
-- The calling-convention check is a short-list decoder of the first
-  instructions: it can only say "x8" for encodings it knows, so a ROM whose
-  prologues look different gets "undetermined" and no glass, not a crash. Only
-  by-value RETURNS are checked; a compiler could also drop or reorder plain
-  arguments of a function it sees every caller of. None of the bound functions
-  on alioth do (read off the disassembly), but a new target deserves the same
-  look.
+- The calling-convention check walks a few hundred instructions (calls and
+  both arms of a branch, `abi_check.h`), but it can only say "x8" for read
+  encodings it knows, so a ROM whose code looks different gets "undetermined"
+  and no glass, not a crash. Only by-value RETURNS are checked; a compiler
+  could also drop or reorder plain arguments of a function it sees every
+  caller of. None of the bound functions on alioth do (read off the
+  disassembly), but a new target deserves the same look.
+- Branch protection. 21 of the 64 surfaceflingers in the corpus are built with
+  BTI and PAC (the Pixel 8 and later from Android 17 QPR1, EvoX 12.x and
+  Lineage for garnet, the FP6, the S22, Nothing's Qualcomm builds, Motorola's
+  mona), and on an ARMv9 core bionic maps their code guarded: an indirect
+  branch must land on a `bti` or `paciasp`. The engine's calls into SurfaceFlinger do, since every
+  function it calls starts with one in all 21 (checked at start, and a function
+  without one would lose the guard on its first page instead). frida's way
+  back from its trampoline into the hooked function lands on an ordinary
+  instruction, so the engine takes the guard off the pages it patches before
+  hooking. The start-up log and `sys.glass.bti` say which case a phone is
+  (`glassctl status` mentions it when it is guarded). Not yet run on a phone
+  that enforces BTI: alioth and the F1 are ARMv8.x.
+- Live mode (`glassctl live`, `module/live.sh`): the engine for one boot
+  without the module's mount, for root that arrives after boot. It has run on
+  the A17 AVD only, enforcing (rules added through a stand-in for the root
+  manager's policy tool) and permissive; `ksud` and `apd` were checked against
+  their source only. Loading it at boot from post-fs-data.sh (KernelSU 3
+  without a metamodule, no restart) is drafted in
+  `captures/sf-corpus/reports/rootless.md` but not wired in: it needs
+  post-mount.sh to count it as mounted, and a measured real boot.
+- The ROM patch (`rom/`) compiles against AOSP android17-release and
+  android16-qpr2-release and LineageOS 24.0 and 23.2, with each branch's own
+  headers and renderengine's `-Werror` flags, and applies with `git am`. It
+  has not been built in a full tree or booted. It cuts the drawing code out of
+  `glass_engine.cpp` with a script (`rom/split/`) until engine/src is split
+  for it. Evolution X 12.x (and crDroid 13.x) need a reworked patch, because
+  their `drawBlurRegion` takes a material. A ROM that carries it is refused by
+  the module's installer (the resolver looks for `GlassFilter`).
+- RenderEngine on Vulkan. Lineage 24 for the Galaxy S20 (x1s) sets
+  `debug.renderengine.backend=skiavkthreaded` (Ganesh on Vulkan). The engine's
+  draw has only run on Ganesh GL.
+- Devices whose vendor switched window blur off
+  (`ro.surface_flinger.supports_background_blur` 0 or unset: Nothing Phone (3a),
+  CMF Phone 2 Pro) install fine and draw nothing; the installer and
+  `glassctl status` say why. Setting the property from the module before
+  SurfaceFlinger starts would turn blur on (an opt-in, since the vendor chose
+  it off, presumably for GPU cost); not built.
 - Every AVD runs permissive. Test with `setenforce 1`, or with `hookprobe`
   under `runcon u:r:surfaceflinger:s0`, before trusting an emulator result on
   anything SELinux could refuse.

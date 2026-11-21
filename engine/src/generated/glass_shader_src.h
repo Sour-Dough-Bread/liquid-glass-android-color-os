@@ -693,6 +693,8 @@ inline constexpr const char* kGlassUniformNames[] = {
     "noiseAmount",
 };
 inline constexpr int kGlassUniformNames_count = 43;
+inline constexpr unsigned kGlassUniformPacked[] = {0, 8, 16, 32, 48, 64, 68, 76, 80, 84, 88, 92, 96, 100, 104, 108, 112, 128, 144, 148, 156, 160, 164, 168, 172, 176, 180, 188, 192, 196, 200, 204, 208, 212, 216, 220, 224, 236, 248, 252, 256, 260, 264};
+inline constexpr unsigned kGlassUniformPackedSize = 268;
 inline constexpr const char* kGlassChildNames[] = {
     "blurredContent",
     "sharpContent",
@@ -2194,6 +2196,8 @@ inline constexpr const char* kGlassToneUniformNames[] = {
     "hdrHeadroom",
 };
 inline constexpr int kGlassToneUniformNames_count = 9;
+inline constexpr unsigned kGlassToneUniformPacked[] = {0, 8, 16, 32, 48, 64, 80, 84, 88};
+inline constexpr unsigned kGlassToneUniformPackedSize = 92;
 inline constexpr const char* kGlassToneChildNames[] = {
     "blurredContent",
 };

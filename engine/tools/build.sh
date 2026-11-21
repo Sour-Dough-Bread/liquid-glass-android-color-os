@@ -21,6 +21,7 @@ for abi in arm64-v8a x86_64; do
     -I "$HERE/../vendor/xz" \
     -o "$OUT/$abi/glasscheck" \
     "$HERE/glasscheck.cpp" "$HERE/../src/abi_check.cpp" "$HERE/../src/elf_syms.cpp" "$HERE/../src/sf_symbols.cpp" \
+    "$HERE/../src/sf_resolve.cpp" "$HERE/../src/sf_cache.cpp" \
     "$HERE/../src/xz_inflate.cpp" "$HERE/../src/glass_params.cpp" "$OUT/$abi/obj"/*.o
   printf "%-10s %s (%s bytes)\n" "$abi" "$OUT/$abi/glasscheck" "$(stat -c%s "$OUT/$abi/glasscheck")"
 done
