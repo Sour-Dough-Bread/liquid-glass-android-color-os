@@ -1,0 +1,3 @@
+# StockGlass, optional: see glass.te.
+persist.sys.glass.      u:object_r:glass_prop:s0
+sys.glass.              u:object_r:glass_prop:s0

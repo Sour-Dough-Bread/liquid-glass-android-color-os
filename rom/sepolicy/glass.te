@@ -1,0 +1,24 @@
+# StockGlass, optional. Gives the glass properties a type of their own so
+# that the shell user can set them: `adb shell setprop persist.sys.glass.mode
+# glass`, or a glassctl the ROM ships, then works without root.
+#
+# Not needed for the patch, nor for a Settings switch. On stock policy
+# persist.sys.glass.* and sys.glass.* are system_prop: SurfaceFlinger reads and
+# sets them, Settings (system_app) sets them, every app and the shell read them.
+#
+# Goes in the ROM's private platform policy, e.g. system/sepolicy/private or
+# device/lineage/sepolicy/common/private, with property_contexts next to it.
+# Everyone who used them as system_prop keeps the same access.
+
+system_internal_prop(glass_prop)
+
+# SurfaceFlinger: the crash guard's mode=stock and the sys.glass.* status.
+set_prop(surfaceflinger, glass_prop)
+# Settings: a glass switch.
+set_prop(system_app, glass_prop)
+# adb shell, glassctl.
+set_prop(shell, glass_prop)
+
+# Read on the platform side, as system_prop is: SystemUI, launchers and
+# system_server are where the module's LSPosed companion reads them.
+get_prop(coredomain, glass_prop)
