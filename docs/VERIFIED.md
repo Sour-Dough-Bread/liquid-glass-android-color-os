@@ -4306,10 +4306,83 @@ overlapping regions came in another order, which varies between restarts.
 - The Graphite canvas check on a Graphite device, and the glass on Ganesh
   Vulkan, which both Lineage Exynos builds use.
 - The blur scale probe in an arm64 SurfaceFlinger: on glass17 it logs
-  `4 assumed`, as it reads A64 code only. The glass on Lunaris or Infinity-X.
+  `4 assumed`, as it reads A64 code only. On alioth (next section)
+  glasscheck's run of it found 4, but the engine's own line had left the log
+  before anyone read it. The glass on Lunaris or Infinity-X.
 - Live mode on a phone: a real root manager's policy tool, whose `ksud` and
   `apd` forms were only read in upstream source; the arm64 build; KernelSU's
   and Magisk's su namespaces; and `live.sh mount` at post-fs-data.
 - The ROM patch in a full tree: no Soong build, no boot.
 - Firmware not in the corpus: Samsung's and OnePlus's own, from two of the
   Reddit reports; crDroid beyond the alioth baseline; AxionOS 2.9.
+
+## v0.4.21 and companion 0.2.2 on alioth (2026-11-22)
+
+The first phone to run the engine from `db0d8c6` on: alioth (Poco F3,
+Adreno 650), crDroid 13.1 on Android 17, built 2026-11-08. That build
+predates both crDroid changes in the survey above, the material argument
+(2026-11-11) and card regions only on the lock screen (2026-11-15), so
+its `drawBlurRegion` has the `(radius, scale, alpha)` shape and neither
+the material path nor the companion's card-region hook has anything to do
+there. Everything went over USB; wireless debugging was not reachable.
+
+**Companion 0.2.2** (`4c6474b0…`, the APK attached to v0.4.21) went on at
+11:29 with `adb install -r` over 0.2.1. Vector kept it enabled and pointed
+at the new APK, with System UI, the launcher and System Framework in its
+scope.
+
+**The module** is the zip from the v0.4.21 release (`845a53e0…`, engine
+arm64 `5885a6c4…`), installed at 11:30 with `ksud module install` over a
+running v0.4.20 (engine `959271dc…`). SurfaceFlinger kept its process
+(pid 1656) through the install, and the installer reported "Swapped 3
+running file(s) for new ones". Its check of the ROM, the probe's first run
+on a phone:
+
+```
+26232 function symbols recovered from MiniDebugInfo
+hook     drawBlurRegion(radius, scale, alpha) at 0x295240, 2680 bytes
+scale    4 (kInputScale 0.25) from the literal at 0x32340, loaded at 0x295304 in drawBlurRegion
+lighter backdrop blur: available
+OK    every required entry point resolved
+```
+
+Glass was set to stock for the reboot (11:31:28). `sys.boot_completed`
+came 64 s later with `engine=hooked`, `regen=1` and `bti=none`; this
+`surfaceflinger` is not BTI-built. USB debugging dropped off for about a
+minute after the boot (the phone enumerated as `18d1:4e11`, MTP alone) and
+came back by itself. By then the engine's start-up lines (the hook, its
+time, the blur scale line) and the companion's had rotated out of the main
+log buffer, so they were not read.
+
+At 11:33:36 `glassctl glass` switched glass on live. SurfaceFlinger kept
+its process (pid 1684), `engine=glass`, `active=1`, and every shader
+compiled, the uniform layout now checked against the packed one on a
+phone's Skia:
+
+```
+mode: glass, preset basic, backdrop tone, 25 properties overridden
+SkSL compiled by SurfaceFlinger's Skia (32853 chars)
+shader validated: 43 uniforms + 2 children resolved, blob 268 bytes, density 2.750 px/dp, 25 properties overridden
+uniform layout from findUniform, which agrees with the packed layout
+tone shader validated (4007 chars, 9 uniforms, blob 92 bytes, from findUniform, which agrees with the packed layout)
+lean shader validated (23853 chars, the glass shader's uniform block)
+lean_soft shader validated (26425 chars, the glass shader's uniform block)
+deep shader validated (19175 chars, the glass shader's uniform block)
+lean tone shader validated (3708 chars, the tone shader's uniform block)
+```
+
+The next lines were draws: the shade's backdrop as `backdrop/tone r=77
+(blurred at 50)`, notification panes over it, the companion's Quick
+Settings tiles at `r=225`, and on the home screen its icons and widgets.
+The companion logged `engine reports "glass"` from SystemUI and from the
+launcher. At 130 s of uptime there was no new tombstone, no
+`sys.glass.tripped` and no warning or error among 200 StockGlass lines.
+Google Play services crashed three times during the boot on a
+`SecurityException` for `DRAW_MOTION_CUES`, which is the ROM's and Play
+services' business, not the glass's.
+
+So the split engine (`glass_draw.cpp`, `sk_shared.cpp`) and the packed
+uniform layout have now drawn on a phone. Not covered: the engine's own
+blur scale line, the material shape, the card-region hook's effect, BTI,
+Graphite, and the F1, which still runs v0.4.20. Nothing was measured; the
+phone's owner was using it.

@@ -114,8 +114,9 @@ the engine what they do differently:
 The installer's check passes on all 66: Pixel (19 builds), LineageOS (16),
 Evolution X and crDroid (9), Nothing OS (8), Motorola (5), and Infinity-X,
 PixelOS, Lunaris, AxionOS, /e/OS and a TrebleDroid GSI (9). That checks the
-binaries on a computer. None of the new code has run on a phone yet, mine
-included, so expect bugs. The safety nets are the ones the module always had: the
+binaries on a computer. On a phone, v0.4.21 has so far run only on my F3,
+whose crDroid build predates the Evolution X changes. None of the paths for
+the other ROMs has run on one, so expect bugs. The safety nets are the ones the module always had: the
 installer refuses a SurfaceFlinger it can't drive, a failed boot disables the
 module, and a SurfaceFlinger crash with glass on brings Android's blur back.
 
