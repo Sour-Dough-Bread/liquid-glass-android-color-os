@@ -1,0 +1,17 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="dev.stockglass.auto.media"
+    android:versionCode="1"
+    android:versionName="0.1.0-proto">
+
+    <uses-sdk android:minSdkVersion="33" android:targetSdkVersion="36" />
+
+    <!-- Xposed metadata only: no activity, service or permission. -->
+    <application android:label="Stock Glass for Android Auto media">
+        <meta-data android:name="xposedmodule" android:value="true" />
+        <meta-data android:name="xposeddescription"
+            android:value="Liquid Glass under the buttons of Android Auto's dashboard media card (prototype)." />
+        <meta-data android:name="xposedminversion" android:value="82" />
+        <meta-data android:name="xposedscope"
+            android:value="com.google.android.projection.gearhead" />
+    </application>
+</manifest>

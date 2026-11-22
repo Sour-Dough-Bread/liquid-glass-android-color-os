@@ -144,6 +144,7 @@ has the survey in full.
 | `engine/` | `libglassengine.so`, which loads into SurfaceFlinger. It resolves Skia's symbols from the ROM's own binary, hooks the blur and draws the glass. |
 | `shader/` | Generates the glass shader (SkSL) that the engine embeds. |
 | `companion/` | The LSPosed module. |
+| `auto/` | Android Auto Glass: prototype LSPosed modules for Google Maps and Android Auto's media screens. [auto/README.md](auto/README.md) has what they do and how far they're tested. |
 | `harness/` | A test app that makes blur regions on demand. |
 | `docs/` | [ARCHITECTURE.md](docs/ARCHITECTURE.md) explains the design. [VERIFIED.md](docs/VERIFIED.md) records what was tested where, with numbers. |
 
