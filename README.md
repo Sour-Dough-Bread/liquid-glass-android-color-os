@@ -58,13 +58,15 @@ From a Poco F3 on crDroid 13.1, Android 17.
 | Build | Where |
 |---|---|
 | Module | [The latest release](https://github.com/capthndsme/liquid-glass-android/releases/latest), with its sha256 |
-| [Companion APK, 0.2.2](https://github.com/capthndsme/liquid-glass-android/releases/download/v0.4.21/stockglass-companion.apk) | sha256 `4c6474b0c92f8e27d59f2d667f61d105723fc1f60d937f2c2e4a61d2bddc2904`, attached to v0.4.21 |
+| [Companion APK](https://github.com/capthndsme/liquid-glass-android/releases/latest/download/stockglass-companion.apk) | the same release; its notes give the sha256 |
 
 GitHub Actions builds every push to this repository and publishes it under
 [Releases](https://github.com/capthndsme/liquid-glass-android/releases). The
 latest release is the newest numbered version. A build between two versions is
 a pre-release named like `v0.4.20-3-g1a2b3c4`, and the module in it reports
-that name. When a release has a companion APK attached, take that one.
+that name. Every release after v0.4.21 has the companion APK too, built by the
+same workflow. All companion builds, 0.1 included, are signed with one key, so
+each installs over the one before.
 
 It's experimental and needs root on Android 14 to 17. The installer checks the
 ROM's SurfaceFlinger first and refuses to install if the engine can't drive it.
