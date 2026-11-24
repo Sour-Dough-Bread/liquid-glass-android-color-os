@@ -4437,3 +4437,129 @@ Notes for the next ColorOS session:
 
 The watchdog was exercised on the same phone: a live switch to glass asked
 for confirmation, Volume Up kept it, and the health watch stayed quiet.
+
+## ColorOS 17: its own glass never reaches drawBlurRegion (CPH2573, 2026-11-24)
+
+With the engine live in glass mode, the home screen, control centre,
+notification shade and volume panel were opened over adb with
+`persist.sys.glass.stats=1`. The engine drew nothing in any of them: no
+stats line, no draw line. While the shade opens SurfaceFlinger logs
+`[BlurShot] alloc buffer root=91 slot=0 size=360x792 sessions=3`: ColorOS's
+material blur is a BlurShot, a quarter-size capture (360x792 of 1440x3168)
+of what is behind, which SystemUI blurs and tints in its own process
+(`com.oplus.systemui...PlatformBlurManagerImpl`, `VolumePlatformBlurParams`,
+`NotificationBlurMixColorParams`, `QsSeekBarBlurManager`). SurfaceFlinger
+only composites the result. Turning the material off
+(`settings put system system_material_blur_enable 0`) changed the look but
+not the route: still BlurShot, still no draw. `BlurBlendFilter::apply` has
+one caller, `UniSkiaRenderEngine::drawAndBlurBgCacheLayers`, ColorOS's
+cached background, not these surfaces. UniRender (SurfaceFlinger drawing
+apps' trees) is off on this phone ("No uniRender surface!").
+
+The AOSP path does work. The harness's `BenchActivity --es scene home`
+(BackgroundBlurDrawable regions, as the companion makes them) gave
+`blurRegions.size()=10` and ten `pane r=263` draws with the glass shader.
+So on ColorOS the glass for its own surfaces has to come from inside
+SystemUI and the launcher: a ColorOS port of the companion that swaps a
+surface's BlurShot material for a BackgroundBlurDrawable region.
+
+The launcher (`OplusLauncher`, package `com.android.launcher`) is Launcher3:
+`BubbleTextView`, `Hotseat`, `Workspace`, `folder/PreviewBackground`,
+`LauncherAppWidgetHostView`, `CellLayout`, `AppsSearchContainerLayout` are
+there; `ThemedIconDelegate`, `IconShape` (icons), `PredictedAppIcon` and
+`QsbLayout` are not (`OplusThemedIconDrawable`, `graphics/IconShape`
+instead). SystemUI keeps the AOSP classes the companion hooks, but its
+control centre is `com.oplus.systemui.plugins.qs` (about 400 classes) and
+every surface has its own blur manager.
+
+## ColorOS 17: the companion on OplusLauncher (CPH2573, 2026-11-24)
+
+Root by a temp-root exploit (KernelSU loaded as a runtime module), NeoZygisk
+2.4, Vector 2.2, meta-overlayfs 1.3.1. Every temp-root run ends in a soft
+reboot that runs the module stages; that is what mounts the overlay and loads
+the engine here (`post-mount: overlay mounted`, engine `glass`). Unprompted full
+reboots 0.5 to 2 minutes after rooting came with the exploit's kernel warnings
+(`posix_cpu_timer_del`, `timerqueue_del`) and boot reason plain `reboot`, never
+`reboot,stockglass`; no SurfaceFlinger crash or tombstone in any of them.
+
+The companion, scoped to `com.android.launcher` with Vector's CLI
+(`/data/adb/lspd/cli scope set ...`), on the first try: search box (drawer,
+`AppsSearchContainerLayout`) and Overview buttons hooked; folders, icons and
+widgets refused cleanly, one line each. What differs from Launcher3:
+
+- Folder plates are a child view, `folder.FolderRoundImageView` (an ImageView
+  at the plate's bounds, radius in `mRadius`, ColorOS's frost as its image);
+  `OplusPreviewBackground.drawBackground` draws the plate only during the
+  fall and convert animations. A before-hook on its `onDraw` puts the region
+  there and draws the frost at `app.fill`: the 3x3 folders on the home screen
+  show the engine's glass instead of ColorOS's frost.
+- `BaseLauncherAppWidgetHostView` has no `mIsCornerRadiusEnforced`; its outline
+  provider enforces when `mEnforcedRectangle` is set and the radius is > 0.
+- Google's search widget sits on the workspace, not in the Hotseat; its pill is
+  an ImageView's GradientDrawable (1192x192 in a 1312x328 host). Taken as a
+  search bar when a workspace widget has no plate but has such a pill: glass.
+- `BackgroundBlurDrawable.mRect` is a `RectF` in ColorOS's framework, a `Rect`
+  in AOSP; the region sweep read it as a Rect and stopped.
+- The steps card is not a widget: `launcher3.card.TitleCardView` hosting an
+  `org.hapjs.card` (Quick App) renderer. Not handled yet.
+- No themed-icon delegate (`OplusThemedIconDrawable` instead); icons not
+  handled yet.
+
+Later the same evening, the dock and the drawer:
+
+- The dock: `OplusHotseat.onDraw` draws an optional `mDockerBackgroundDrawable`
+  translated to `mShortcutsAndWidgets`, corners `measuredHeight *
+  BACKGROUND_SMOOTH_CORNER_RADIUS_FACTOR` (0.44 with smooth corners v2). On
+  this phone it is absent, so the dock has no plate; `LauncherDock` puts a
+  region there (`app.dock`): a glass slab behind the four icons.
+- Every launcher frost is a `BlurTransitionDrawable` (`RenderEffectDrawable`,
+  a RenderNode with a backdrop RenderEffect, or `LayerBlurDrawable`), radius in
+  `mRadius` (a `DirtyValue<Float>` on the first), animated alpha in
+  `mWholeAlpha`. `OplusFrost` hooks both draws: region at the bounds, frost at
+  `app.fill` through the original inside a layer. Folders and the drawer's
+  category cards take it; the cards' change is subtler, since the drawer sits
+  over ColorOS's own blurred wallpaper.
+- COUI widgets ask for frost through
+  `com.oplus.view.OplusViewBackgroundRenderEffect.setBackgroundRenderEffect
+  (RenderEffect, View)` (oplus-framework.jar): a backdrop effect on the view's
+  RenderNode. `CouiGlass` passes null and puts a region at the outline:
+  the drawer's search pill (`HighlightStrokeSearchBgView`) and colour button
+  (`BackgroundContainerView`). The drawer's header (a full-width
+  `RelativeLayout`) also asks for it; as glass it showed a hard edge across
+  the screen, so views at least 90% of the window's width keep their frost.
+- The All/Categories tab (`COUISegmentButtonLayout`) paints its own pill; it
+  is not frost and stays as it is.
+- Long-press popups were glass with no change of their own (frost the two
+  hooks above already take). Open folders are full screen over a blurred
+  wallpaper: a backdrop, left as it is.
+- The All/Categories tab: `COUISegmentButtonLayout.onDraw` paints the pill into
+  `mTmpRectF` (radius half its height) with the paints
+  `OplusAllAppCategoryTabView.getCustomBackgroundPaint()` returns, new on
+  every call: a region under the pill, those paints at `app.fill`.
+- Workspace cards (`TitleCardView`, the steps card): the Quick App renderer
+  paints an opaque plate; `mCardBounds` is declared in `LauncherCardView`,
+  two classes up. Region at `mCardBounds` with `getRadiusArr()`, the plate's
+  background (the first one breadth first covering 90% of the card) at
+  `app.fill`: the steps card is glass, text unchanged.
+- Themed icons: ColorOS's own (Settings, Themed icons) are not
+  `ThemedIconDrawable`s. Its theme engine bakes plate and glyph into one
+  bitmap, drawn by `com.oplus.icons.OplusFastBitmapDrawable` through
+  `FastBitmapDrawable.mPaint` (probe: `app.debug`, one line per drawable
+  class). The plate is exactly the theme's background colour
+  (`ThemedIconDrawable.getColors`: `#2f3034` plate, `#d7e3ff` glyph in dark
+  mode), so a bitmap whose border ring matches it is themed; a
+  `ColorMatrixColorFilter` keeping RGB with alpha' = A + s*luma - k puts the
+  plate at `app.fill` and the glyph opaque, over a region per icon. Icons
+  ColorOS themed with another plate (one with a badge, a few third-party
+  ones) do not match and keep their look.
+- Big folders draw their icons once into a cached RenderNode
+  (`FolderPreviewDrawable`, which is also the icons' callback), often before
+  any icon with a host view: the filter alone there, with the context from
+  `ActivityThread.currentApplication()`, no region (glass in glass). The
+  glyphs sit on the folder's glass with a faint plate.
+- Dock icons: four regions in SurfaceFlinger's dump of the launcher layer
+  (`blurRegions`, rects at y 2804) on each of five launcher restarts, and
+  after opening and closing the drawer. Earlier builds that missed them on
+  screen had the context and preview-path bugs above.
+- Idle cost: 0 launcher frames in 5 s on the settled home screen with the
+  companion on and off (`dumpsys gfxinfo`).

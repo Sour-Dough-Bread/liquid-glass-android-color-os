@@ -50,7 +50,7 @@ final class ViewGlass extends Drawable {
     private final Switch on;
     private final Keep keep;
     private final String what;
-    private boolean shadowless, fillOnly;
+    private boolean shadowless, fillOnly, plateless;
     private int ambientShadow, spotShadow;
     private boolean shadowCleared;
     final Region region = new Region();
@@ -130,6 +130,16 @@ final class ViewGlass extends Drawable {
         return this;
     }
 
+    /**
+     * Glass at the view's outline with no background to fade: a view whose
+     * plate is an effect on its own RenderNode (ColorOS's COUI frost), which
+     * the caller has taken away. The switch alone decides.
+     */
+    ViewGlass plateless() {
+        plateless = true;
+        return this;
+    }
+
     /** Also fades the glass by {@code f} (see Region.fadeWith). */
     ViewGlass fadeWith(Region.Fade f) {
         region.fadeWith(f);
@@ -188,6 +198,11 @@ final class ViewGlass extends Drawable {
      * Returns whether the view has glass now. Idempotent; runs before each draw.
      */
     private boolean applyAlpha(View v) {
+        if (plateless) {
+            peak = 255;
+            originalAlpha = 255;
+            return on.on();
+        }
         try {
             Drawable bg = v.getBackground();
             if (bg != background) {

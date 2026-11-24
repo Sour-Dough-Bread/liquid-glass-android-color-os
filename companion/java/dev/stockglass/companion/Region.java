@@ -5,6 +5,7 @@ import android.graphics.Paint;
 import android.graphics.PorterDuff;
 import android.graphics.PorterDuffXfermode;
 import android.graphics.Rect;
+import android.graphics.RectF;
 import android.graphics.Xfermode;
 import android.graphics.drawable.Drawable;
 import android.util.ArraySet;
@@ -650,14 +651,14 @@ final class Region {
                 for (Owner o : all) {
                     Region r = o.region;
                     if (r.root != vri || r.bbd == null || !r.recorded) continue;
-                    Rect rect = r.aggregatorRect();
+                    Object rect = r.aggregatorRect();
                     synchronized (r.lastReported) {
-                        if (rect.equals(r.lastReported)) continue;
-                        rect.set(r.lastReported);
+                        if (sameRect(rect, r.lastReported)) continue;
+                        setRect(rect, r.lastReported);
                     }
                     ++fixed;
                     if (r.visible && r.alpha > 0) ++shown; // in what SurfaceFlinger has
-                    if (rect.isEmpty()) ++lost;
+                    if (emptyRect(rect)) ++lost;
                 }
                 // An empty frame of moves: the aggregator sends its regions with the next frame.
                 if (shown > 0) queue.put(0, new ArraySet<Runnable>());
@@ -756,12 +757,29 @@ final class Region {
     }
 
     /** The rect the aggregator sends for this region (window coordinates), as it has applied hwui's moves. */
-    private Rect aggregatorRect() throws Exception {
+    private Object aggregatorRect() throws Exception {
         if (rectField == null) {
             rectField = bbd.getClass().getDeclaredField("mRect");
             rectField.setAccessible(true);
         }
-        return (Rect) rectField.get(bbd);
+        return rectField.get(bbd);
+    }
+
+    // mRect is a Rect in AOSP and a RectF in ColorOS 17's framework.
+    private static boolean sameRect(Object a, Rect b) {
+        if (a instanceof Rect) return a.equals(b);
+        RectF f = (RectF) a;
+        return Math.round(f.left) == b.left && Math.round(f.top) == b.top
+                && Math.round(f.right) == b.right && Math.round(f.bottom) == b.bottom;
+    }
+
+    private static void setRect(Object a, Rect b) {
+        if (a instanceof Rect) ((Rect) a).set(b);
+        else ((RectF) a).set(b);
+    }
+
+    private static boolean emptyRect(Object a) {
+        return a instanceof Rect ? ((Rect) a).isEmpty() : ((RectF) a).isEmpty();
     }
 
     /** Debug: the aggregator's rect, and hwui's last word on the node if they differ. */

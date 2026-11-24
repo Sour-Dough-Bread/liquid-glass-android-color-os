@@ -104,7 +104,14 @@ final class LauncherWidgets {
             }
             dispatchDraw = Class.forName(CELL, false, cl).getDeclaredMethod("dispatchDraw", Canvas.class);
             Class<?> base = Class.forName(BASE, false, cl);
-            enforced = field(base, "mIsCornerRadiusEnforced");
+            try {
+                enforced = field(base, "mIsCornerRadiusEnforced");
+            } catch (NoSuchFieldException e) {
+                // ColorOS 17's OplusLauncher has no flag: its outline provider
+                // enforces whenever the rectangle is set and the radius > 0,
+                // and isEnforced() asks the same.
+                enforced = null;
+            }
             enforcedRect = field(base, "mEnforcedRectangle");
             enforcedRadius = field(base, "mEnforcedCornerRadius");
             try {
@@ -405,6 +412,13 @@ final class LauncherWidgets {
         return info == null ? "a widget" : info.provider.flattenToShortString();
     }
 
+    /** Whether the host clips the widget to its enforced rounded rectangle. */
+    private static boolean isEnforced(View h) throws IllegalAccessException {
+        if (enforced != null) return enforced.getBoolean(h);
+        Rect r = (Rect) enforcedRect.get(h);
+        return r != null && !r.isEmpty() && enforcedRadius.getFloat(h) > 0f;
+    }
+
     private static Field field(Class<?> c, String name) throws NoSuchFieldException {
         Field f = c.getDeclaredField(name);
         f.setAccessible(true);
@@ -465,6 +479,17 @@ final class LauncherWidgets {
             View bg = !lastOnWorkspace || !canvas.isHardwareAccelerated() ? null
                     : bar ? (pills.isEmpty() ? null : pills.get(0)) : findPlateView(h);
             Object p = plateOf(bg);
+            if (p == null && !bar && lastOnWorkspace && canvas.isHardwareAccelerated()) {
+                // A search bar placed on the workspace (Google's on ColorOS 17):
+                // no background view, its pill is an image as wide as the bar.
+                List<View> alt = searchPlates(h);
+                if (!alt.isEmpty()) {
+                    bar = true;
+                    pills = alt;
+                    bg = alt.get(0);
+                    p = plateOf(bg);
+                }
+            }
             if (p == null && lastOnWorkspace && Gate.debug()) {
                 StringBuilder t = new StringBuilder();
                 tree(h, 0, t);
@@ -515,7 +540,7 @@ final class LauncherWidgets {
             if (bar) {
                 rect.set(bounds);
                 r = pillRadius(bg, rect);
-            } else if (enforced.getBoolean(h)) {
+            } else if (isEnforced(h)) {
                 rect.set((Rect) enforcedRect.get(h));
                 r = enforcedRadius.getFloat(h);
             } else {

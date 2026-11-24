@@ -49,11 +49,18 @@ public final class Entry implements IXposedHookLoadPackage {
                 break;
             case "com.android.launcher3":
             case "com.google.android.apps.nexuslauncher":
+            // ColorOS 17's OplusLauncher: a Launcher3 fork under its own
+            // package name (com.android.launcher.Launcher).
+            case "com.android.launcher":
                 Drawer.init(p.classLoader);
+                OplusFrost.install(p.classLoader); // before folders: they defer to it
+                CouiGlass.install(p.classLoader);
                 LauncherFolders.install(p.classLoader);
-                LauncherIcons.install(p.classLoader);
+                if (!OplusIcons.install(p.classLoader)) LauncherIcons.install(p.classLoader);
                 LauncherWidgets.install(p.classLoader);
                 LauncherSearch.install(p.classLoader);
+                LauncherDock.install(p.classLoader);
+                LauncherCards.install(p.classLoader);
                 LauncherOverview.install(p.classLoader);
                 Gate.watch();
                 break;

@@ -104,6 +104,8 @@ Read at most every 500 ms, while a control draws.
 | `persist.sys.glass.app.toast` | 1 | 0 leaves toasts stock |
 | `persist.sys.glass.app.drawer` | 1 | 0 leaves the app drawer's themed icons stock |
 | `persist.sys.glass.app.search` | 1 | 0 leaves the drawer's and the dock's search boxes stock |
+| `persist.sys.glass.app.frost` | 1 | 0 leaves ColorOS 17's other launcher frost stock (cards, popups); folders and the drawer follow `app.folders` and `app.drawer` |
+| `persist.sys.glass.app.dock` | 1 | 0 leaves the dock without a glass slab (ColorOS 17's launcher, which draws none of its own on phones) |
 | `persist.sys.glass.app.volume` | 1 | 0 leaves AxionOS's volume panel stock (the stock volume dialog has blur of its own) |
 | `persist.sys.glass.app.dialogs` | 1 | 0 leaves SystemUI's dialogs stock: the Quick Settings popups (Internet, Bluetooth, Do Not Disturb, Cast, …) and their confirmations |
 | `persist.sys.glass.app.overview` | 1 | 0 leaves the buttons in Overview (Screenshot, Clear all, …) stock |

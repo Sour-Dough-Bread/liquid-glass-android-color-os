@@ -46,6 +46,7 @@ final class LauncherFolders {
         if (installed) return;
         installed = true;
         loader = cl;
+        if (installOplus(cl)) return;
         Method target;
         try {
             Class<?> pb = Class.forName(PB, false, cl);
@@ -86,6 +87,88 @@ final class LauncherFolders {
         });
         Gate.onChange(LauncherFolders::gateChanged);
         L.i("launcher folders hooked: PreviewBackground.drawBackground");
+    }
+
+    /**
+     * ColorOS 17's OplusLauncher. Its folder plate (small, 2x2 and the big 3x3
+     * folders alike) is a child view of the folder icon: FolderRoundImageView,
+     * an ImageView laid out at the plate's bounds by OplusPreviewBackground
+     * .setBackground, whose drawable is ColorOS's own frost (a
+     * BlurTransitionDrawable blurring in the launcher's process) clipped to a
+     * smooth rounded square of mRadius. OplusPreviewBackground.drawBackground
+     * draws the same plate straight into the icon only during the fall and
+     * convert animations, so the view is where the plate is.
+     *
+     * A before-hook on its onDraw puts this folder's region at the view's
+     * bounds with mRadius, then draws ColorOS's frost over it at app.fill of
+     * its strength (as every other surface keeps app.fill of its plate), and
+     * skips the original. With folder glass off the original runs untouched.
+     */
+    private static boolean installOplus(ClassLoader cl) {
+        final Class<?> view;
+        final Field radius;
+        final Method onDraw;
+        try {
+            view = Class.forName("com.android.launcher3.folder.FolderRoundImageView", false, cl);
+            onDraw = view.getDeclaredMethod("onDraw", Canvas.class);
+            radius = field(view, "mRadius");
+        } catch (Throwable t) {
+            return false; // not OplusLauncher
+        }
+        XposedBridge.hookMethod(onDraw, new XC_MethodHook() {
+            @Override
+            protected void beforeHookedMethod(MethodHookParam param) {
+                try {
+                    Region.reap();
+                    if (drawOplus((android.widget.ImageView) param.thisObject, (Canvas) param.args[0],
+                            radius.getFloat(param.thisObject))) {
+                        param.setResult(null);
+                    }
+                } catch (Throwable e) {
+                    L.once("folder-oplus", "folder hook failed; folders stay stock", e);
+                }
+            }
+        });
+        Gate.onChange(LauncherFolders::gateChanged);
+        L.i("launcher folders hooked: FolderRoundImageView.onDraw (OplusLauncher)");
+        return true;
+    }
+
+    /** Draws the plate as glass; false leaves it to the original onDraw. */
+    private static boolean drawOplus(android.widget.ImageView v, Canvas canvas, float r) {
+        Folder f = folders.get(v);
+        if (f == null) {
+            f = new Folder();
+            f.region.ownedBy(v);
+            f.region.fadeWith(Drawer.INSTANCE);
+            f.host = new WeakReference<>(v);
+            folders.put(v, f);
+        }
+        android.graphics.drawable.Drawable d = v.getDrawable();
+        if (OplusFrost.handles(d)) { // its own draw is hooked there
+            f.region.hide();
+            return false;
+        }
+        int w = v.getWidth(), h = v.getHeight();
+        if (!Gate.folders() || d == null || w <= 0 || h <= 0 || !canvas.isHardwareAccelerated()) {
+            f.region.hide();
+            return false;
+        }
+        float corner = Math.max(0f, Math.min(r, Math.min(w, h) / 2f));
+        f.region.draw(v, canvas, 0, 0, w, h, corner, corner, corner, corner,
+                Gate.radius(), Gate.punch(true));
+        int keep = Math.round(255 * Gate.fill());
+        if (keep > 0) {
+            d.setVisible(true, false);
+            d.setBounds(0, 0, w, h);
+            int save = canvas.saveLayerAlpha(0, 0, w, h, keep);
+            android.graphics.Path clip = new android.graphics.Path();
+            clip.addRoundRect(0, 0, w, h, corner, corner, android.graphics.Path.Direction.CW);
+            canvas.clipPath(clip);
+            d.draw(canvas);
+            canvas.restoreToCount(save);
+        }
+        return true;
     }
 
     /**

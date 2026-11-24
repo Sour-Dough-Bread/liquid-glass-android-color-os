@@ -1,0 +1,93 @@
+  _  __                    _ ____  _   _ 
+ | |/ /___ _ __ _ __   ___| / ___|| | | |
+ | ' // _ \ '__| '_ \ / _ \ \___ \| | | |
+ | . \  __/ |  | | | |  __/ |___) | |_| |
+ |_|\_\___|_|  |_| |_|\___|_|____/ \___/ 
+
+- Module size: 10.29 MB
+- Installing to /data/adb/modules_update/stockglass
+- Extracting module files
+- Running module installer
+- Current boot slot: _b
+- Device is system-as-root
+Archive:  /data/user/0/me.weishu.kernelsu/cache/module-5894874598723909679.zip
+  inflating: module.prop
+***************
+ Stock Glass 
+ by capthndsme 
+***************
+*********************
+ Powered by KernelSU 
+*********************
+Archive:  /data/user/0/me.weishu.kernelsu/cache/module-5894874598723909679.zip
+  inflating: customize.sh
+- Extracting module files
+Archive:  /data/user/0/me.weishu.kernelsu/cache/module-5894874598723909679.zip
+   creating: webroot/
+  inflating: webroot/index.html
+  inflating: live.sh
+  inflating: meta.sh
+  inflating: action.sh
+  inflating: post-fs-data.sh
+  inflating: module.prop
+  inflating: post-mount.sh
+  inflating: glassctl
+  inflating: customize.sh
+  inflating: service.sh
+  inflating: build-overlay.sh
+   creating: bin/
+   creating: bin/arm64-v8a/
+  inflating: bin/arm64-v8a/glasscheck
+  inflating: bin/arm64-v8a/patchelf
+   creating: bin/x86_64/
+  inflating: bin/x86_64/glasscheck
+  inflating: bin/x86_64/patchelf
+   creating: libs/
+   creating: libs/arm64-v8a/
+  inflating: libs/arm64-v8a/libglassengine.so
+   creating: libs/x86_64/
+  inflating: libs/x86_64/libglassengine.so
+  inflating: glass-theme.sh
+  inflating: uninstall.sh
+  inflating: sepolicy.rule
+  inflating: README.md
+
+  Stock Glass
+  An optional Liquid Glass mode for Android's blur
+
+- Architecture: arm64 -> arm64-v8a
+- Checking this ROM's Skia...
+  Must use __system_property_read_callback() to read
+  /system/bin/surfaceflinger
+    build id 13984b9437415255cabc9383121dfcf4
+    20583 function symbols recovered from MiniDebugInfo
+    hook     drawBlurRegion(radius, scale, alpha) at 0x285d1c, 2416 bytes
+    scale    not found: no constant in drawBlurRegion (120 instructions, 1 fdiv) nor in the 13 functions it calls; 4 assumed
+    lighter backdrop blur: available
+    branch protection: BTI-built, and this CPU enforces it
+    note     no findUniform and findChild: the shader's own declarations lay out its uniforms, checked against uniformSize()
+    note     getTotalMatrix: engine's own definition
+    note     setShader: engine's own definition
+    note     invertNonIdentity: engine's own inverse
+    note     no SkImage_Base::makeSubset(SkRecorder*): snapshotCopy=bounds unavailable
+    MISSING  SkString::SkString(const char*): not in this build's symbols (inlined away, or no symbols)
+    MISSING  SkString::~SkString: not in this build's symbols (inlined away, or no symbols)
+    MISSING  SkRuntimeEffect::uniformSize: not in this build's symbols (inlined away, or no symbols)
+    MISSING  SkImage::makeShader: not in this build's symbols (inlined away, or no symbols)
+    MISSING  SkData::MakeZeroInitialized: not in this build's symbols (inlined away, or no symbols)
+    MISSING  SkRuntimeEffect::makeShader: not in this build's symbols (inlined away, or no symbols)
+    MISSING  SkMatrix::postConcat: not in this build's symbols (inlined away, or no symbols)
+    MISSING  SkPaint::reset: not in this build's symbols (inlined away, or no symbols)
+    MISSING  SkPaint::~SkPaint: not in this build's symbols (inlined away, or no symbols)
+    MISSING  SkCanvas::drawRect: not in this build's symbols (inlined away, or no symbols)
+  FAIL  this build's Skia is not one the engine can drive.
+        Nothing was installed; the device is untouched.
+
+! This ROM's SurfaceFlinger does not expose what the engine needs.
+! Nothing has been installed and the device is untouched.
+! To ask for support, open an issue on
+!   github.com/capthndsme/liquid-glass-android
+! with this screen or /data/local/tmp/stockglass-check.txt
+! aborting
+Error: Failed to install module script
+- Error: Failed to install module script

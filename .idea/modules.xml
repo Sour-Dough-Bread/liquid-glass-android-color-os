@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="ProjectModuleManager">
+    <modules>
+      <module fileurl="file://$PROJECT_DIR$/companion/companion.iml" filepath="$PROJECT_DIR$/companion/companion.iml" />
+      <module fileurl="file://$PROJECT_DIR$/auto/media/devloader/devloader.iml" filepath="$PROJECT_DIR$/auto/media/devloader/devloader.iml" />
+      <module fileurl="file://$PROJECT_DIR$/auto/maps/devloader/devloader2.iml" filepath="$PROJECT_DIR$/auto/maps/devloader/devloader2.iml" />
+      <module fileurl="file://$PROJECT_DIR$/auto/lists/devloader/devloader3.iml" filepath="$PROJECT_DIR$/auto/lists/devloader/devloader3.iml" />
+      <module fileurl="file://$PROJECT_DIR$/companion/devloader/devloader4.iml" filepath="$PROJECT_DIR$/companion/devloader/devloader4.iml" />
+      <module fileurl="file://$PROJECT_DIR$/harness/harness.iml" filepath="$PROJECT_DIR$/harness/harness.iml" />
+      <module fileurl="file://$PROJECT_DIR$/captures/coloros17/jadx/jadx.iml" filepath="$PROJECT_DIR$/captures/coloros17/jadx/jadx.iml" />
+      <module fileurl="file://$PROJECT_DIR$/captures/coloros17/jadx/launcher/launcher.iml" filepath="$PROJECT_DIR$/captures/coloros17/jadx/launcher/launcher.iml" />
+      <module fileurl="file://$PROJECT_DIR$/.idea/liquid-glass-android-color-os.iml" filepath="$PROJECT_DIR$/.idea/liquid-glass-android-color-os.iml" />
+      <module fileurl="file://$PROJECT_DIR$/auto/lists/lists.iml" filepath="$PROJECT_DIR$/auto/lists/lists.iml" />
+      <module fileurl="file://$PROJECT_DIR$/auto/maps/maps.iml" filepath="$PROJECT_DIR$/auto/maps/maps.iml" />
+      <module fileurl="file://$PROJECT_DIR$/auto/media/media.iml" filepath="$PROJECT_DIR$/auto/media/media.iml" />
+      <module fileurl="file://$PROJECT_DIR$/auto/media/testmedia/testmedia.iml" filepath="$PROJECT_DIR$/auto/media/testmedia/testmedia.iml" />
+    </modules>
+  </component>
+</project>

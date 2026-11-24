@@ -100,7 +100,7 @@ final class Gate {
     private static int debuggable = -1;
     private static String engineSeen;
     private static boolean glass, qs, folders, icons, widgets, shade, headsUp, sliders, toolbar, screenshot,
-            toast, drawer, search, clock, clockPlain, volume, dialogs, overview, appDialogs, debug, rtFollow = true;
+            toast, drawer, search, dock, frost, clock, clockPlain, volume, dialogs, overview, appDialogs, debug, rtFollow = true;
     private static String punch = "", scrimColor = "stock";
     private static String debugMode = "0";
     private static float fill = 0.3f, accent = 0.75f, tint = 0.6f, tileColor = 0.5f, contrast = 0.65f,
@@ -204,6 +204,18 @@ final class Gate {
     static boolean search() {
         refresh();
         return glass && search;
+    }
+
+    /** ColorOS's other launcher frost (cards, popups) as glass (OplusFrost). */
+    static boolean frost() {
+        refresh();
+        return glass && frost;
+    }
+
+    /** A glass slab behind the dock's icons where the launcher draws none (ColorOS). */
+    static boolean dock() {
+        refresh();
+        return glass && dock;
     }
 
     static boolean volume() {
@@ -346,6 +358,8 @@ final class Gate {
         toast = !prop("app.toast", "1").equals("0");
         drawer = !prop("app.drawer", "1").equals("0");
         search = !prop("app.search", "1").equals("0");
+        dock = !prop("app.dock", "1").equals("0");
+        frost = !prop("app.frost", "1").equals("0");
         volume = !prop("app.volume", "1").equals("0");
         dialogs = !prop("app.dialogs", "1").equals("0");
         overview = !prop("app.overview", "1").equals("0");

@@ -13,6 +13,6 @@
             android:value="Liquid Glass on Quick Settings, the launcher, the text toolbar, the screenshot bar and the lockscreen clock. Draws nothing unless the Stock Glass module is in glass mode." />
         <meta-data android:name="xposedminversion" android:value="82" />
         <meta-data android:name="xposedscope"
-            android:value="android;com.android.systemui;com.android.launcher3;com.google.android.apps.nexuslauncher" />
+            android:value="android;com.android.systemui;com.android.launcher3;com.google.android.apps.nexuslauncher;com.android.launcher" />
     </application>
 </manifest>
