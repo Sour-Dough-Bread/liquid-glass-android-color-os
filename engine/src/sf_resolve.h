@@ -82,8 +82,31 @@ struct Resolved {
     std::string abi_detail;
 };
 
+// The libraries a SurfaceFlinger may take Skia from instead of linking it in.
+// AOSP links Skia statically; ColorOS 17 (OnePlus 12, CPH2573_17.0.0.100)
+// imports every out-of-line Skia function from libhwui.so, the framework's
+// copy, and keeps only RenderEngine and Skia's header-inline code. A library
+// is read only when the binary names it in DT_NEEDED, so it is the very file
+// the process loaded, and only for Skia: the hook targets and the rest of
+// RenderEngine always come from the binary itself.
+inline constexpr const char* kSkiaLibraries[] = {"libhwui.so"};
+// Where the system linker namespace finds them on a device (64-bit only, like
+// the engine).
+inline constexpr const char* kSystemLibraryDirs[] = {"/system/lib64", "/system_ext/lib64"};
+
+// Adds every kSkiaLibraries entry the binary loads (DT_NEEDED) to `syms`, from
+// the first directory in `dirs` that has it. Returns one line per library for
+// reports: what was added, or why not. Call it after loadFromFile and before
+// resolve().
+std::vector<std::string> addSkiaLibraries(SymbolResolver* syms,
+                                          const std::vector<std::string>& dirs);
+std::vector<std::string> systemLibraryDirs();
+
 struct Resolution {
     Resolved entry[kCount];
+    // The files the entries' addresses belong to, by Symbol::module: [0] the
+    // binary, then the libraries (SymbolResolver::modules, or the cache's).
+    std::vector<std::string> modules;
     int shape = -1;                // index into kHookShapes once judged, else -1
     bool ok = false;               // judge(): the engine can install
     size_t symbol_count = 0;       // how many function symbols the tables held
@@ -108,10 +131,15 @@ struct Resolution {
 // file on disk. Return kX8 when the question does not apply (x86-64).
 using AbiProbe = ResultRegister (*)(const Symbol& sym, std::string* detail, void* user);
 
-// The probe for a binary on disk; `user` is the path as a const char*. Asks
-// only where the question applies (an AArch64 file, an address in its code),
-// the way glasscheck always has, and answers kX8 otherwise.
+// The probe for files on disk; `user` is a const std::vector<std::string>*
+// holding each module's path (SymbolResolver::modules, Resolution::modules),
+// and each symbol is asked of its own module's file. Asks only where the
+// question applies (an AArch64 file, an address in its code), the way
+// glasscheck always has, and answers kX8 otherwise.
 ResultRegister fileAbiProbe(const Symbol& sym, std::string* detail, void* user);
+
+// The module's file name for reports: "libhwui.so", or "" for the binary.
+std::string moduleName(const Resolution& r, uint8_t module);
 
 // Fills `out` from a symbol table, runs probeAbi() and judges it. `abi` may be
 // null (no check: host tools that only report).

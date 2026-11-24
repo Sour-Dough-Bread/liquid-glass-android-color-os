@@ -444,17 +444,41 @@ bool install() {
     // A17 builds measured it did for MakeForShader(SkString): called the
     // standard way it crashed SurfaceFlinger on the first glass frame. Asked of
     // the code in memory; one that fails is treated as absent (sf_resolve.h).
-    // Calls the scan follows stay inside the binary's own code segments.
+    // Calls the scan follows stay inside the code segments of the function's
+    // own file: the binary, or the library it takes Skia from (sf_resolve.h,
+    // kSkiaLibraries), each at its own load bias.
     struct ProbeContext {
-        uintptr_t bias;
-        std::vector<glass::ExecSegment> segs;
+        std::vector<uintptr_t> biases;                      // by Symbol::module
+        std::vector<std::vector<glass::ExecSegment>> segs;  // by Symbol::module
+        std::string missing;                                // a module not mapped here
     };
     auto probe = [](const glass::Symbol& s, std::string* detail,
                     void* user) -> glass::ResultRegister {
         const auto* c = static_cast<const ProbeContext*>(user);
-        return glass::resultRegisterInProcess(s.value, c->bias, &c->segs, detail);
+        if (s.module >= c->biases.size() || c->segs[s.module].empty()) {
+            if (detail != nullptr) *detail = "its file is not mapped in this process";
+            return glass::ResultRegister::kUndetermined;
+        }
+        return glass::resultRegisterInProcess(s.value, c->biases[s.module], &c->segs[s.module],
+                                              detail);
     };
-    ProbeContext probe_ctx{bias, glass::readExecSegments(exe)};
+    ProbeContext probe_ctx;
+    const std::vector<glass::ExecSegment> exe_segs = glass::readExecSegments(exe);
+    // Module 0 is the binary; the rest are found in /proc/self/maps by path.
+    auto mapModules = [&](const std::vector<std::string>& paths) {
+        probe_ctx.biases.assign(1, bias);
+        probe_ctx.segs.assign(1, exe_segs);
+        probe_ctx.missing.clear();
+        for (size_t m = 1; m < paths.size(); ++m) {
+            bool mapped = false;
+            const uintptr_t b = glass::moduleLoadBias(paths[m].c_str(), &mapped);
+            probe_ctx.biases.push_back(mapped ? b : 0);
+            probe_ctx.segs.push_back(mapped ? glass::readExecSegments(paths[m])
+                                            : std::vector<glass::ExecSegment>{});
+            if (!mapped && probe_ctx.missing.empty()) probe_ctx.missing = paths[m];
+        }
+    };
+    mapModules({exe});
     void* const probe_bias = &probe_ctx;
 
     // The install-time cache first (sf_cache.h): glasscheck resolved this very
@@ -467,6 +491,7 @@ bool install() {
     const std::string cache = glass::sf::cachePathFor(enginePath());
     bool from_cache = glass::sf::readCacheForProcess(cache, exe, bias, &res, &why);
     if (from_cache) {
+        mapModules(res.modules);
         glass::sf::probeAbi(&res, probe, probe_bias);
         glass::sf::judge(&res);
         if (!res.ok) {
@@ -483,7 +508,24 @@ bool install() {
             LOGE("symbol load failed: %s", resolver.error().c_str());
             return false;
         }
+        for (const std::string& line :
+             glass::sf::addSkiaLibraries(&resolver, glass::sf::systemLibraryDirs())) {
+            LOGI("%s", line.c_str());
+        }
+        mapModules(resolver.modules());
         glass::sf::resolve(resolver, probe, probe_bias, &res);
+    }
+    // Every address is relative to its own file's load bias. A library the
+    // resolution relies on but that this process has not mapped would leave
+    // nothing to call; refuse rather than guess where it is.
+    mapModules(res.modules);
+    if (res.ok && !probe_ctx.missing.empty()) {
+        LOGE("%s is not mapped in this process; refusing to install", probe_ctx.missing.c_str());
+        return false;
+    }
+    for (size_t m = 1; m < res.modules.size(); ++m) {
+        LOGI("module %zu: %s at 0x%llx", m, res.modules[m].c_str(),
+             static_cast<unsigned long long>(probe_ctx.biases[m]));
     }
     for (size_t i = 0; i < glass::sf::kEntryPointCount; ++i) {
         if (res.entry[i].abi_rejected) {
@@ -539,8 +581,8 @@ bool install() {
     // the guard on its first page instead of faulting at the first draw.
     int unpadded = 0;
     auto addr = [&](size_t i) -> void* {
-        if (!g_syms[i].valid()) return nullptr;
-        void* fn = reinterpret_cast<void*>(bias + g_syms[i].value);
+        if (!g_syms[i].valid() || g_syms[i].module >= probe_ctx.biases.size()) return nullptr;
+        void* fn = reinterpret_cast<void*>(probe_ctx.biases[g_syms[i].module] + g_syms[i].value);
         if (bti_guarded && !landsOnPad(fn)) {
             LOGW("%s starts without a landing pad; its page loses the guard",
                  glass::sf::kEntryPoints[i].label);
@@ -607,8 +649,10 @@ bool install() {
     // How Android's blur maps onto blurRect on this build (blur_scale.h): 4 on
     // AOSP, 4.545 on Lunaris 3.13, per axis on Infinity-X 4.x. Read out of
     // drawBlurRegion's own code and the functions it calls, so before any of
-    // them is hooked. Not found means 4, as before.
-    const glass::BlurScale blur_scale = glass::probeBlurScaleInProcess(exe, bias, draw);
+    // them is hooked. Per axis, too, where drawBlurRegion asks the filter for
+    // the image's size (ColorOS 17). Otherwise not found means 4, as before.
+    glass::BlurScale blur_scale = glass::probeBlurScaleInProcess(exe, bias, draw);
+    glass::applyFilterSizedImage(&blur_scale, g_syms[glass::sf::kBlurredImageSize].valid());
     glass::draw::setBlurScale(blur_scale.inverse, blur_scale.per_axis);
     LOGI("blur scale: %s", blur_scale.how.c_str());
 

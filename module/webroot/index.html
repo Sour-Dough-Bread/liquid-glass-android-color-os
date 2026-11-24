@@ -76,6 +76,10 @@
   }
   .banner.show { display: block; }
   .banner code { font-size: 13px; }
+  .banner button {
+    display: block; margin-top: 10px; padding: 8px 14px; border: 0; border-radius: 10px;
+    background: var(--accent); color: var(--accent-text); font: inherit; font-weight: 600;
+  }
 
   /* mode */
   .seg { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; background: var(--bg);
@@ -453,7 +457,26 @@ function render() {
   const eng = state.engine;
   chip.className = 'chip ' + (eng === 'loaded' ? 'ok' : eng === 'disabled' ? 'bad' : 'warn');
   chip.textContent = eng === 'loaded' ? 'engine running' : eng === 'disabled' ? 'disabled' : 'not loaded';
-  if (eng === 'disabled') {
+  clearTimeout(render.confirmTimer);
+  if (state.confirm) {
+    // watchdog.sh: glass was just switched on and reverts unless kept. A page
+    // the glass left readable is the answer; the countdown refreshes itself.
+    banner('Liquid Glass reverts to Android\'s blur in <b>' + escapeHtml(state.confirm) +
+           ' s</b> unless you keep it. <button id="keep-glass">Keep Liquid Glass</button>');
+    document.getElementById('keep-glass').addEventListener('click', async () => {
+      await exec(`${CTL} keep`);
+      toast('Liquid Glass kept');
+      await load();
+    });
+    render.confirmTimer = setTimeout(load, 1000);
+  } else if (eng === 'disabled' && state.disabledWhy) {
+    banner('The watchdog turned the module off because ' + escapeHtml(state.disabledWhy) +
+           ', and rebooted without it. ' +
+           (state.mount === 'self'
+             ? 'Remove <code>/data/adb/glass/disabled</code> and reboot, or install it again, to try again; '
+             : 'Install it again from the manager (that also clears this) and reboot to try again; ') +
+           '<code>/data/adb/glass/watchdog.log</code> says what happened.');
+  } else if (eng === 'disabled') {
     banner('The module turned itself off after a boot that did not complete. ' +
            (state.mount === 'self'
              ? 'Remove <code>/data/adb/glass/disabled</code> and reboot, or install it again, to try again; '
@@ -478,6 +501,12 @@ function render() {
     banner('SurfaceFlinger restarted at ' + at.toLocaleTimeString() + ' while drawing Liquid ' +
            'Glass, so the engine switched back to Android\'s blur rather than crash again. ' +
            'The crash is in <code>/data/tombstones</code>. Turning glass on again clears this.');
+  } else if (eng === 'loaded' && state.reverted) {
+    const sp = state.reverted.indexOf(' ');
+    const at = new Date(Number(state.reverted.slice(0, sp)) * 1000);
+    banner('At ' + at.toLocaleTimeString() + ' the watchdog switched back to Android\'s blur: ' +
+           escapeHtml(state.reverted.slice(sp + 1)) + '. <code>/data/adb/glass/watchdog.log</code> ' +
+           'has the details. Turning glass on again clears this.');
   } else if (eng === 'loaded' && state.engineStatus === 'no-glass') {
     banner('The engine is running, but the glass shader did not validate on this ROM, so ' +
            'Android\'s blur is drawn instead. <code>logcat -s StockGlass</code> says why.');

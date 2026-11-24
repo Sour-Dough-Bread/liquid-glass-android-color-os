@@ -4386,3 +4386,54 @@ uniform layout have now drawn on a phone. Not covered: the engine's own
 blur scale line, the material shape, the card-region hook's effect, BTI,
 Graphite, and the F1, which still runs v0.4.20. Nothing was measured; the
 phone's owner was using it.
+
+## ColorOS 17: Skia in libhwui.so, a filter-sized blur, and a blur cache (2026-11-23 and 24)
+
+A ColorOS 17 phone (arm64, BTI-enforcing `surfaceflinger`) refused the
+v0.4.21 install: glasscheck found the hook target (`drawBlurRegion(radius,
+scale, alpha)`), `generateTemporaryImage` and `MakeForShader`, and none of
+the ten core Skia entry points. They were not drifted; they were not in the
+file. ColorOS links Skia into `surfaceflinger` from `/system/lib64/libhwui.so`
+(imports versioned `@LIBHWUI_PLATFORM`), while RenderEngine stays in the
+binary. The resolver now reads the libraries a binary names in `DT_NEEDED`
+and lists in `kSkiaLibraries` (libhwui.so alone), takes only their exported
+functions, lets the binary's own symbols win, and never takes the hook
+target or a RenderEngine entry from a library. The engine adds the
+library's load bias from `/proc/self/maps`; the symbol cache (format 2)
+records each library's path and build ID. With that the installer passed,
+naming libhwui.so for the Skia entries, and `glassctl glass` drew.
+
+Two things then drew wrongly, both seen in the owner's screenshots:
+
+- **Recents' wallpaper came out streaked.** ColorOS's `drawBlurRegion`
+  loads no scale constant. It asks the filter for the blurred image's size
+  (virtual `getBlurredImageSizeForShader`, vtable +0x28) and an out-of-line
+  `getShaderTransform` divides blurRect by it per axis. Its
+  `KawaseBlurDualFilterV2` makes images of different sizes at different
+  radii, so the probe's fallback of 4 mapped the tone's regenerated blur
+  wrongly. The size function's symbol now selects the per-axis mapping
+  (`applyFilterSizedImage`). Recents was right after the fix.
+- **Panes showed a sharp copy of the wallpaper.** ColorOS keeps blurs across
+  frames in `BlurImageCache` (`store`, `findAndTouchEntry`). The engine's
+  lazy blur hands back a snapshot, which the cache kept. Both symbols are
+  now in the blur-cache marker, so the engine refuses its lazy blur here;
+  `deferred/frame` read 0.00 afterwards.
+
+What remains on the dialog ("Start recording?") is the clear variant's lens
+over a large pane: a frosted A/B of the same dialog did not double.
+
+Notes for the next ColorOS session:
+
+- `ro.surface_flinger.supports_background_blur` is unset, yet blur works
+  (`KawaseDualFilterV2`, `backgroundBlurRadius=180`). The installer's
+  "Blur OFF" warning is wrong on this ROM.
+- `logcat -s StockGlass` shows nothing; `logcat -d -b all
+  --pid=$(pidof surfaceflinger) | grep StockGlass` does.
+- KernelSU 3 mounts nothing without a metamodule (meta-overlayfs);
+  `glassctl live` loads the engine for one boot without one.
+- Much of ColorOS's visible glass (control centre tiles, folders, menus) is
+  its own material blur (`OplusBlurParams`, `BlurBlendFilter`, `BgCache`),
+  which does not pass through `drawBlurRegion`. The engine does not see it.
+
+The watchdog was exercised on the same phone: a live switch to glass asked
+for confirmation, Volume Up kept it, and the health watch stayed quiet.

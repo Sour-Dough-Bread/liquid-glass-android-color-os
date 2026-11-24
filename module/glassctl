@@ -4,7 +4,13 @@
 # inside SurfaceFlinger picks changes up within half a second, no reboot.
 #
 #   glassctl                     status (same as `glassctl status`)
-#   glassctl glass | on          draw Liquid Glass over Android's blur regions
+#   glassctl glass | on          draw Liquid Glass over Android's blur regions.
+#                                From Android's blur it reverts by itself after
+#                                20 s unless kept (Volume Up, or glassctl keep):
+#                                a screen it broke cannot answer. --keep skips
+#                                that; persist.sys.glass.confirm sets the time
+#                                (0: never ask)
+#   glassctl keep                keep the glass just switched on
 #   glassctl stock | off         Android's own blur, untouched (the default)
 #   glassctl toggle              flip between the two
 #   glassctl preset <name>       pick a preset; clears per-setting tuning
@@ -241,6 +247,26 @@ retry_hint() {
 engine_status() { getprop sys.glass.engine; }
 tripped() { getprop sys.glass.tripped; }
 
+# The watchdog (watchdog.sh): seconds left to confirm glass that was just
+# switched on, and why it last switched glass off by itself ("<time> <why>").
+confirm_pending() { [ -f "$MODDIR/watchdog.sh" ] && sh "$MODDIR/watchdog.sh" pending; }
+reverted() { getprop sys.glass.reverted; }
+confirm_secs() {
+  s=$(getprop $P.confirm)
+  case "$s" in ''|*[!0-9]*) s=20 ;; esac
+  echo "$s"
+}
+# Started in its own session with nothing attached, so the WebUI's call (and a
+# root shell) returns at once and the watchdog outlives it.
+watchdog() {
+  [ -f "$MODDIR/watchdog.sh" ] || return 0
+  if command -v setsid >/dev/null 2>&1; then
+    setsid sh "$MODDIR/watchdog.sh" "$@" </dev/null >/dev/null 2>&1 &
+  else
+    sh "$MODDIR/watchdog.sh" "$@" </dev/null >/dev/null 2>&1 &
+  fi
+}
+
 # Why Android itself draws no window blur right now, or nothing when it does.
 # Stock Glass only restyles the blurs Android draws, so with blur off there is
 # nothing for it to act on, which looks exactly like a module that does not
@@ -314,7 +340,11 @@ status() {
               if grep -q /dev/stockglass/ "/proc/$(pidof surfaceflinger)/maps" 2>/dev/null; then
                 echo "         (live mode: until the next reboot; glassctl unlive takes it out)"
               fi ;;
-    disabled) echo "Engine:  DISABLED after a boot that did not complete"
+    disabled) w=$(head -n 1 "$STATE/disabled" 2>/dev/null)
+              case "$w" in
+                watchdog:*) echo "Engine:  DISABLED by the watchdog: ${w#watchdog: }" ;;
+                *)          echo "Engine:  DISABLED after a boot that did not complete" ;;
+              esac
               echo "         $(retry_hint)" ;;
     no-metamodule)
               echo "Engine:  not loaded — KernelSU 3+ only mounts modules through a"
@@ -346,6 +376,15 @@ status() {
   if [ -n "$b" ]; then
     echo "Blur:    OFF in Android: $b."
     echo "         Stock Glass restyles Android's blur, so nothing changes until it is on."
+  fi
+  c=$(confirm_pending)
+  if [ -n "$c" ]; then
+    echo "Confirm: Liquid Glass reverts in $c s unless kept: Volume Up, or glassctl keep"
+  fi
+  r=$(reverted)
+  if [ -n "$r" ]; then
+    echo "Reverted: $(date -d "@${r%% *}" +%H:%M:%S 2>/dev/null || echo "${r%% *}"): ${r#* }"
+    echo "         (the watchdog switched to Android's blur; /data/adb/glass/watchdog.log)"
   fi
   t=$(tripped)
   if [ -n "$t" ]; then
@@ -386,8 +425,13 @@ json() {
   mw=$(printf '%s' "$MOUNT_WHY" | tr -d '"\\')
   mn=$(printf '%s' "$META_NAME" | tr -d '"\\')
   bo=$(blur_off_reason | tr -d '"\\')
-  printf '{"engine":"%s","engineStatus":"%s","mount":"%s","mountWhy":"%s","metaName":"%s","blurOff":"%s","tripped":"%s","regen":"%s","followTheme":%s,"app":{%s},"clockTint":"%s","tileTint":"%s","tileColor":"%s","scrim":"%s","scrimColor":"%s","live":"%s","liveWhy":"%s","state":%s}\n' \
-    "$(engine_state)" "$(engine_status)" "$ms" "$mw" "$mn" "$bo" "$(tripped)" "$(getprop sys.glass.regen)" "$ft" "$app" \
+  # The watchdog: seconds left to confirm, why it last reverted, and why it
+  # turned the module off ("" unless it did).
+  cf=$(confirm_pending)
+  rv=$(reverted | tr -d '"\\')
+  dw=$(head -n 1 "$STATE/disabled" 2>/dev/null | sed -n 's/^watchdog: //p' | tr -d '"\\')
+  printf '{"engine":"%s","engineStatus":"%s","mount":"%s","mountWhy":"%s","metaName":"%s","blurOff":"%s","tripped":"%s","confirm":"%s","reverted":"%s","disabledWhy":"%s","regen":"%s","followTheme":%s,"app":{%s},"clockTint":"%s","tileTint":"%s","tileColor":"%s","scrim":"%s","scrimColor":"%s","live":"%s","liveWhy":"%s","state":%s}\n' \
+    "$(engine_state)" "$(engine_status)" "$ms" "$mw" "$mn" "$bo" "$(tripped)" "$cf" "$rv" "$dw" "$(getprop sys.glass.regen)" "$ft" "$app" \
     "$(getprop $P.app.clocktint)" "$(getprop $P.app.tint)" "$(getprop $P.app.tilecolor)" \
     "$(getprop $P.app.scrim)" "$(getprop $P.app.scrimcolor)" \
     "$(getprop sys.glass.live)" "$(getprop sys.glass.live.why | tr -d '"\\')" "$st"
@@ -406,15 +450,34 @@ cmd="${1:-status}"
 case "$cmd" in
   status) status ;;
   glass|on)
+    was=$(mode)
     # Switching on again is the answer to a crash note, so it clears it.
     [ -n "$(tripped)" ] && setprop sys.glass.tripped ""
+    setprop sys.glass.reverted ""
     setprop $P.mode glass
     [ "$(getprop $P.bypass)" = "1" ] && setprop $P.bypass ""
     echo "Liquid Glass on ($(preset))"
+    # From Android's blur, glass stays only if someone says it works: a screen
+    # it broke cannot (watchdog.sh). --keep skips the question.
+    if [ "$was" != glass ] && [ "$1" != --keep ]; then
+      s=$(confirm_secs)
+      if [ "$s" -gt 0 ]; then
+        echo "Press Volume Up within $s s to keep it (or: glassctl keep);"
+        echo "otherwise Android's blur comes back by itself."
+        watchdog confirm "$s"
+      else
+        watchdog health 120
+      fi
+    fi
     ;;
   stock|off)
     setprop $P.mode stock
+    [ -f "$MODDIR/watchdog.sh" ] && sh "$MODDIR/watchdog.sh" cancel
     echo "Android's own blur"
+    ;;
+  keep)
+    [ -f "$MODDIR/watchdog.sh" ] || die "this copy of the module has no watchdog.sh"
+    sh "$MODDIR/watchdog.sh" keep
     ;;
   toggle)
     if [ "$(mode)" = glass ]; then sh "$0" stock; else sh "$0" glass; fi
@@ -536,6 +599,6 @@ case "$cmd" in
       *) die "usage: glassctl live [on|off|status|check] [--force]" ;;
     esac
     ;;
-  -h|--help|help) sed -n '2,61p' "$0" | sed 's/^# \{0,1\}//' ;;
+  -h|--help|help) sed -n '2,67p' "$0" | sed 's/^# \{0,1\}//' ;;
   *) die "unknown command '$cmd' (glassctl help)" ;;
 esac

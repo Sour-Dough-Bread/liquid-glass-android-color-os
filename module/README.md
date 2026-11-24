@@ -446,6 +446,34 @@ completes. `sys.glass.engine` says what the engine did at load: `hooked`, `glass
 (the shader validated), `no-glass` (it did not; Android's blur is drawn) or
 `not-hooked`.
 
+## If the screen is unusable: the watchdog
+
+A boot can complete into a screen nobody can use: glass drawn wrong, black or
+garbled, or a System UI that keeps dying. Neither guard above can see that, so
+`watchdog.sh` covers it, in three layers:
+
+1. **Keep it, or it reverts.** Switching glass on from Android's blur (the
+   Action button, the WebUI, `glassctl glass`) posts a notification. Unless
+   you press **Volume Up** within 20 seconds, tap **Keep Liquid Glass** in the
+   WebUI, or run `glassctl keep`, it switches back to Android's blur by
+   itself. A screen the glass broke cannot answer, so it reverts. The first
+   boot after installing or updating with glass already on asks the same
+   question, with 90 seconds from the end of the boot.
+2. **Restarts with glass on.** For three minutes after every boot, and for two
+   minutes after glass is kept, it watches SurfaceFlinger and System UI. Two
+   SurfaceFlinger restarts or three System UI restarts with glass on switch it
+   back to Android's blur. Switching the mode also switches off the
+   companion's surfaces, so this covers the companion too.
+3. **Restarts without glass.** If SurfaceFlinger keeps restarting even with
+   Android's blur (three times) while the engine is in it, the module turns
+   itself off (`/data/adb/glass/disabled`, as the boot guard does) and reboots
+   the phone without it.
+
+Whatever it did is in `glassctl status`, the WebUI and
+`/data/adb/glass/watchdog.log`. `persist.sys.glass.confirm` sets the time to
+answer, in seconds, and `0` stops the question. `glassctl glass --keep`
+switches glass on without asking.
+
 ## Logs
 
 ```sh

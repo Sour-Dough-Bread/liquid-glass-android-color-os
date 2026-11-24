@@ -506,7 +506,7 @@ libs/<abi>/       libglassengine.so
 `ksu.exec` stand-in that runs each command over `adb shell`, so the page can be
 iterated on against a real device's glassctl and engine.
 
-Three decisions worth keeping:
+Decisions worth keeping:
 
 1. **Injection is a `DT_NEEDED` entry on a copy**, mounted over the original.
    `LD_PRELOAD` is not available — surfaceflinger runs with `AT_SECURE=1`, so
@@ -523,6 +523,21 @@ Three decisions worth keeping:
    0.4.8). `customize.sh` first gives each live path a new file by rename, so
    the running copy stays intact until the reboot. See VERIFIED.md, "Updating
    over a running copy".
+5. **A usable screen is confirmed, not assumed** (`watchdog.sh`). The boot
+   guard catches a boot that never completes, and the engine's crash guard
+   catches SurfaceFlinger dying in its draw. Neither can see a boot that
+   completes into a screen nobody can use. So glass switched on from Android's
+   blur, and the first boot of a new engine with glass on, stays only if
+   someone confirms it: Volume Up (`getevent`), the WebUI's Keep, or
+   `glassctl keep`, within `persist.sys.glass.confirm` seconds (20; 90 on that
+   boot). A broken screen cannot answer, so silence reverts the mode, live.
+   For the first minutes after boot and after a confirm it also counts
+   restarts: SurfaceFlinger twice or System UI three times with glass on
+   reverts the mode. SurfaceFlinger three times with Android's blur, with
+   the engine mapped from the module's mount, writes `disabled` and reboots,
+   because only a reboot takes the engine out. Live mode's deliberate
+   restarts are not counted. The reboot calls Android's tools by path, because
+   module scripts run in busybox's standalone shell, where `svc` is runit's.
 
 ## Many SurfaceFlingers: one resolver, a cache, and hook shapes
 
@@ -592,6 +607,32 @@ adds an `SkPath` overload. Three pieces keep that manageable:
    marked `scan`, so the clever part runs where a mistake costs a declined
    install and can be tested on the host, and the engine only ever runs the
    cheap, strict check.
+
+4. **Skia from a library** (`kSkiaLibraries` in `sf_resolve.h`). AOSP links
+   Skia into surfaceflinger statically. ColorOS 17 (OnePlus 12,
+   CPH2573_17.0.0.100) does not: RenderEngine is still in the binary, but
+   every out-of-line Skia function is an import from `libhwui.so`
+   (`@LIBHWUI_PLATFORM`), and only Skia's header-inline code is left in
+   surfaceflinger. Its MiniDebugInfo then held the hook and the generate
+   filters but none of the ten core Skia entries, with no drift either: they
+   were not renamed, they were somewhere else. `SymbolResolver::addLibrary`
+   adds a library's exported `.dynsym` as module 1, and
+   `sf::addSkiaLibraries` calls it for each library in that table that the
+   binary names in `DT_NEEDED`. That guarantees it is the file the process
+   loaded. Three rules keep it narrow:
+   - a name the binary defines itself keeps the binary's address;
+   - only Skia may come from a library: the hook shapes, the generate filters
+     and anything mangled under `android::renderengine` are never taken from
+     one, and `judge()` refuses a cache that says otherwise;
+   - every address carries its module (`Symbol::module`). The engine adds
+     that file's own load bias (from `/proc/self/maps`) and refuses to install
+     when the file is not mapped. The x8 probe reads the module's own code,
+     and the cache (format 2) records each library's path and build ID, so an
+     OTA that changes only `libhwui.so` invalidates the cache too.
+
+   The engine still depends on the pinned Skia layouts (`SkPaint`,
+   `SkString`, `SkData`). On ColorOS they are libhwui's Skia, which is also
+   the one surfaceflinger's RenderEngine was compiled against.
 
 Two smaller tables follow the same pattern. The blur filters whose
 `generateTemporaryImage` the engine hooks for `backdropBlur` are rows of

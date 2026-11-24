@@ -211,6 +211,27 @@ const char* kBlurCacheValidM[] = {
     "NS_9allocatorIS5_EEE5clearEv",
     "_ZNSt3__15dequeIN7android12renderengine4skia16SkiaRenderEngine14BlurCacheEntryE"
     "NS_9allocatorIS5_EEE8pop_backEv",
+    // ColorOS 17 (OnePlus 12, CPH2573_17.0.0.100): a BlurImageCache class of
+    // its own, keyed per layer, stored after a blur is made and looked up
+    // before the next. A snapshot handed back in a blur's place there came
+    // back as the "blur" of later frames: sharp wallpaper behind recents.
+    "_ZN7android12renderengine4skia14BlurImageCache5storeERKNS2_8CacheKeyE5sk_spI7SkImageEjRK6SkRect"
+    "RK7SkIRect",
+    "_ZN7android12renderengine4skia14BlurImageCache17findAndTouchEntryERKNS2_8CacheKeyE",
+    nullptr,
+};
+
+// A RenderEngine whose drawBlurRegion asks the filter how big its blurred
+// image is (getBlurredImageSizeForShader) and maps each axis by blurRect over
+// that, with no scale constant to read (blur_scale.h). The base BlurFilter
+// answers with the image's own size; ColorOS 17's KawaseBlurDualFilterV2
+// answers blurRect / 4 behind two flags and otherwise the same. The dual
+// filter's image changes size with the radius, so a blur the engine asks for
+// at a lower radius is NOT a quarter of blurRect: mapped at a fixed 4, it came
+// out twice too big (a second, enlarged home screen behind dialogs). Never
+// called: its presence alone switches the mapping to per axis.
+const char* kBlurredImageSizeM[] = {
+    "_ZNK7android12renderengine4skia10BlurFilter28getBlurredImageSizeForShaderERK6SkRectPK7SkImage",
     nullptr,
 };
 
@@ -338,6 +359,7 @@ const EntryPoint kEntryPoints[] = {
     {"SkCanvas::baseRecorder", kCanvasBaseRecorderM, nullptr, kOptional},
     {"SkCanvas::recorder", kCanvasRecorderM, nullptr, kOptional},
     {"RenderEngine blur cache (marker)", kBlurCacheValidM, nullptr, kOptional},
+    {"BlurFilter::getBlurredImageSizeForShader (marker)", kBlurredImageSizeM, nullptr, kOptional},
 
     // ---- kBlurGenerate (any one enables backdropBlur) ---------------------
     {"KawaseBlurFilter::generateTemporaryImage", kGenerateKawaseM, nullptr, kBlurGenerate, true},

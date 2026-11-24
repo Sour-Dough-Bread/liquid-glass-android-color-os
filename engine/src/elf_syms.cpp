@@ -119,7 +119,8 @@ const uint8_t* ElfView::section(const char* name, size_t* out_size) const {
 }
 
 bool ElfView::collectFunctions(const char* symtab_name, SymbolOrigin origin,
-                               std::unordered_map<std::string, Symbol>* out) const {
+                               std::unordered_map<std::string, Symbol>* out,
+                               uint8_t module) const {
     if (!ok() || out == nullptr) return false;
 
     for (uint16_t i = 0; i < shnum_; ++i) {
@@ -151,8 +152,16 @@ bool ElfView::collectFunctions(const char* symtab_name, SymbolOrigin origin,
             Elf64_Sym sym;
             memcpy(&sym, sym_bytes + k * sizeof(Elf64_Sym), sizeof(sym));
             if (ELF64_ST_TYPE(sym.st_info) != STT_FUNC) continue;
-            if (sym.st_value == 0) continue;
+            // An import names a function some other file defines: never an
+            // address in this one.
+            if (sym.st_value == 0 || sym.st_shndx == SHN_UNDEF) continue;
             if (sym.st_name == 0 || sym.st_name >= strtab_size) continue;
+            // From a library, only what it exports: what another file could
+            // link against, which is what the binary itself calls.
+            if (module != 0 && ELF64_ST_BIND(sym.st_info) != STB_GLOBAL &&
+                ELF64_ST_BIND(sym.st_info) != STB_WEAK) {
+                continue;
+            }
 
             const char* nm = strtab + sym.st_name;
             // Guard against an unterminated string table.
@@ -160,11 +169,44 @@ bool ElfView::collectFunctions(const char* symtab_name, SymbolOrigin origin,
             const size_t len = strnlen(nm, max_len);
             if (len == 0 || len == max_len) continue;
 
-            out->emplace(std::string(nm, len), Symbol{sym.st_value, sym.st_size, origin});
+            Symbol entry{sym.st_value, sym.st_size, origin};
+            entry.module = module;
+            out->emplace(std::string(nm, len), entry);
         }
         return true;
     }
     return false;
+}
+
+std::vector<std::string> ElfView::neededLibraries() const {
+    std::vector<std::string> out;
+    if (!ok()) return out;
+    for (uint16_t i = 0; i < shnum_; ++i) {
+        const auto* s = static_cast<const Elf64_Shdr*>(shdr(i));
+        if (s == nullptr || s->sh_type != SHT_DYNAMIC) continue;
+        if (!inRange(0, s->sh_offset, s->sh_size, size_)) return out;
+        // The names are offsets into the string table sh_link names (.dynstr).
+        if (s->sh_link >= shnum_) return out;
+        const auto* strs = static_cast<const Elf64_Shdr*>(shdr(static_cast<uint16_t>(s->sh_link)));
+        if (strs == nullptr || strs->sh_type == SHT_NOBITS ||
+            !inRange(0, strs->sh_offset, strs->sh_size, size_)) {
+            return out;
+        }
+        const char* strtab = reinterpret_cast<const char*>(base_ + strs->sh_offset);
+        const size_t count = s->sh_size / sizeof(Elf64_Dyn);
+        for (size_t k = 0; k < count; ++k) {
+            Elf64_Dyn d;
+            memcpy(&d, base_ + s->sh_offset + k * sizeof(Elf64_Dyn), sizeof(d));
+            if (d.d_tag == DT_NULL) break;
+            if (d.d_tag != DT_NEEDED || d.d_un.d_val >= strs->sh_size) continue;
+            const size_t max_len = strs->sh_size - d.d_un.d_val;
+            const size_t len = strnlen(strtab + d.d_un.d_val, max_len);
+            if (len == 0 || len == max_len) continue;
+            out.emplace_back(strtab + d.d_un.d_val, len);
+        }
+        return out;
+    }
+    return out;
 }
 
 // --------------------------------------------------------------- SymbolResolver
@@ -172,6 +214,8 @@ bool ElfView::collectFunctions(const char* symtab_name, SymbolOrigin origin,
 bool SymbolResolver::loadFromFile(const std::string& path, InflateFn inflate, void* user) {
     syms_.clear();
     error_.clear();
+    modules_.assign(1, path);
+    needed_.clear();
 
     std::vector<uint8_t> image;
     if (!readWholeFile(path, &image)) {
@@ -184,6 +228,8 @@ bool SymbolResolver::loadFromFile(const std::string& path, InflateFn inflate, vo
         error_ = "not a valid ELF64: " + path;
         return false;
     }
+
+    needed_ = outer.neededLibraries();
 
     // An unstripped or partially stripped build resolves without MiniDebugInfo.
     outer.collectFunctions(".symtab", SymbolOrigin::kSymtab, &syms_);
@@ -212,6 +258,52 @@ bool SymbolResolver::loadFromFile(const std::string& path, InflateFn inflate, vo
     }
 
     return !syms_.empty();
+}
+
+size_t SymbolResolver::addLibrary(const std::string& path) {
+    if (modules_.empty()) {
+        error_ = "no binary loaded before " + path;
+        return 0;
+    }
+    if (modules_.size() > 254) {
+        error_ = "too many libraries";
+        return 0;
+    }
+    const size_t slash = path.rfind('/');
+    const std::string base = slash == std::string::npos ? path : path.substr(slash + 1);
+    bool is_needed = false;
+    for (const std::string& n : needed_) is_needed = is_needed || n == base;
+    if (!is_needed) {
+        error_ = base + " is not one the binary loads (DT_NEEDED)";
+        return 0;
+    }
+    for (size_t m = 1; m < modules_.size(); ++m) {
+        if (modules_[m] == path) return 0;  // already added
+    }
+
+    std::vector<uint8_t> image;
+    if (!readWholeFile(path, &image)) {
+        error_ = "cannot read " + path;
+        return 0;
+    }
+    ElfView lib;
+    if (!lib.parse(image.data(), image.size())) {
+        error_ = "not a valid ELF64: " + path;
+        return 0;
+    }
+    std::unordered_map<std::string, Symbol> exported;
+    const auto module = static_cast<uint8_t>(modules_.size());
+    lib.collectFunctions(".dynsym", SymbolOrigin::kDynsym, &exported, module);
+    size_t added = 0;
+    for (auto& [name, sym] : exported) {
+        if (syms_.emplace(name, sym).second) ++added;
+    }
+    if (added == 0) {
+        error_ = path + " exports no function the binary lacks";
+        return 0;
+    }
+    modules_.push_back(path);
+    return added;
 }
 
 Symbol SymbolResolver::find(const std::string& mangled) const {

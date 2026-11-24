@@ -161,6 +161,10 @@ enum Index : size_t {
     // (BlurCache, Android 17 QPR1 on), where no blur may be put off
     kBlurCacheValid,
 
+    // ---- kOptional, never called: drawBlurRegion sizes the blurred image by
+    // asking the filter (ColorOS 17), so the scale is per axis (blur_scale.h)
+    kBlurredImageSize,
+
     // ---- kBlurGenerate: BlurFilter::generateTemporaryImage per filter (A17)
     kGenerateKawase,
     kGenerateGaussian,

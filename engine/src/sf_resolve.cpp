@@ -3,6 +3,9 @@
 #include <cinttypes>
 #include <cstdio>
 #include <cstring>
+#include <iterator>
+
+#include <unistd.h>
 
 namespace glass {
 namespace sf {
@@ -81,6 +84,18 @@ std::string whyMissing(const Resolution& r, Index i) {
 
 const char* labelOf(Index i) { return kEntryPoints[i].label; }
 
+// Only Skia may come from a library (kSkiaLibraries). The hook targets, the
+// generate filters and every other piece of RenderEngine are hooked or
+// identified in the binary's own code, and a library's copy of one would be
+// code SurfaceFlinger never runs.
+bool mayComeFromLibrary(const EntryPoint& ep) {
+    if (ep.strategy == kHookTarget || ep.strategy == kBlurGenerate) return false;
+    for (const char* const* m = ep.manglings; *m != nullptr; ++m) {
+        if (strstr(*m, "7android12renderengine") != nullptr) return false;
+    }
+    return true;
+}
+
 void fnv(uint64_t* h, const void* data, size_t n) {
     const auto* p = static_cast<const uint8_t*>(data);
     for (size_t i = 0; i < n; ++i) {
@@ -92,13 +107,61 @@ void fnv(uint64_t* h, const void* data, size_t n) {
 }  // namespace
 
 ResultRegister fileAbiProbe(const Symbol& sym, std::string* detail, void* user) {
-    const char* path = static_cast<const char*>(user);
+    const auto* paths = static_cast<const std::vector<std::string>*>(user);
+    if (paths == nullptr || sym.module >= paths->size()) {
+        // No file to ask: refuse rather than answer for code nobody read.
+        if (detail != nullptr) *detail = "no file for this symbol's module";
+        return ResultRegister::kUndetermined;
+    }
     ResultRegister rr = ResultRegister::kX8;
     int machine = 0;
-    if (!aarch64ResultRegisterInFile(path, sym.value, sym.size, &rr, detail, &machine)) {
+    if (!aarch64ResultRegisterInFile((*paths)[sym.module], sym.value, sym.size, &rr, detail,
+                                     &machine)) {
         return ResultRegister::kX8;
     }
     return rr;
+}
+
+std::string moduleName(const Resolution& r, uint8_t module) {
+    if (module == 0 || module >= r.modules.size()) return {};
+    const std::string& p = r.modules[module];
+    const size_t slash = p.rfind('/');
+    return slash == std::string::npos ? p : p.substr(slash + 1);
+}
+
+std::vector<std::string> systemLibraryDirs() {
+    return std::vector<std::string>(std::begin(kSystemLibraryDirs), std::end(kSystemLibraryDirs));
+}
+
+std::vector<std::string> addSkiaLibraries(SymbolResolver* syms,
+                                          const std::vector<std::string>& dirs) {
+    std::vector<std::string> report;
+    for (const char* lib : kSkiaLibraries) {
+        bool needed = false;
+        for (const std::string& n : syms->needed()) needed = needed || n == lib;
+        if (!needed) continue;
+        std::string found;
+        for (const std::string& d : dirs) {
+            const std::string p = d + "/" + lib;
+            if (access(p.c_str(), R_OK) == 0) {
+                found = p;
+                break;
+            }
+        }
+        if (found.empty()) {
+            report.push_back(std::string(lib) + ": loaded by the binary, but not found");
+            continue;
+        }
+        const size_t n = syms->addLibrary(found);
+        char buf[600];
+        if (n > 0) {
+            snprintf(buf, sizeof(buf), "Skia from %s: %zu exported functions", found.c_str(), n);
+        } else {
+            snprintf(buf, sizeof(buf), "%s: not used (%s)", found.c_str(), syms->error().c_str());
+        }
+        report.push_back(buf);
+    }
+    return report;
 }
 
 bool Resolution::canRegenerateBlur() const {
@@ -116,13 +179,15 @@ void resolve(const SymbolResolver& syms, AbiProbe abi, void* abi_user, Resolutio
     *out = Resolution{};
     out->symbol_count = syms.count();
     out->had_minidebuginfo = syms.hadMiniDebugInfo();
+    out->modules = syms.modules();
 
     for (size_t i = 0; i < kEntryPointCount; ++i) {
         const EntryPoint& ep = kEntryPoints[i];
         Resolved& r = out->entry[i];
+        const bool own_only = !mayComeFromLibrary(ep);
         for (const char* const* m = ep.manglings; *m != nullptr; ++m) {
             const Symbol s = syms.find(*m);
-            if (s.valid()) {
+            if (s.valid() && !(own_only && s.module != 0)) {
                 r.sym = s;
                 r.source = Source::kSymbols;
                 break;
@@ -136,6 +201,7 @@ void resolve(const SymbolResolver& syms, AbiProbe abi, void* abi_user, Resolutio
             if (ep.prefix != nullptr) {
                 for (const std::string& name : syms.findByPrefix(ep.prefix)) {
                     if (isKnownMangling(name)) continue;
+                    if (own_only && syms.find(name).module != 0) continue;
                     r.drifted = true;
                     r.drift_name = name;
                     break;
@@ -204,6 +270,21 @@ void judge(Resolution* r) {
         }
     }
 
+    // A cache is read, not resolved, so the rule resolve() applies is checked
+    // again here: anything hooked or identified lives in the binary itself.
+    for (size_t i = 0; i < kEntryPointCount; ++i) {
+        if (r->has(static_cast<Index>(i)) && r->entry[i].sym.module != 0 &&
+            !mayComeFromLibrary(kEntryPoints[i])) {
+            r->fatal.push_back(std::string(kEntryPoints[i].label) +
+                               ": must be the binary's own, not a library's");
+            r->shape = -1;
+        }
+        if (r->entry[i].sym.module != 0 && r->entry[i].sym.module >= r->modules.size() &&
+            r->has(static_cast<Index>(i))) {
+            r->fatal.push_back(std::string(kEntryPoints[i].label) + ": from an unknown module");
+        }
+    }
+
     if (r->builtin_glass) {
         r->fatal.push_back("this ROM has Stock Glass built into RenderEngine (GlassFilter): "
                            "the module is not needed, and would draw over it");
@@ -226,6 +307,17 @@ void judge(Resolution* r) {
         r->notes.push_back("Evolution X's glass (EvoX 12.x, crDroid 13.x): StockGlass draws "
                            "where Android blurs, and leaves regions that ask for one of its "
                            "materials to the ROM");
+    }
+    for (size_t m = 1; m < r->modules.size(); ++m) {
+        int from = 0;
+        for (size_t i = 0; i < kEntryPointCount; ++i) {
+            from += r->has(static_cast<Index>(i)) && r->entry[i].sym.module == m;
+        }
+        if (from > 0) {
+            r->notes.push_back(std::to_string(from) + " Skia entry points from " +
+                               moduleName(*r, static_cast<uint8_t>(m)) +
+                               ", which this SurfaceFlinger takes Skia from");
+        }
     }
     if (r->entry[kMakeForShader].abi_rejected && r->has(kMakeForShaderOpts)) {
         r->notes.push_back("MakeForShader(SkString) does not take x8; compiling through the "
@@ -281,10 +373,12 @@ std::string describe(const Resolution& r, size_t index) {
     const Resolved& e = r.entry[index];
     char buf[512];
     if (e.sym.valid()) {
-        snprintf(buf, sizeof(buf), "  %-8s %-44s 0x%-8" PRIx64 " %6" PRIu64 " B  %s%s%s",
+        const std::string lib = moduleName(r, e.sym.module);
+        snprintf(buf, sizeof(buf), "  %-8s %-44s 0x%-8" PRIx64 " %6" PRIu64 " B  %s%s%s%s%s",
                  strategyName(ep.strategy), ep.label, e.sym.value, e.sym.size,
                  sourceName(e.source), e.source == Source::kSymbols ? " " : "",
-                 e.source == Source::kSymbols ? symbolOriginName(e.sym.origin) : "");
+                 e.source == Source::kSymbols ? symbolOriginName(e.sym.origin) : "",
+                 lib.empty() ? "" : " in ", lib.c_str());
     } else {
         snprintf(buf, sizeof(buf), "  %-8s %-44s --        %s", strategyName(ep.strategy),
                  ep.label,

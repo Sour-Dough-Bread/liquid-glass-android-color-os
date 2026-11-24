@@ -551,4 +551,12 @@ BlurScale probeBlurScaleInProcess(const std::string& exe_path, uintptr_t bias,
 #endif
 }
 
+void applyFilterSizedImage(BlurScale* scale, bool sized_by_filter) {
+    if (scale == nullptr || scale->found || !sized_by_filter) return;
+    scale->per_axis = true;
+    scale->found = true;
+    scale->how = "per axis: drawBlurRegion asks the filter for the image's size "
+                 "(getBlurredImageSizeForShader) and maps blurRect over it";
+}
+
 }  // namespace glass

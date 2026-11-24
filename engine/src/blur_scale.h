@@ -10,6 +10,12 @@
 //   - Project Infinity-X 4.x (A17, AxionOS's GlassBlurFilter) loads no
 //     constant at all: drawBlurRegion divides blurRect by the image's own
 //     width and height, per axis (about 1/6 with its default gb_scale).
+//   - ColorOS 17 loads none either: drawBlurRegion asks the filter for the
+//     image's size (virtual getBlurredImageSizeForShader) and an out-of-line
+//     getShaderTransform divides blurRect by it. Its dual Kawase filter makes
+//     images of different sizes at different radii, so no constant would do.
+//     The probe cannot see that; applyFilterSizedImage below decides it from
+//     the size function's symbol.
 //
 // The probe reads the answer out of the target's own drawBlurRegion:
 //
@@ -80,5 +86,15 @@ BlurScale probeBlurScaleInFile(const std::string& path, const Symbol& draw_blur_
 // found, with 4.
 BlurScale probeBlurScaleInProcess(const std::string& exe_path, uintptr_t bias,
                                   const Symbol& draw_blur_region);
+
+// The probe found no constant, but the build has
+// BlurFilter::getBlurredImageSizeForShader (sf_symbols.h, kBlurredImageSize):
+// drawBlurRegion asks the filter for the image's size and divides blurRect by
+// it per axis (ColorOS 17, through an out-of-line getShaderTransform that the
+// probe's literal search finds nothing in). The base filter answers with the
+// image's own size, which is what per_axis measures. A constant the probe did
+// find is kept. Called by glasscheck and the engine alike, so both report the
+// same mapping.
+void applyFilterSizedImage(BlurScale* scale, bool sized_by_filter);
 
 }  // namespace glass

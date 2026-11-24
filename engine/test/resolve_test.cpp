@@ -81,8 +81,32 @@ bool sameEntries(const glass::sf::Resolution& a, const glass::sf::Resolution& b)
     for (size_t i = 0; i < glass::sf::kCount; ++i) {
         if (a.entry[i].sym.value != b.entry[i].sym.value) return false;
         if (a.entry[i].sym.size != b.entry[i].sym.size) return false;
+        if (a.entry[i].sym.module != b.entry[i].sym.module) return false;
     }
     return a.shape == b.shape && a.ok == b.ok;
+}
+
+// A binary pulled from a device sits with the libraries it was pulled with:
+// the Skia library (sf_resolve.h, kSkiaLibraries) is looked for next to it
+// and in a lib64/ beside it, the way the device's linker finds it in
+// /system/lib64. Absolute, as the cache records it.
+std::vector<std::string> pulledLibraryDirs(const std::string& path) {
+    char* real = realpath(path.c_str(), nullptr);
+    std::string dir = real != nullptr ? real : path;
+    free(real);
+    const size_t slash = dir.rfind('/');
+    dir = slash == std::string::npos ? "." : dir.substr(0, slash);
+    return {dir, dir + "/lib64"};
+}
+
+bool load(glass::SymbolResolver* r, const std::string& path, std::vector<std::string>* report) {
+    if (!r->loadFromFile(path, inflateViaXz, nullptr)) return false;
+    *report = glass::sf::addSkiaLibraries(r, pulledLibraryDirs(path));
+    return true;
+}
+
+void* probeUser(const glass::SymbolResolver& r) {
+    return const_cast<std::vector<std::string>*>(&r.modules());
 }
 
 }  // namespace
@@ -91,12 +115,13 @@ bool sameEntries(const glass::sf::Resolution& a, const glass::sf::Resolution& b)
 // the symbols held, and the first reason when it fails.
 int brief(const std::string& path) {
     glass::SymbolResolver r;
-    if (!r.loadFromFile(path, inflateViaXz, nullptr)) {
+    std::vector<std::string> libs;
+    if (!load(&r, path, &libs)) {
         printf("FAIL  no symbols (%s)\n", r.error().c_str());
         return 1;
     }
     glass::sf::Resolution res;
-    glass::sf::resolve(r, glass::sf::fileAbiProbe, const_cast<char*>(path.c_str()), &res);
+    glass::sf::resolve(r, glass::sf::fileAbiProbe, probeUser(r), &res);
     std::string drift;
     for (size_t i = 0; i < glass::sf::kEntryPointCount; ++i) {
         if (!res.entry[i].drifted) continue;
@@ -133,9 +158,12 @@ int main(int argc, char** argv) {
     printf("  %zu function symbols recovered%s\n", r.count(),
            r.hadMiniDebugInfo() ? " (MiniDebugInfo present)" : " (no MiniDebugInfo)");
     check(r.count() > 10000, "recovered a plausible symbol count (>10000)");
+    for (const std::string& line : glass::sf::addSkiaLibraries(&r, pulledLibraryDirs(path))) {
+        printf("  %s\n", line.c_str());
+    }
 
     glass::sf::Resolution res;
-    glass::sf::resolve(r, glass::sf::fileAbiProbe, const_cast<char*>(path.c_str()), &res);
+    glass::sf::resolve(r, glass::sf::fileAbiProbe, probeUser(r), &res);
     for (size_t i = 0; i < glass::sf::kEntryPointCount; ++i) {
         printf("%s\n", glass::sf::describe(res, i).c_str());
     }
@@ -171,7 +199,7 @@ int main(int argc, char** argv) {
         check(read_ok, "cache read back and verified against the file%s%s",
               why.empty() ? "" : ": ", why.c_str());
         if (read_ok) {
-            glass::sf::probeAbi(&back, glass::sf::fileAbiProbe, const_cast<char*>(path.c_str()));
+            glass::sf::probeAbi(&back, glass::sf::fileAbiProbe, &back.modules);
             glass::sf::judge(&back);
             check(sameEntries(res, back), "cached resolution equals the resolved one");
         }
@@ -182,7 +210,7 @@ int main(int argc, char** argv) {
             std::string t = body;
             const size_t e = t.find("\ne ");
             size_t field = e;
-            for (int k = 0; k < 6 && field != std::string::npos; ++k) field = t.find(' ', field + 1);
+            for (int k = 0; k < 7 && field != std::string::npos; ++k) field = t.find(' ', field + 1);
             if (field != std::string::npos) {
                 char& c = t[field - 1];
                 c = c == '0' ? '1' : '0';

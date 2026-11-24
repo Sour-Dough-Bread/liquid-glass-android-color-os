@@ -494,6 +494,22 @@ int unitTests() {
         b = glass::probeBlurScaleInFile("/nonexistent/surfaceflinger", s);
         report(!b.found && b.inverse == 4.0f, "a file that does not exist", b);
     }
+    // ColorOS 17: no constant to read, but drawBlurRegion asks the filter for
+    // the image's size (getBlurredImageSizeForShader): per axis.
+    {
+        glass::BlurScale b;  // as the probe leaves "not found": 4
+        glass::applyFilterSizedImage(&b, true);
+        report(b.found && b.per_axis, "filter-sized image, no constant: per axis", b);
+        glass::BlurScale c;
+        glass::applyFilterSizedImage(&c, false);
+        report(!c.found && !c.per_axis && c.inverse == 4.0f, "no size function: 4, as before", c);
+        glass::BlurScale k;
+        k.found = true;
+        k.inverse = 4.54545f;
+        glass::applyFilterSizedImage(&k, true);
+        report(k.found && !k.per_axis && std::fabs(k.inverse - 4.54545f) < 1e-4f,
+               "a constant the probe found is kept", k);
+    }
     printf("%s\n", failures == 0 ? "blur_scale_test: all passed" : "blur_scale_test: FAILURES");
     return failures == 0 ? 0 : 1;
 }
@@ -612,7 +628,8 @@ int corpus(const std::string& dir) {
         }
         // As glasscheck and resolve_test resolve it: the ABI asked of the file.
         glass::sf::Resolution res;
-        glass::sf::resolve(syms, glass::sf::fileAbiProbe, const_cast<char*>(path.c_str()), &res);
+        glass::sf::resolve(syms, glass::sf::fileAbiProbe,
+                           const_cast<std::vector<std::string>*>(&syms.modules()), &res);
         glass::Symbol dbr;
         if (res.shape >= 0) {
             dbr = res.sym(glass::sf::kHookShapes[res.shape].entry);

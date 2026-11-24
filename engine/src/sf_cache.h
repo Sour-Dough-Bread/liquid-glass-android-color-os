@@ -26,11 +26,18 @@
 // The module's overlay puts both in /system/lib64 with the system_lib_file
 // label, which SurfaceFlinger may read; /data/adb is out of its reach.
 //
+// A build that takes Skia from a library (sf_resolve.h, kSkiaLibraries) has
+// entries in that library too. Each one names its module, and the library is
+// held to the same rules as the binary: its build ID must match the file on
+// disk, its address must lie in its code, and its first bytes must match what
+// is mapped at its own load bias.
+//
 // Format, one record per line:
-//   stockglass-symcache 1
+//   stockglass-symcache 2
 //   table <16 hex>
 //   build-id <hex>
-//   e <index> <value hex> <size hex> <symbols|scan> <prologue hex> <label...>
+//   lib <module> <build-id hex> <absolute path>     (module 1 and up, in order)
+//   e <index> <module> <value hex> <size hex> <symbols|scan> <prologue hex> <label...>
 //   d <index> <drifted mangling>          (informational)
 //   end
 #pragma once
@@ -51,7 +58,8 @@ bool writeCache(const std::string& cache_path, const std::string& exe_path, cons
                 std::string* error);
 
 // Reads a cache and checks it against the binary running in this process,
-// loaded at `bias`: the code compared is the mapped text. Fills `out` with the
+// loaded at `bias`, and each cached library at its own load bias (from
+// /proc/self/maps): the code compared is the mapped text. Fills `out` with the
 // entries (Source::kCache, or kScan for scanned ones) and judges it; the caller
 // should still run probeAbi(). False with *why when the cache is absent, stale
 // or does not match.

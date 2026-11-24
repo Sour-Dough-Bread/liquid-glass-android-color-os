@@ -136,8 +136,19 @@ void jsonString(const std::string& s) {
 
 std::string prop(const char* name) {
 #ifdef __ANDROID__
-    char buf[PROP_VALUE_MAX] = {0};
-    return __system_property_get(name, buf) > 0 ? std::string(buf) : std::string();
+    // Through the callback, not __system_property_get: a value longer than
+    // PROP_VALUE_MAX (ColorOS's ro.build.fingerprint) makes the latter print
+    // "Must use __system_property_read_callback() to read" and return nothing.
+    const prop_info* pi = __system_property_find(name);
+    if (pi == nullptr) return {};
+    std::string out;
+    __system_property_read_callback(
+        pi,
+        [](void* cookie, const char*, const char* value, uint32_t) {
+            if (value != nullptr) *static_cast<std::string*>(cookie) = value;
+        },
+        &out);
+    return out;
 #else
     (void)name;
     return {};
@@ -178,6 +189,10 @@ void printJson(const char* path, const glass::sf::Resolution& res, const std::st
             printf(",\"value\":\"0x%llx\",\"size\":%llu,\"source\":\"%s\"",
                    static_cast<unsigned long long>(e.sym.value),
                    static_cast<unsigned long long>(e.sym.size), glass::sf::sourceName(e.source));
+            if (e.sym.module != 0) {
+                printf(",\"module\":");
+                jsonString(glass::sf::moduleName(res, e.sym.module));
+            }
         }
         if (e.drifted) {
             printf(",\"drift\":");
@@ -239,7 +254,7 @@ int main(int argc, char** argv) {
             printf("FAIL  cache not usable: %s\n", why.c_str());
             return 1;
         }
-        glass::sf::probeAbi(&res, glass::sf::fileAbiProbe, const_cast<char*>(path));
+        glass::sf::probeAbi(&res, glass::sf::fileAbiProbe, &res.modules);
         glass::sf::judge(&res);
         printf("%s  cache %s for %s (build id %s)\n", res.ok ? "OK  " : "FAIL",
                res.ok ? "verified" : "does not add up", path, build_id.c_str());
@@ -264,7 +279,12 @@ int main(int argc, char** argv) {
     }
 
     glass::sf::Resolution res;
-    glass::sf::resolve(r, glass::sf::fileAbiProbe, const_cast<char*>(path), &res);
+    // The binary's own count, before any library adds to it.
+    const size_t own_symbols = r.count();
+    const std::vector<std::string> libraries =
+        glass::sf::addSkiaLibraries(&r, glass::sf::systemLibraryDirs());
+    glass::sf::resolve(r, glass::sf::fileAbiProbe,
+                       const_cast<std::vector<std::string>*>(&r.modules()), &res);
 
     if (json) {
         printJson(path, res, build_id);
@@ -272,15 +292,17 @@ int main(int argc, char** argv) {
         const std::string fp = prop("ro.build.fingerprint");
         if (!fp.empty()) printf("%s\n", fp.c_str());
         printf("%s\n  build id %s\n  %zu function symbols recovered%s\n", path,
-               build_id.empty() ? "(none)" : build_id.c_str(), r.count(),
+               build_id.empty() ? "(none)" : build_id.c_str(), own_symbols,
                res.had_minidebuginfo ? " from MiniDebugInfo" : " (no MiniDebugInfo)");
+        for (const std::string& l : libraries) printf("  library  %s\n", l.c_str());
         if (res.shape >= 0) {
             const glass::Symbol& t = res.sym(glass::sf::kHookShapes[res.shape].entry);
             printf("  hook     %s at 0x%llx, %llu bytes\n", glass::sf::kHookShapes[res.shape].label,
                    static_cast<unsigned long long>(t.value),
                    static_cast<unsigned long long>(t.size));
             // What the engine will read at boot, before it hooks (blur_scale.h).
-            const glass::BlurScale scale = glass::probeBlurScaleInFile(path, t);
+            glass::BlurScale scale = glass::probeBlurScaleInFile(path, t);
+            glass::applyFilterSizedImage(&scale, res.has(glass::sf::kBlurredImageSize));
             printf("  scale    %s\n", scale.how.c_str());
         }
         printf("  lighter backdrop blur: %s\n",

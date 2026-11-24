@@ -99,6 +99,7 @@ set_perm "$MODPATH/bin/$ABI/glasscheck" 0 0 0755
 set_perm "$MODPATH/glassctl"            0 0 0755
 set_perm "$MODPATH/action.sh"           0 0 0755
 set_perm "$MODPATH/live.sh"             0 0 0755
+set_perm "$MODPATH/watchdog.sh"         0 0 0755
 # set_perm_recursive above flattened these; the mount preserves them verbatim.
 [ -f "$MODPATH/system/bin/surfaceflinger" ] && {
   set_perm "$MODPATH/system/bin/surfaceflinger" 0 0 0755
@@ -185,8 +186,21 @@ ui_print "- Panes (notification cards, the volume panel, dialogs) get the"
 ui_print "  glass. The shade keeps Android's blur or gets a toned one:"
 ui_print "    sh /data/adb/modules/stockglass/glassctl backdrop stock|tone|glass"
 case "$(getprop persist.sys.glass.mode)" in
-  glass|on) ui_print "- Liquid Glass was already switched on here; keeping it." ;;
+  glass|on)
+    ui_print "- Liquid Glass was already switched on here; keeping it."
+    if [ "$(getprop persist.sys.glass.confirm)" != 0 ]; then
+      # service.sh asks on the first boot of this engine (watchdog.sh).
+      mkdir -p /data/adb/glass && : > /data/adb/glass/confirm_boot
+      ui_print "  After the reboot, press Volume Up within 90 s of the lock"
+      ui_print "  screen appearing to keep it. Otherwise it switches back to"
+      ui_print "  Android's blur by itself, in case this version draws it wrong."
+    fi
+    ;;
 esac
+ui_print "- A watchdog switches glass off by itself if SurfaceFlinger or"
+ui_print "  System UI keeps restarting, and turns the module off if even"
+ui_print "  Android's blur keeps crashing. Switching glass on asks you to"
+ui_print "  keep it (Volume Up) within 20 s, or it reverts."
 # A ROM that draws no window blur at all installs fine and then shows nothing,
 # which reads as a broken module. Say so now; glassctl status repeats it.
 if [ "$(getprop ro.surface_flinger.supports_background_blur)" != 1 ]; then

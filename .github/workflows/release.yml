@@ -55,6 +55,7 @@ jobs:
           command -v busybox >/dev/null || sudo apt-get install -y --no-install-recommends busybox-static
           engine/test/host.sh
           module/tools/guard_test.sh
+          module/tools/watchdog_test.sh
 
       - name: Android NDK, build tools and platform
         run: |

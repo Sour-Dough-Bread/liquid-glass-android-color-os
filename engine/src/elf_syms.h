@@ -33,6 +33,10 @@ struct Symbol {
     uint64_t value = 0;   // link-time address; add the module load bias for runtime
     uint64_t size = 0;
     SymbolOrigin origin = SymbolOrigin::kUnknown;
+    // Which file the address belongs to: 0 is the binary itself, 1 and up a
+    // library added with SymbolResolver::addLibrary, in the order added
+    // (SymbolResolver::modules). The load bias to add is that file's.
+    uint8_t module = 0;
     bool valid() const { return value != 0; }
 };
 
@@ -54,7 +58,12 @@ public:
     // STT_FUNC entry with a non-empty name into `out`. Later duplicates are
     // ignored, matching first-wins lookup.
     bool collectFunctions(const char* symtab_name, SymbolOrigin origin,
-                          std::unordered_map<std::string, Symbol>* out) const;
+                          std::unordered_map<std::string, Symbol>* out,
+                          uint8_t module = 0) const;
+
+    // The DT_NEEDED names of the .dynamic section, in order. Empty when there
+    // is none or it is malformed.
+    std::vector<std::string> neededLibraries() const;
 
     bool ok() const { return ehdr_ != nullptr; }
 
@@ -88,6 +97,20 @@ public:
     // stripped build still resolves.
     bool loadFromFile(const std::string& path, InflateFn inflate, void* user);
 
+    // Adds the functions a shared library exports (its .dynsym) as module
+    // modules().size(), for a binary that takes part of what the engine calls
+    // from a library rather than carrying it: ColorOS 17's surfaceflinger
+    // imports all of Skia from libhwui.so. A name the binary defines itself
+    // keeps the binary's address. Only a library the binary names in
+    // DT_NEEDED is accepted, so it is one the process has loaded. Returns how
+    // many names were added; 0 with error() set when the file cannot be used.
+    size_t addLibrary(const std::string& path);
+
+    // [0] the binary loadFromFile read, then each library addLibrary added.
+    const std::vector<std::string>& modules() const { return modules_; }
+    // The binary's DT_NEEDED names, from loadFromFile.
+    const std::vector<std::string>& needed() const { return needed_; }
+
     // Exact match on the mangled name.
     Symbol find(const std::string& mangled) const;
 
@@ -107,6 +130,8 @@ private:
     std::unordered_map<std::string, Symbol> syms_;
     std::string error_;
     bool had_mdi_ = false;
+    std::vector<std::string> modules_;
+    std::vector<std::string> needed_;
 };
 
 // The GNU build ID of an ELF file (NT_GNU_BUILD_ID in a PT_NOTE segment), as
